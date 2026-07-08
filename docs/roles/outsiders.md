@@ -1,4 +1,4 @@
-# Trouble Brewing — Outsiders
+# Outsiders
 
 Outsiders are **good**, but their abilities create problems or ambiguity for good.
 

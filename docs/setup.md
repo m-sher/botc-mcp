@@ -1,40 +1,24 @@
 # Setup
 
-## Player requirements
+## Players
 
-| Script | Recommended players (excluding Storyteller) |
-| --- | --- |
-| Trouble Brewing | 5+ |
-| Sects & Violets / Bad Moon Rising | 7+ (5–6 possible but not recommended) |
-| With Travellers | up to 20 |
+- **5–15** player seats (characters in the bag).
+- One **Storyteller** (not in the bag).
 
-One player is the **Storyteller** (not a character in the bag).
+## Steps
 
-## Physical space
+1. Fix **circle seating order** (clockwise). Neighbor abilities use this order.
+2. Use base composition for the player count (table below).
+3. Choose which characters of each type go in the bag (from the pool in
+   [characters.md](characters.md)). Players do not see which were chosen.
+4. Apply setup modifiers (Baron, Drunk).
+5. Token count **must equal** player count.
+6. Assign characters randomly to players (or draw).
+7. Storyteller records seating order and all true roles in the Grimoire.
+8. Place Fortune Teller **red herring** on a random good player if Fortune Teller is in play.
+9. Begin **First Night**.
 
-1. Arrange chairs in a circle/square with clear clockwise order.
-2. Leave a gap for the Storyteller to enter/exit.
-3. Center mostly empty (Town Square goes there).
-4. Grimoire placed so players cannot see inside.
-
-## Setup steps (Storyteller)
-
-1. Assemble Grimoire; stock info / night / shroud tokens.
-2. Choose edition/script; add edition tokens and night sheet.
-3. Place Town Square + one life token per player matching seats.
-4. Show composition strip (Townsfolk / Outsiders / Minions counts).
-5. Read rules to new players ([overview.md](overview.md) four rules + signals).
-6. **Secretly** select character tokens by composition (below).
-7. Apply setup modifiers (orange flower text, e.g. Baron `[+2 Outsiders]`).
-8. After modifiers, token count **must equal** player count.
-9. Add reminder tokens for characters with green leaves.
-10. Shuffle tokens into bag; each player draws one in secret.
-11. Collect tokens into Grimoire in seating order (felt side rules as preferred).
-12. Begin **First Night**.
-
-## Base composition by player count
-
-Default bag **before** character-specific modifiers (Baron, Drunk setup, etc.):
+## Base composition (before modifiers)
 
 | Players | Townsfolk | Outsiders | Minions | Demon |
 | ---: | ---: | ---: | ---: | ---: |
@@ -50,42 +34,36 @@ Default bag **before** character-specific modifiers (Baron, Drunk setup, etc.):
 | 14 | 9 | 1 | 3 | 1 |
 | 15 | 9 | 2 | 3 | 1 |
 
-Pattern: bands of three player counts share Townsfolk/Minion counts; Outsiders cycle 0 → 1 → 2.
+## Setup modifiers
 
-Above 15: keep 15-player core and add **Travellers** for extra seats.
-
-## Setup modifiers (examples from Trouble Brewing)
-
-| Character | Setup effect |
+| Character | Effect |
 | --- | --- |
-| **Baron** | `[+2 Outsiders]` — add 2 Outsiders, remove 2 Townsfolk |
-| **Drunk** | Not drawn as “Drunk” by the player: Storyteller places Drunk on a Townsfolk token; that player thinks they are that Townsfolk |
+| **Baron** | `+2 Outsiders`, `−2 Townsfolk` |
+| **Drunk** | Player is not told they are Drunk. Storyteller assigns them a Townsfolk identity they *think* they are; their ability does not work. Bag still counts them as the Outsider. |
 
-Always re-balance so tokens = players after modifiers.
+After modifiers, retune so seats = tokens.
 
-## First-game recommended bags (8 players, from official setup advice)
+## Example bags (8 players)
 
-**Info-heavy / chaotic (good for new players):**  
-Chef, Empath, Fortune Teller, Undertaker, Virgin, Drunk(as Investigator), Scarlet Woman, Imp.
+**Info-heavy:** Chef, Empath, Fortune Teller, Undertaker, Virgin, Drunk (thinks Investigator), Scarlet Woman, Imp.
 
-**Quieter / lethal toys:**  
-Empath, Fortune Teller, Ravenkeeper, Slayer, Mayor, Saint, Poisoner, Imp.
+**Quieter:** Empath, Fortune Teller, Ravenkeeper, Slayer, Mayor, Saint, Poisoner, Imp.
 
-**Logic-heavy:**  
-Washerwoman, Fortune Teller, Undertaker, Slayer, Virgin, Recluse, Spy, Imp.
+**Logic-heavy:** Washerwoman, Fortune Teller, Undertaker, Slayer, Virgin, Recluse, Spy, Imp.
 
-## What players know publicly
+## Public knowledge after setup
 
-- The **script** (which characters *might* be in play).
-- How many Townsfolk / Outsiders / Minions / Demon **by default** for the count
-  (but Baron/Drunk/etc. change actual composition — good must deduce that).
-- Not which specific tokens were bagged.
+- The full **character pool** (who *might* be in play).
+- Default Townsfolk / Outsiders / Minions / Demon counts for this player count
+  (actual Outsider count may differ if Baron is in).
+- Not which specific characters were bagged, and not anyone’s true role.
 
-## Grimoire truths (Storyteller only)
+## Grimoire (Storyteller only)
 
 - True character of every player
-- Alignment (if ever inverted)
-- Drunk / poisoned / protected / dead
-- Red herring (Fortune Teller)
-- Not-in-play bluffs shown to Demon
-- Any other reminder tokens
+- Drunk assignment and bluff Townsfolk
+- Poisoned, Monk-protected, Butler master
+- Red herring
+- Dead markers
+- Three not-in-play bluffs shown to the Demon (7+ players)
+- Any other reminders

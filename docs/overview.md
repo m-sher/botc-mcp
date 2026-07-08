@@ -1,66 +1,52 @@
 # Overview
 
-## What is Blood on the Clocktower?
+## The game
 
-Blood on the Clocktower is a social deduction / hidden-role game for **5–20 players**
-(plus one **Storyteller** who runs the game). It is set in the fictional town of
-**Ravenswood Bluff**. A **Demon** hides among the townsfolk; the good team must
-find and execute the Demon before too few living players remain.
+Players sit in a fixed circle order. One seat is the **Storyteller** (moderator /
+server): not a character, not on a team. Every other seat is a **player** with a
+secret character.
 
-Created by Steven Medway, published by The Pandemonium Institute.
+A **Demon** (the Imp) hides among the group. Good must execute the Demon. Evil must
+reduce the living players to **two**.
 
-## Teams
-
-| Team | Character types | Goal (default) |
+| Team | Types | Goal |
 | --- | --- | --- |
-| **Good** | Townsfolk, Outsiders | Execute (kill) the Demon |
-| **Evil** | Minions, Demon | Reduce living players to **two** |
+| **Good** | Townsfolk, Outsiders | Kill the Demon |
+| **Evil** | Minions, Demon (Imp) | Two living players left |
 
-- Good outnumbers evil, but evil **knows each other** from night one (at 7+ players)
-  and may freely lie.
-- Every player has a unique character with a unique ability.
-- The Storyteller is **not** on a team; they run nights, resolve abilities, and
-  manage the **Grimoire** (the private source of truth).
+- Good outnumbers evil. Evil knows each other from the first night (see setup / night
+  rules for player-count edge cases) and may lie freely.
+- Every player has exactly one character and ability.
+- The Storyteller holds the **Grimoire**: private full game state.
 
-## The four rules (player-facing)
+## Four player rules
 
-1. **You may say whatever you want at any time.** Public or private talk is free.
-2. **No peeking.** Keep your character secret; never look in the Grimoire.
-3. **Ask the Storyteller any questions you need.** Privately if preferred.
-4. **Play nice.** Deception is the game; disrespect is not.
+1. **Say whatever you want at any time** (public or private).
+2. **No peeking** — do not learn other players’ true characters or Grimoire contents
+   except via abilities.
+3. **Ask the Storyteller** rules or ability questions (privately if needed).
+4. **Play nice** — deception is in-game; abuse is not.
 
-## Key design pillars
+## Design pillars (for the sim)
 
-- **Death is not the end.** Dead players still talk, still win/lose with their team,
-  and have **one ghost vote** for the rest of the game.
-- **Information is abundant but unreliable.** Drunk or poisoned players get false
-  information without knowing it.
-- **Every character matters.** Passive info, active info, protection, once-per-game
-  kills, and setup-warping abilities all coexist.
-- **The Storyteller shapes the experience** (especially false info and optional
-  Mayor bounce kills) without breaking core rules.
+- **Death is not the end** — dead players talk, share their team’s win/loss, and have
+  **one ghost vote** for the rest of the game.
+- **Info can be wrong** — drunk or poisoned players may receive false ability results
+  and are not told.
+- **Abilities are the engine** — each role is unique; resolve them in night order and
+  on day triggers.
 
-## Editions / scripts
+## Character pool
 
-A **script** (edition) is a fixed pool of ~22–25 characters used for one game.
+This simulation uses a fixed pool (Trouble Brewing). Full list:
+[characters.md](characters.md).
 
-| Script | Difficulty | Flavor |
-| --- | --- | --- |
-| **Trouble Brewing** | Beginner | Classic demon hunt + misinformation |
-| **Sects & Violets** | Intermediate | Chaos, madness, info warping |
-| **Bad Moon Rising** | Advanced | Multi-kills, lethal days, powerful minions |
+## State the Storyteller tracks
 
-**Travellers** and **Fabled** support large groups, mid-game join/leave, and
-Storyteller balance tools. See [scripts/other-editions.md](scripts/other-editions.md).
-
-## Physical / conceptual components
-
-| Component | Purpose |
+| Concept | Purpose |
 | --- | --- |
-| **Grimoire** | Storyteller’s private board of tokens and reminders |
-| **Town Square** | Public life tokens and vote tokens |
-| **Character tokens** | Secret roles drawn at setup |
-| **Night sheet** | Ordered wake list (First Night / Other Nights) |
-| **Script / character sheet** | Public list of possible characters this game |
-| **Reminder tokens** | Track poison, protection, red herring, etc. |
-| **Shrouds** | Mark dead characters in the Grimoire |
+| **Grimoire** | True characters, reminders, dead, poison, protection, etc. |
+| **Living / dead** | Public after announcements |
+| **Night order** | Who acts when at night |
+| **Character sheet** | Public list of characters that *might* be in the bag |
+| **Reminders** | Poison, Monk protect, Butler master, red herring, Drunk, etc. |

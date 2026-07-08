@@ -1,7 +1,6 @@
-# Trouble Brewing — Townsfolk
+# Townsfolk
 
-All Townsfolk are **good**. Ability text is implementation-oriented paraphrase of
-official summaries.
+All Townsfolk are **good**.
 
 ---
 
@@ -122,7 +121,7 @@ official summaries.
 **You cannot die at the hand of the Demon.**
 
 - Night Demon attack on Soldier → no death; Demon does not re-target.
-- Also protects from other negative Demon effects where applicable (TB: mainly kill).
+- Also protects from other negative Demon effects where applicable (mainly the kill).
 - **Can** die by execution and non-Demon effects.
 
 ---

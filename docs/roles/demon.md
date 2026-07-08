@@ -1,4 +1,4 @@
-# Trouble Brewing — Demon
+# Demon
 
 ## Imp
 
@@ -12,30 +12,29 @@
 - Blocked by Monk protection, Soldier, etc.
 - Deaths announced at dawn without cause.
 
-### First night (Demon briefing, 7+)
+### First night briefing
+
+**7+ players:**
 
 1. Learn who the Minions are.
 2. Learn three **good** characters **not in play** (safe bluffs).
-3. Do **not** kill on N1.
+3. Do **not** kill.
+
+**5–6 players:** no Minion reveal and no bluff trio.
 
 ### Starpass (self-kill)
 
 1. Imp chooses themself at night → Imp dies.
 2. Storyteller chooses a **living Minion** → becomes Imp.
-3. New Imp is shown **You are** + Imp token.
+3. New Imp is told they are now the Imp.
 4. New Imp does **not** kill again that same night.
-5. Game continues (good has not won).
+5. Game continues.
 
 ### Interaction notes
 
 | Situation | Result |
 | --- | --- |
-| Imp executed, no SW / SW ineligible | Good wins |
-| Imp executed/killed, SW eligible (5+ alive) | SW becomes Imp |
+| Imp executed, no SW or SW ineligible | Good wins |
+| Imp dies, SW eligible (5+ alive) | SW becomes Imp |
 | Imp starpass | Minion becomes Imp |
-| Last Demon dead, 2 alive simultaneously | Good wins (tie-break) |
-
-### Small games (5–6)
-
-Often: Demon may not receive the same Minion/bluff briefing. Confirm Teensyville /
-script notes for the eval mode you implement.
+| Last Demon dead and two alive at once | Good wins |

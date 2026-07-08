@@ -1,37 +1,31 @@
 # Character Types
 
-Every non-Storyteller seat is one character type:
+Every player seat is one of:
 
-| Type | Team | Role in the game |
+| Type | Team | Role |
 | --- | --- | --- |
-| **Townsfolk** | Good | Core information, protection, and power roles |
-| **Outsiders** | Good | Good-aligned but abilities hinder good or create ambiguity |
-| **Minions** | Evil | Support the Demon; know Demon on N1 (7+) |
-| **Demons** | Evil | Primary night killer; evil wins if two living remain |
-| **Travellers** | Either (hidden) | Mid-game join/leave; public character, hidden alignment |
-| **Fabled** | Storyteller | Balance / accessibility tools, not bag characters |
+| **Townsfolk** | Good | Information, protection, once-per-game power |
+| **Outsiders** | Good | Complicate good’s game |
+| **Minions** | Evil | Support the Imp |
+| **Demon (Imp)** | Evil | Night kill; evil wins at two living |
 
-## Good vs evil knowledge
+## Starting knowledge
 
-| Group | Typically knows |
+| Group | Knows |
 | --- | --- |
-| Townsfolk / Outsiders | Only their own character (Drunk exception) |
-| Minions | Who the Demon is; fellow Minions (group wake) |
-| Demon | Who the Minions are; 3 not-in-play good bluffs |
-| Everyone | The public script list of possible characters |
+| Townsfolk / Outsiders | Own character only (Drunk thinks they are a Townsfolk) |
+| Minions (7+ players) | Who the Demon is; fellow Minions |
+| Imp (7+ players) | Who the Minions are; 3 not-in-play good bluffs |
+| Minions / Imp (5–6 players) | Own role only among evil (no mutual reveal / no bluff trio) |
+| Everyone | Public character pool |
 
-## Ability timing tags (script shorthand)
+## Ability timing tags
 
 | Tag | Meaning |
 | --- | --- |
-| Each night | Wakes every night including N1 (if applicable) |
+| Each night | Acts every night including N1 when listed |
 | Each night* | Every night **except** the first |
 | Once per game | Single use; spent even if failed while drunk/poisoned |
 | First night | Setup information only |
-| During the day | Public or private day action |
-| `[setup text]` | Modifies bag composition at setup only |
-
-## Detection & “registers as”
-
-Information abilities that ask “are they evil?” or “what character are they?”
-must respect **registration** (Spy, Recluse, red herring). See [../states.md](../states.md).
+| During the day | Day action |
+| `[setup text]` | Changes bag composition at setup only |

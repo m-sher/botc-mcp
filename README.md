@@ -1,23 +1,19 @@
 # botc-mcp
 
-Rust **eval MCP server** for [Blood on the Clocktower](https://bloodontheclocktower.com/)
-gameplay scenarios. Agents can retrieve structured rules and (later) run
-scripted evaluations against a rules engine.
+Rust **MCP server** for models to play **Blood on the Clocktower** (Trouble Brewing
+character set only): one fixed gameplay loop under a Storyteller moderator.
 
 ## Status
 
-**Scaffold + rules documentation.** Game engine and MCP tools are not implemented yet.
+**Scaffold + rules documentation.** Engine and MCP tools not implemented yet.
 
-## Documentation
+## Rules
 
-Authoritative-for-this-repo rules live under [`docs/`](docs/README.md), split for
-retrieval:
+Simulation rules live under [`docs/`](docs/README.md):
 
 - Gameplay loop, setup, win conditions, voting
-- States (drunk/poisoned), ability meta-rules, night order
-- Full **Trouble Brewing** role reference
-
-Start at [`docs/README.md`](docs/README.md).
+- States (drunk/poisoned), ability resolution, night order
+- Full role reference for this character pool
 
 ## Development
 
@@ -27,9 +23,9 @@ cargo test
 cargo run
 ```
 
-Requires a recent stable Rust toolchain (edition 2024).
+Requires a recent stable Rust toolchain.
 
 ## License
 
 Code: TBD.  
-Rules text: paraphrased community/official reference; game © The Pandemonium Institute.
+Rules text: paraphrased reference; game © The Pandemonium Institute.
