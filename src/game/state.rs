@@ -262,6 +262,13 @@ impl Game {
 
         if let Some(faces) = opts.drunk_faces {
             apply_drunk_face_overrides(&mut assignments, &bag_set, &faces)?;
+            // Auto-generated bluffs may collide with overridden faces — re-filter.
+            demon_bluffs = refilter_demon_bluffs_for_faces(
+                &self.rng,
+                &bag_set,
+                &assignments,
+                demon_bluffs,
+            );
         }
 
         if let Some(rh) = opts.red_herring {
@@ -455,14 +462,11 @@ impl Game {
             .clone()
             .ok_or(GameError::IllegalAction("no pending host decision"))?;
         match pending {
-            PendingHostDecision::MayorRedirect { living_others, .. } => {
-                // Prefer nobody dies when any alternative seat exists; else kill Mayor.
-                let choice = if living_others.is_empty() {
-                    MayorRedirectChoice::KillMayor
-                } else {
-                    MayorRedirectChoice::Nobody
-                };
-                self.apply_host_decision(HostDecision::MayorRedirect { choice })
+            PendingHostDecision::MayorRedirect { .. } => {
+                // Skip default: nobody dies. Host may still pick kill_mayor / kill_other.
+                self.apply_host_decision(HostDecision::MayorRedirect {
+                    choice: MayorRedirectChoice::Nobody,
+                })
             }
             PendingHostDecision::StarpassPick { minions, dead_imp } => {
                 // Random among living minions (previous default).
@@ -582,4 +586,47 @@ fn validate_demon_bluffs_override(
         }
     }
     Ok(bluffs)
+}
+
+/// Drop bluffs that match any Drunk face; fill back to 3 from not-in-play good chars.
+fn refilter_demon_bluffs_for_faces(
+    rng: &crate::rng::SeededRng,
+    bag_set: &[Character],
+    assignments: &[RoleAssignment],
+    bluffs: Vec<Character>,
+) -> Vec<Character> {
+    use crate::roles::{all_outsiders, all_townsfolk};
+    use rand::seq::SliceRandom;
+
+    let drunk_faces: std::collections::HashSet<Character> = assignments
+        .iter()
+        .filter(|a| a.true_character == Character::Drunk)
+        .filter_map(|a| a.believed_character)
+        .collect();
+    if drunk_faces.is_empty() {
+        return bluffs;
+    }
+
+    let in_bag: std::collections::HashSet<Character> = bag_set.iter().copied().collect();
+    let mut kept: Vec<Character> = bluffs
+        .into_iter()
+        .filter(|c| !drunk_faces.contains(c))
+        .collect();
+    let used: std::collections::HashSet<Character> = kept.iter().copied().collect();
+    let mut pool: Vec<Character> = all_townsfolk()
+        .iter()
+        .chain(all_outsiders().iter())
+        .copied()
+        .filter(|c| !in_bag.contains(c) && !drunk_faces.contains(c) && !used.contains(c))
+        .collect();
+    let mut brng = rng.substream("demon_bluffs_refilter");
+    pool.shuffle(&mut brng);
+    for c in pool {
+        if kept.len() >= 3 {
+            break;
+        }
+        kept.push(c);
+    }
+    kept.truncate(3);
+    kept
 }

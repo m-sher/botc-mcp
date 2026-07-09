@@ -147,7 +147,6 @@ fn spy_type_owner_prefers_in_play_and_excludes_actor_face() {
     );
     let opts = register::TypeOwnerOpts {
         acting_seat: Some(SeatId(0)),
-        force_true_type: false,
     };
     let in_play_tf = [Character::Washerwoman, Character::Soldier, Character::Chef];
     let mut named = std::collections::HashSet::new();

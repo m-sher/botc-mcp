@@ -72,14 +72,14 @@ pub fn try_demon_kill(game: &mut Game, demon_seat: SeatId, target: SeatId) -> Ki
 }
 
 fn resolve_starpass(game: &mut Game, imp_seat: SeatId) -> KillResult {
-    // Imp dies first; host then picks which living minion becomes Imp.
-    mark_dead(game, imp_seat);
-
+    // Do not mark the Imp dead until the host resolves starpass. During the pause,
+    // public `alive` must still be true so polling does not leak that a starpass is underway.
     let mut living_minions: Vec<SeatId> = game
         .seats
         .iter()
         .filter(|s| {
             s.alive
+                && s.id != imp_seat
                 && s.true_character
                     .is_some_and(|c| c.character_type() == CharacterType::Minion)
         })
@@ -88,6 +88,7 @@ fn resolve_starpass(game: &mut Game, imp_seat: SeatId) -> KillResult {
 
     if living_minions.is_empty() {
         // §11.4: no minion → Imp dies and Good wins.
+        mark_dead(game, imp_seat);
         win::win_check(game);
         return KillResult::Died(imp_seat);
     }
@@ -101,7 +102,11 @@ fn resolve_starpass(game: &mut Game, imp_seat: SeatId) -> KillResult {
 }
 
 /// Finish starpass after host (or default) picks `new_imp` minion seat.
+///
+/// Marks the old Imp dead first, then converts the chosen minion.
 pub(crate) fn complete_starpass(game: &mut Game, dead_imp: SeatId, new_imp: SeatId) -> KillResult {
+    mark_dead(game, dead_imp);
+
     let was_poisoner = game
         .seats
         .iter()

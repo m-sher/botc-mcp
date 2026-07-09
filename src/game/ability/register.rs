@@ -222,8 +222,6 @@ pub struct TypeOwnerOpts {
     /// Info role acting seat: never name this seat's true/face character as the pair token
     /// when Spy/Recluse misregisters (Washerwoman must not hear "you are the X").
     pub acting_seat: Option<SeatId>,
-    /// When true, Spy/Recluse never hide from their true type (Investigator sole-minion force).
-    pub force_true_type: bool,
 }
 
 /// Characters to exclude from named misregister tokens for the acting info role.
@@ -315,13 +313,11 @@ pub fn register_as_type_owner_with(
     let exclude = acting_exclude_chars(game, opts.acting_seat);
 
     // True type: Spy/Recluse may flip p=0.5 to hide from their true type detection,
-    // unless force_true_type or they are the sole remaining true owner of that type.
+    // unless they are the sole remaining true owner of that type.
     if c.character_type() == ty {
         match c {
             Character::Spy if ty == CharacterType::Minion => {
-                if opts.force_true_type
-                    || other_true_type_count(game, seat, ty, opts.acting_seat) == 0
-                {
+                if other_true_type_count(game, seat, ty, opts.acting_seat) == 0 {
                     return Some(Character::Spy);
                 }
                 // misreg_branch = hide from true minion type.
@@ -331,9 +327,7 @@ pub fn register_as_type_owner_with(
                 return Some(Character::Spy);
             }
             Character::Recluse if ty == CharacterType::Outsider => {
-                if opts.force_true_type
-                    || other_true_type_count(game, seat, ty, opts.acting_seat) == 0
-                {
+                if other_true_type_count(game, seat, ty, opts.acting_seat) == 0 {
                     return Some(Character::Recluse);
                 }
                 if misreg_branch(game, event_label) {
@@ -343,10 +337,6 @@ pub fn register_as_type_owner_with(
             }
             other => return Some(other),
         }
-    }
-
-    if opts.force_true_type {
-        return None;
     }
 
     match (c, ty) {

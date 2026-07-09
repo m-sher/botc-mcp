@@ -82,6 +82,11 @@ pub fn open_nominations(game: &mut Game, host: &Token) -> Result<(), GameError> 
         Some(Actor::Host) => {}
         _ => return Err(GameError::Unauthorized),
     }
+    open_nominations_inner(game)
+}
+
+/// Discussion → Nominations (no host auth; used by host tool and first nominate auto-open).
+fn open_nominations_inner(game: &mut Game) -> Result<(), GameError> {
     require_not_ended(game)?;
     let (day, stage) = day_stage(game)?;
     if stage != DayStage::Discussion {
@@ -102,11 +107,17 @@ pub fn open_nominations(game: &mut Game, host: &Token) -> Result<(), GameError> 
 }
 
 /// Player: open a nomination and start the vote window (or Virgin bounce).
+///
+/// Allowed from Day Nominations, or from Discussion (auto-opens nominations first).
 pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameError> {
     require_not_ended(game)?;
     let (_day, stage) = day_stage(game)?;
-    if stage != DayStage::Nominations {
-        return Err(GameError::WrongPhase);
+    match stage {
+        DayStage::Nominations => {}
+        DayStage::Discussion => {
+            // First living nomination auto-opens the nominations stage.
+            open_nominations_inner(game)?;
+        }
     }
     if game.executed_today.is_some() {
         return Err(GameError::IllegalAction("already executed today"));
@@ -155,7 +166,8 @@ pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameE
             // Immediate execution of nominator — day's execution, no vote.
             game.st_announce("The Virgin's power triggers. The nominator is executed.");
             resolve_execution(game, by);
-            // Day's execution is done; nominations effectively closed for further executions.
+            // Day's execution done — auto-end day (no further noms/executions).
+            try_auto_end_day(game)?;
             return Ok(());
         }
         // Disabled, or nominator does not register as Townsfolk: ability spent, vote proceeds.
@@ -342,7 +354,60 @@ fn close_vote_inner(game: &mut Game) -> Result<(), GameError> {
         "Votes closed on seat {}: {yes} yes vote(s).",
         open.target.0
     ));
+    // When no further legal nomination exists, end the day automatically.
+    try_auto_end_day(game)?;
     Ok(())
+}
+
+/// True when some living player can still open a legal nomination.
+fn any_legal_nomination_remaining(game: &Game) -> bool {
+    if game.executed_today.is_some() {
+        return false;
+    }
+    if game.current_nomination.is_some() {
+        return true;
+    }
+    let living: Vec<SeatId> = game
+        .seats
+        .iter()
+        .filter(|s| s.alive)
+        .map(|s| s.id)
+        .collect();
+    for &by in &living {
+        if game.day_nominators.contains(&by) {
+            continue;
+        }
+        for &target in &living {
+            if target == by {
+                continue;
+            }
+            if game.day_nominees.contains(&target) {
+                continue;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// End day (execute leader / enter night) when no further nominations are possible.
+fn try_auto_end_day(game: &mut Game) -> Result<(), GameError> {
+    if game.winner.is_some() || matches!(game.phase, Phase::Ended { .. }) {
+        return Ok(());
+    }
+    let Ok((_, stage)) = day_stage(game) else {
+        return Ok(());
+    };
+    if stage != DayStage::Nominations {
+        return Ok(());
+    }
+    if game.current_nomination.is_some() {
+        return Ok(());
+    }
+    if any_legal_nomination_remaining(game) {
+        return Ok(());
+    }
+    end_nominations_inner(game)
 }
 
 /// Current execution candidate: threshold met and strictly highest yes total today.
@@ -376,20 +441,28 @@ pub fn execution_leader(game: &Game) -> Option<SeatId> {
     }
 }
 
-/// Host: execute the leader (if any), then begin the next night if the game continues.
+/// Host: force-end nominations (execute leader if any), then begin the next night.
+///
+/// Day also auto-ends via [`try_auto_end_day`] when no legal nominations remain.
 pub fn end_nominations(game: &mut Game, host: &Token) -> Result<(), GameError> {
     match game.tokens.resolve(host) {
         Some(Actor::Host) => {}
         _ => return Err(GameError::Unauthorized),
     }
+    end_nominations_inner(game)
+}
+
+/// Execute the vote leader (if any), win checks, enter night. No host auth.
+fn end_nominations_inner(game: &mut Game) -> Result<(), GameError> {
     require_not_ended(game)?;
     let (day, stage) = day_stage(game)?;
     if stage != DayStage::Nominations {
         return Err(GameError::WrongPhase);
     }
     // Close any dangling open vote as no majority progress (missing = no).
+    // Avoid re-entering try_auto_end_day recursion: close tally only.
     if game.current_nomination.is_some() {
-        close_vote_inner(game)?;
+        close_vote_tally_only(game)?;
     }
 
     if game.executed_today.is_none() {
@@ -414,6 +487,25 @@ pub fn end_nominations(game: &mut Game, host: &Token) -> Result<(), GameError> {
     // Auto-path: next night is day + 1 (Day 1 → Night 2).
     let next_night = day + 1;
     game.enter_night(next_night);
+    Ok(())
+}
+
+/// Finalize open nomination tally without auto-ending the day.
+fn close_vote_tally_only(game: &mut Game) -> Result<(), GameError> {
+    let open = game
+        .current_nomination
+        .take()
+        .ok_or(GameError::IllegalAction("no open nomination"))?;
+    let yes = open.votes.iter().filter(|(_, y)| *y).count() as u32;
+    game.closed_nominations.push(ClosedNomination {
+        by: open.by,
+        target: open.target,
+        yes_votes: yes,
+    });
+    game.st_announce(format!(
+        "Votes closed on seat {}: {yes} yes vote(s).",
+        open.target.0
+    ));
     Ok(())
 }
 

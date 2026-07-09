@@ -485,6 +485,8 @@ impl Game {
         self.deaths_tonight.clear();
         self.pending_night = None;
         self.pending_host = None;
+        // Host-authored lies are scoped to a single night.
+        self.host_lie_queue.clear();
         self.night_queue = build_other_night_queue(self);
         self.night_cursor = 0;
         self.phase = Phase::Night { night, cursor: 0 };
@@ -668,6 +670,8 @@ pub fn dawn(game: &mut Game) {
             .push(PublicEvent::DiedInNight { seats: deaths });
     }
     game.deaths_tonight.clear();
+    // Unused host lies do not carry into the next day/night.
+    game.host_lie_queue.clear();
 
     let day = match game.phase {
         Phase::FirstNight { .. } => 1u32,

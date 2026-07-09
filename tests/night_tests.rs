@@ -617,9 +617,13 @@ fn imp_starpass_transfers_to_minion() {
         NightActionPayload::PickOne { target: SeatId(1) }, // self
     )
     .unwrap();
-    assert!(!g.seats[1].alive, "old Imp must be dead");
+    assert!(
+        g.seats[1].alive,
+        "old Imp stays alive during starpass host pause"
+    );
     assert!(g.pending_host.is_some(), "starpass waits for host");
     skip_night_action(&mut g, &host).unwrap();
+    assert!(!g.seats[1].alive, "old Imp dies when starpass completes");
     // Only minion is Poisoner seat 2 → becomes Imp
     assert_eq!(g.seats[2].true_character, Some(Character::Imp));
     assert!(g.seats[2].alive);

@@ -30,9 +30,9 @@ hard-coding a winner.
 | --- | --- | --- |
 | Spy/Recluse registration | random p=0.5 | `start_game.registration_mode`: `random` / `always_true` / `always_misreg` |
 | Drunk face, red herring, demon bluffs | seeded-random | `start_game.drunk_faces`, `red_herring`, `demon_bluffs` |
-| Mayor night bounce | host pending | `host_decide` type `mayor_redirect`; `skip_night_action` → nobody dies when alternatives exist |
-| Imp starpass minion | host pending | `host_decide` type `starpass_pick`; skip → random living minion |
-| Disabled-role false info text | seeded-random | `host_queue_lie` FIFO free-text consumed by next disabled info result |
+| Mayor night bounce | host pending | `host_decide` type `mayor_redirect`; `skip_night_action` → **nobody dies** (always). Host may still choose `kill_mayor` / `kill_other`. |
+| Imp starpass minion | host pending | `host_decide` type `starpass_pick`; skip → random living minion. Imp stays publicly alive until the host resolves. |
+| Disabled-role false info text | seeded-random | `host_queue_lie` FIFO free-text consumed by next disabled info result; **scoped to the current night** (cleared at dawn and on `enter_night`) |
 
 Structured host-authored lies (e.g. pick exact Empath count) beyond the free-text queue are deferred.
 

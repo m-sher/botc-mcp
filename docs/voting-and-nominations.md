@@ -15,7 +15,7 @@ Day phase after discussion. Storyteller opens and closes nominations.
 
 ## Nomination
 
-1. Storyteller opens nominations.
+1. Storyteller opens nominations, **or** the first living player nominates during Discussion (engine auto-opens).
 2. A living player: “I nominate **X**.”
 3. Nominee may defend.
 4. Vote runs immediately after.
@@ -40,6 +40,10 @@ The **first** time the Virgin is nominated:
 ### Engine auto-close
 
 The vote window auto-closes when **all living** players have voted **and** every dead player who still has a ghost vote available has either voted or called `pass_vote`. The host may `close_vote` earlier; missing votes count as no.
+
+### Engine auto-end day
+
+After a vote closes (or a Virgin execution ends the day’s execution), if **no further legal nomination** exists — every living seat has already nominated, or every other living seat has already been nominated, or an execution already happened today — the engine runs execution resolution / win checks and enters the next night automatically. The host may still force-end earlier with `end_nominations`.
 
 ## Execution threshold
 

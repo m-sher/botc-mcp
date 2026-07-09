@@ -130,7 +130,6 @@ fn pair_owners(
 
     let opts = TypeOwnerOpts {
         acting_seat: Some(acting_seat),
-        force_true_type: false,
     };
     let mut owners: Vec<(SeatId, Character)> = Vec::new();
     let mut seen = std::collections::HashSet::new();

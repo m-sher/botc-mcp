@@ -23,11 +23,12 @@ pub enum PendingHostDecision {
         /// Other living seats (host may pick any; non-killable → nobody dies).
         living_others: Vec<SeatId>,
     },
-    /// Imp self-killed with living minions; host chooses which becomes the Imp.
+    /// Imp self-targeted with living minions; host chooses which becomes the Imp.
+    /// Imp is still alive in the grimoire until the host resolves this decision.
     StarpassPick {
-        /// Living minion seats at the moment of starpass.
+        /// Living minion seats at the moment of starpass (Imp still alive).
         minions: Vec<SeatId>,
-        /// Imp seat already marked dead.
+        /// Imp seat that will die when starpass completes.
         dead_imp: SeatId,
     },
 }

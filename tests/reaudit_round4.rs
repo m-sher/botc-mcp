@@ -179,7 +179,8 @@ fn starpass_pending_host_pick() {
         NightActionPayload::PickOne { target: SeatId(1) },
     )
     .unwrap();
-    assert!(!g.seats[1].alive);
+    // #27: Imp stays publicly alive during host starpass pause.
+    assert!(g.seats[1].alive, "Imp must stay alive until host resolves starpass");
     match g.pending_host.clone().expect("starpass pending") {
         botc_mcp::game::PendingHostDecision::StarpassPick { minions, .. } => {
             assert!(minions.contains(&SeatId(2)) && minions.contains(&SeatId(3)));
@@ -194,6 +195,7 @@ fn starpass_pending_host_pick() {
         },
     )
     .unwrap();
+    assert!(!g.seats[1].alive, "Imp dies when starpass completes");
     assert_eq!(g.seats[3].true_character, Some(Character::Imp));
     assert_eq!(g.seats[2].true_character, Some(Character::Poisoner));
 }
