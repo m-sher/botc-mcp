@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -79,6 +81,8 @@ impl App {
     }
 
     fn on_key(&mut self, code: KeyCode) {
+        // Only explicit keyboard actions. Mouse wheel / trackpad scroll is ignored
+        // in the event loop (EnableMouseCapture + drop Event::Mouse).
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Up | KeyCode::Char('k') if self.focus == Focus::Setup => {
@@ -89,12 +93,22 @@ impl App {
             }
             KeyCode::Enter if self.focus == Focus::Setup => self.launch(),
             KeyCode::Tab if self.agents.is_some() => {
-                let n = self.agents.as_ref().map(|a| a.agents.len()).unwrap_or(1).max(1);
+                let n = self
+                    .agents
+                    .as_ref()
+                    .map(|a| a.agents.len())
+                    .unwrap_or(1)
+                    .max(1);
                 self.selected_agent = (self.selected_agent + 1) % n;
                 self.scroll_log = 0;
             }
             KeyCode::BackTab if self.agents.is_some() => {
-                let n = self.agents.as_ref().map(|a| a.agents.len()).unwrap_or(1).max(1);
+                let n = self
+                    .agents
+                    .as_ref()
+                    .map(|a| a.agents.len())
+                    .unwrap_or(1)
+                    .max(1);
                 self.selected_agent = (self.selected_agent + n - 1) % n;
                 self.scroll_log = 0;
             }
@@ -106,8 +120,13 @@ impl App {
                 self.do_tick();
                 self.last_tick = Instant::now();
             }
-            KeyCode::PageUp => self.scroll_log = self.scroll_log.saturating_add(5),
-            KeyCode::PageDown => self.scroll_log = self.scroll_log.saturating_sub(5),
+            // Keyboard-only log navigation (not mouse scroll).
+            KeyCode::PageUp if self.focus == Focus::Monitor => {
+                self.scroll_log = self.scroll_log.saturating_add(5);
+            }
+            KeyCode::PageDown if self.focus == Focus::Monitor => {
+                self.scroll_log = self.scroll_log.saturating_sub(5);
+            }
             _ => {}
         }
     }
@@ -318,7 +337,9 @@ impl App {
 pub fn run_tui() -> std::io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Capture mouse so the terminal delivers wheel/trackpad as Event::Mouse
+    // (which we ignore) instead of synthesizing Enter/Space/arrow keypresses.
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -332,17 +353,33 @@ pub fn run_tui() -> std::io::Result<()> {
             app.do_tick();
             app.last_tick = Instant::now();
         }
-        if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    app.on_key(key.code);
+        // Drain the whole queue so scroll floods don't lag behind real keys.
+        while event::poll(Duration::from_millis(0))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    // Press only — ignore Release/Repeat (and anything scroll-related).
+                    if key.kind == KeyEventKind::Press {
+                        app.on_key(key.code);
+                    }
                 }
+                // Explicit no-op: wheel, trackpad, clicks, resize, paste, focus.
+                Event::Mouse(_)
+                | Event::Resize(_, _)
+                | Event::FocusGained
+                | Event::FocusLost
+                | Event::Paste(_) => {}
             }
         }
+        // Idle wait so we don't busy-spin when the queue is empty.
+        let _ = event::poll(Duration::from_millis(200));
     };
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     if let Some(mut pool) = app.agents.take() {
         pool.stop_all();
