@@ -1,5 +1,6 @@
 //! Ratatui monitoring UI for the multi-agent harness.
 
+use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,7 +21,8 @@ use ratatui::{Frame, Terminal};
 
 use crate::game::{Game, GameId, SeatId, StartOpts, StChoiceMode};
 use crate::harness::agents::{
-    find_agent_mcp_bin, find_grok, AgentConfig, AgentPool, AgentRole, HarnessConfig,
+    agent_mcp_bin_ok, find_agent_mcp_bin, find_grok, resolve_agent_mcp_bin_for_display,
+    AgentConfig, AgentPool, AgentRole, HarnessConfig,
 };
 use crate::harness::socket::SocketServer;
 use crate::mcp_server::{self, SharedStore};
@@ -48,7 +50,8 @@ struct App {
     tick_interval: Duration,
     cfg: HarnessConfig,
     should_quit: bool,
-    scroll_log: usize,
+    /// Lines scrolled up from the live tail (0 = stick to newest output) (#45).
+    scroll_from_bottom: usize,
 }
 
 impl App {
@@ -59,12 +62,25 @@ impl App {
         let id = uuid::Uuid::new_v4();
         cfg.work_root = PathBuf::from(format!("/tmp/botc-harness-{id}"));
         cfg.socket_path = cfg.work_root.join("engine.sock");
+        let mcp_ok = agent_mcp_bin_ok(&cfg);
+        let mcp_path = resolve_agent_mcp_bin_for_display(&cfg);
+        let status = if mcp_ok {
+            format!(
+                "↑/↓ players · Enter launch · q quit | grok={} mcp={}",
+                cfg.grok_bin.display(),
+                mcp_path.display()
+            )
+        } else {
+            format!(
+                "MISSING botc-agent-mcp at {} — run: cargo build --bins",
+                mcp_path.display()
+            )
+        };
         Self {
             focus: Focus::Setup,
             player_count: 5,
             selected_agent: 0,
-            status: "↑/↓ players · Enter launch · q quit | needs `grok` + `cargo build --bins`"
-                .into(),
+            status,
             store: mcp_server::new_shared_store(),
             game_id: None,
             host_token: None,
@@ -76,7 +92,7 @@ impl App {
             tick_interval: Duration::from_secs(45),
             cfg,
             should_quit: false,
-            scroll_log: 0,
+            scroll_from_bottom: 0,
         }
     }
 
@@ -100,7 +116,7 @@ impl App {
                     .unwrap_or(1)
                     .max(1);
                 self.selected_agent = (self.selected_agent + 1) % n;
-                self.scroll_log = 0;
+                self.scroll_from_bottom = 0;
             }
             KeyCode::BackTab if self.agents.is_some() => {
                 let n = self
@@ -110,7 +126,7 @@ impl App {
                     .unwrap_or(1)
                     .max(1);
                 self.selected_agent = (self.selected_agent + n - 1) % n;
-                self.scroll_log = 0;
+                self.scroll_from_bottom = 0;
             }
             KeyCode::Char('t') if self.agents.is_some() => {
                 self.auto_tick = !self.auto_tick;
@@ -120,12 +136,16 @@ impl App {
                 self.do_tick();
                 self.last_tick = Instant::now();
             }
-            // Keyboard-only log navigation (not mouse scroll).
+            // Keyboard-only log navigation (not mouse scroll). 0 = live tail.
             KeyCode::PageUp if self.focus == Focus::Monitor => {
-                self.scroll_log = self.scroll_log.saturating_add(5);
+                self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(5);
             }
             KeyCode::PageDown if self.focus == Focus::Monitor => {
-                self.scroll_log = self.scroll_log.saturating_sub(5);
+                self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(5);
+            }
+            KeyCode::Home if self.focus == Focus::Monitor => {
+                // Jump to live tail.
+                self.scroll_from_bottom = 0;
             }
             _ => {}
         }
@@ -136,6 +156,18 @@ impl App {
             self.status = "Already launched — restart the TUI for a new table.".into();
             return;
         }
+        // #50: refuse to launch without a real botc-agent-mcp binary.
+        if !agent_mcp_bin_ok(&self.cfg) {
+            let p = resolve_agent_mcp_bin_for_display(&self.cfg);
+            self.status = format!(
+                "botc-agent-mcp not found (looked for {}). Run: cargo build --bins",
+                p.display()
+            );
+            return;
+        }
+        // Refresh resolved path so workdir config gets an absolute sibling if possible.
+        self.cfg.agent_mcp_bin = find_agent_mcp_bin();
+
         self.player_names = (0..self.player_count).map(|i| format!("P{i}")).collect();
         let seed = self.cfg.seed.unwrap_or(42);
         let created = match Game::create(self.player_names.clone(), seed) {
@@ -209,6 +241,7 @@ impl App {
                     self.auto_tick = true;
                     self.last_tick = Instant::now();
                     self.focus = Focus::Monitor;
+                    self.scroll_from_bottom = 0;
                     self.agents = Some(pool);
                 }
                 Err(e) => {
@@ -317,6 +350,7 @@ impl App {
         }
     }
 
+    /// Full agent log as joined text (newest at end). Caller applies tail-anchor scroll (#45).
     fn agent_log_text(&self) -> String {
         let Some(pool) = self.agents.as_ref() else {
             return String::new();
@@ -327,25 +361,87 @@ impl App {
         let idx = self.selected_agent.min(pool.agents.len() - 1);
         let agent = &pool.agents[idx];
         let log = agent.log.lock().unwrap();
-        let skip = self.scroll_log.min(log.len().saturating_sub(1));
-        let start = log.len().saturating_sub(100 + skip);
-        // Each assembler entry is one logical line; join with newlines for the pane.
+        // Cap retained lines for the pane (keep a generous buffer for PgUp).
+        let start = log.len().saturating_sub(400);
         log[start..].join("\n")
+    }
+
+    fn shutdown(&mut self) {
+        // Stop agents first (kills children + removes work root with tokens).
+        if let Some(mut pool) = self.agents.take() {
+            pool.stop_all();
+        }
+        // Then stop socket (non-blocking accept survives missing path).
+        if let Some(s) = self.socket.take() {
+            s.stop();
+        }
     }
 }
 
-pub fn run_tui() -> std::io::Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    // Capture mouse so the terminal delivers wheel/trackpad as Event::Mouse
-    // (which we ignore) instead of synthesizing Enter/Space/arrow keypresses.
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+/// RAII guard: restores terminal raw-mode / alternate screen on Drop or panic (#49).
+struct TerminalGuard {
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+    restored: bool,
+}
 
+impl TerminalGuard {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        // Capture mouse so the terminal delivers wheel/trackpad as Event::Mouse
+        // (which we ignore) instead of synthesizing Enter/Space/arrow keypresses.
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend)?;
+        Ok(Self {
+            terminal,
+            restored: false,
+        })
+    }
+
+    fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
+        &mut self.terminal
+    }
+
+    fn restore(&mut self) {
+        if self.restored {
+            return;
+        }
+        self.restored = true;
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
+        let _ = self.terminal.show_cursor();
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Best-effort restore before printing the panic (stdout may be alt screen).
+        let _ = disable_raw_mode();
+        let mut out = io::stdout();
+        let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen);
+        prev(info);
+    }));
+}
+
+pub fn run_tui() -> io::Result<()> {
+    install_panic_hook();
+    let mut guard = TerminalGuard::enter()?;
     let mut app = App::new();
+
     let result = loop {
-        terminal.draw(|f| draw(f, &app))?;
+        guard.terminal_mut().draw(|f| draw(f, &app))?;
         if app.should_quit {
             break Ok(());
         }
@@ -374,16 +470,8 @@ pub fn run_tui() -> std::io::Result<()> {
         let _ = event::poll(Duration::from_millis(200));
     };
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
-    if let Some(mut pool) = app.agents.take() {
-        pool.stop_all();
-    }
+    app.shutdown();
+    guard.restore();
     result
 }
 
@@ -434,22 +522,29 @@ fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
+    let mcp = resolve_agent_mcp_bin_for_display(&app.cfg);
+    let mcp_note = if agent_mcp_bin_ok(&app.cfg) {
+        "ok"
+    } else {
+        "MISSING — cargo build --bins"
+    };
     let text = format!(
         "Player count: {pc}   →  {tot} headless Grok sessions (host + players)\n\n\
          Model:       {model}\n\
          Grok binary: {grok}\n\
-         Agent MCP:   {mcp}\n\
+         Agent MCP:   {mcp}  ({mcp_note})\n\
          Work root:   {work}\n\n\
          Controls:  ↑/↓  change player count\n\
                     Enter  create game + spawn agents\n\
-                    q      quit\n\n\
+                    q      quit (kills agents, removes workdirs)\n\n\
          Each agent workdir gets .grok/config.toml → botc-agent-mcp\n\
-         (token-scoped) → Unix socket → shared in-process engine.",
+         (token-scoped) → Unix socket → shared in-process engine.\n\
+         Build first: cargo build --bins && cargo run --bin botc-tui",
         pc = app.player_count,
         tot = app.player_count + 1,
         model = app.cfg.model,
         grok = app.cfg.grok_bin.display(),
-        mcp = app.cfg.agent_mcp_bin.display(),
+        mcp = mcp.display(),
         work = app.cfg.work_root.display(),
     );
     let p = Paragraph::new(text)
@@ -516,8 +611,52 @@ fn draw_monitor(f: &mut Frame, area: Rect, app: &App) {
             AgentRole::Player { seat } => format!("stream: seat{}", seat.0),
         })
         .unwrap_or_else(|| "stream".into());
-    let log_p = Paragraph::new(app.agent_log_text())
-        .block(Block::default().borders(Borders::ALL).title(agent_title))
-        .wrap(Wrap { trim: false });
+
+    // #45: tail-anchor — keep newest lines in view via Paragraph::scroll.
+    let log_text = app.agent_log_text();
+    let line_count = if log_text.is_empty() {
+        0
+    } else {
+        log_text.lines().count()
+    };
+    // Inner height excludes borders (top+bottom).
+    let view_h = cols[2].height.saturating_sub(2) as usize;
+    let max_scroll_top = line_count.saturating_sub(view_h);
+    // scroll_from_bottom=0 → show the end; larger → look further up.
+    let scroll_y = max_scroll_top.saturating_sub(app.scroll_from_bottom.min(max_scroll_top));
+    let tail_mark = if app.scroll_from_bottom == 0 {
+        "·live"
+    } else {
+        "·scroll"
+    };
+    let log_p = Paragraph::new(log_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("{agent_title} {tail_mark}")),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_y as u16, 0));
     f.render_widget(log_p, cols[2]);
+}
+
+/// Pure helper for unit tests: compute vertical scroll that keeps the live tail
+/// (or an offset from it) in view (#45).
+pub fn stream_scroll_y(line_count: usize, view_h: usize, scroll_from_bottom: usize) -> usize {
+    let max_scroll_top = line_count.saturating_sub(view_h);
+    max_scroll_top.saturating_sub(scroll_from_bottom.min(max_scroll_top))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_scroll_defaults_to_tail() {
+        // 50 lines, 10-row pane, scroll_from_bottom=0 → scroll so last 10 show.
+        assert_eq!(stream_scroll_y(50, 10, 0), 40);
+        assert_eq!(stream_scroll_y(5, 10, 0), 0); // fits entirely
+        assert_eq!(stream_scroll_y(50, 10, 5), 35); // look 5 lines up from tail
+        assert_eq!(stream_scroll_y(50, 10, 999), 0); // clamped to top
+    }
 }

@@ -1,5 +1,9 @@
 //! Tool allowlists for `botc-agent-mcp` proxies.
 
+/// JSON-RPC error code for role/policy denials (`tools/call` exists; params invalid) (#51).
+/// Do **not** use `-32601` (Method not found) — strict clients may disable all tools.
+pub const ACL_DENY_JSONRPC_CODE: i64 = -32602;
+
 /// Tools only the Storyteller proxy may call.
 pub const HOST_ONLY: &[&str] = &[
     "create_game",
@@ -49,5 +53,11 @@ mod tests {
         assert!(!tool_allowed("create_game", true));
         assert!(tool_allowed("say", true));
         assert!(tool_allowed("skip_night_action", true));
+    }
+
+    #[test]
+    fn acl_deny_code_is_invalid_params_not_method_not_found() {
+        assert_eq!(ACL_DENY_JSONRPC_CODE, -32602);
+        assert_ne!(ACL_DENY_JSONRPC_CODE, -32601);
     }
 }

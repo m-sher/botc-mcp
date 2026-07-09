@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -56,16 +56,52 @@ impl Default for HarnessConfig {
     }
 }
 
+/// Shared child handle so stop_all can kill while a waiter reaps.
+#[derive(Debug, Default)]
+struct ChildSlot {
+    inner: Mutex<Option<Child>>,
+}
+
+impl ChildSlot {
+    fn store(&self, child: Child) {
+        *self.inner.lock().unwrap() = Some(child);
+    }
+
+    fn take_and_kill(&self) {
+        if let Some(mut c) = self.inner.lock().unwrap().take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    fn wait_exit(&self) -> Option<std::process::ExitStatus> {
+        let mut g = self.inner.lock().unwrap();
+        let child = g.as_mut()?;
+        match child.wait() {
+            Ok(st) => {
+                *g = None;
+                Some(st)
+            }
+            Err(_) => {
+                *g = None;
+                None
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct LiveAgent {
     pub config: AgentConfig,
-    pub session_id: String,
+    /// Mutable so a failed first run can mint a fresh UUID (#47).
+    pub session_id: Arc<Mutex<String>>,
     pub workdir: PathBuf,
     pub log: Arc<Mutex<Vec<String>>>,
     /// True while a headless Grok child for this agent is alive.
     pub running: Arc<Mutex<bool>>,
-    /// True after the first successful spawn (so later ticks use `--resume`).
-    pub session_started: bool,
+    /// True only after a **successful** first headless run (#47).
+    pub session_started: Arc<Mutex<bool>>,
+    child: Arc<ChildSlot>,
 }
 
 pub struct AgentPool {
@@ -95,11 +131,12 @@ impl AgentPool {
             let session_id = uuid::Uuid::new_v4().to_string();
             live.push(LiveAgent {
                 config: a,
-                session_id,
+                session_id: Arc::new(Mutex::new(session_id)),
                 workdir,
                 log: Arc::new(Mutex::new(Vec::new())),
                 running: Arc::new(Mutex::new(false)),
-                session_started: false,
+                session_started: Arc::new(Mutex::new(false)),
+                child: Arc::new(ChildSlot::default()),
             });
         }
         Ok(Self {
@@ -108,9 +145,10 @@ impl AgentPool {
         })
     }
 
-    /// Kick off every agent with its role prompt (one headless grok invocation each).
+    /// Kick off every agent. One spawn failure does not abort the rest (#48 borderline).
     pub fn kickoff_all(&mut self, n_players: usize) -> std::io::Result<usize> {
         let mut n = 0;
+        let mut last_err: Option<std::io::Error> = None;
         for agent in &mut self.agents {
             let prompt = match agent.config.role {
                 AgentRole::Host => prompts::host_kickoff(
@@ -125,16 +163,24 @@ impl AgentPool {
                     n_players,
                 ),
             };
-            if spawn_grok_tick(&self.cfg, agent, &prompt)? == TickOutcome::Spawned {
-                n += 1;
+            match spawn_grok_tick(&self.cfg, agent, &prompt) {
+                Ok(TickOutcome::Spawned) => n += 1,
+                Ok(TickOutcome::SkippedStillRunning) => {}
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if n == 0 {
+            if let Some(e) = last_err {
+                return Err(e);
             }
         }
         Ok(n)
     }
 
-    /// One more multi-turn tick for every agent (resume session).
+    /// One more multi-turn tick for every agent.
     pub fn tick_all(&mut self, public_summary: &str, host_hint: &str) -> std::io::Result<usize> {
         let mut n = 0;
+        let mut last_err: Option<std::io::Error> = None;
         for agent in &mut self.agents {
             let prompt = match agent.config.role {
                 AgentRole::Host => {
@@ -147,17 +193,36 @@ impl AgentPool {
                     public_summary,
                 ),
             };
-            if spawn_grok_tick(&self.cfg, agent, &prompt)? == TickOutcome::Spawned {
-                n += 1;
+            match spawn_grok_tick(&self.cfg, agent, &prompt) {
+                Ok(TickOutcome::Spawned) => n += 1,
+                Ok(TickOutcome::SkippedStillRunning) => {}
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if n == 0 {
+            if let Some(e) = last_err {
+                return Err(e);
             }
         }
         Ok(n)
     }
 
+    /// Kill all grok children and remove workdirs containing tokens (#46).
     pub fn stop_all(&mut self) {
         for agent in &mut self.agents {
             *agent.running.lock().unwrap() = false;
+            agent.child.take_and_kill();
         }
+        // Best-effort secret cleanup.
+        if self.cfg.work_root.exists() {
+            let _ = fs::remove_dir_all(&self.cfg.work_root);
+        }
+    }
+}
+
+impl Drop for AgentPool {
+    fn drop(&mut self) {
+        self.stop_all();
     }
 }
 
@@ -251,7 +316,6 @@ fn spawn_grok_tick(
     agent: &mut LiveAgent,
     prompt: &str,
 ) -> std::io::Result<TickOutcome> {
-    // Skip if a previous headless process is still running for this agent.
     if *agent.running.lock().unwrap() {
         return Ok(TickOutcome::SkippedStillRunning);
     }
@@ -259,12 +323,19 @@ fn spawn_grok_tick(
     let prompt_file = agent.workdir.join("prompt.txt");
     fs::write(&prompt_file, prompt)?;
 
+    let session_started = *agent.session_started.lock().unwrap();
+    // If a previous first-run failed, mint a fresh session id so --session-id is not a collision (#47).
+    if !session_started {
+        // Keep existing id for first attempt; regenerate only after a failed attempt (see waiter).
+    }
+    let session_id = agent.session_id.lock().unwrap().clone();
+
     let args = build_grok_tick_args(
         cfg,
         &agent.workdir,
         &prompt_file,
-        &agent.session_id,
-        agent.session_started,
+        &session_id,
+        session_started,
     );
 
     let mut cmd = Command::new(&cfg.grok_bin);
@@ -275,20 +346,19 @@ fn spawn_grok_tick(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let mut g = agent.log.lock().unwrap();
-            g.push(format!(
-                "ERROR failed to spawn {}: {e}",
-                cfg.grok_bin.display()
-            ));
+            push_log_line(
+                &agent.log,
+                format!("ERROR failed to spawn {}: {e}", cfg.grok_bin.display()),
+            );
             return Err(e);
         }
     };
 
-    // Mark session as started only after a successful spawn (resume needs an existing session).
-    agent.session_started = true;
-
     let log = Arc::clone(&agent.log);
     let running_flag = Arc::clone(&agent.running);
+    let session_started_flag = Arc::clone(&agent.session_started);
+    let session_id_slot = Arc::clone(&agent.session_id);
+    let child_slot = Arc::clone(&agent.child);
     *running_flag.lock().unwrap() = true;
 
     if let Some(stdout) = child.stdout.take() {
@@ -313,16 +383,25 @@ fn spawn_grok_tick(
             use std::io::BufRead;
             let reader = std::io::BufReader::new(stderr);
             for line in reader.lines().flatten() {
-                // stderr is not streaming-json; log whole lines.
                 push_log_line(&log, format!("[stderr] {line}"));
             }
         });
     }
 
-    let running_flag2 = Arc::clone(&running_flag);
+    child_slot.store(child);
+
+    // Waiter: set session_started only on success; regenerate id on failed first run (#47).
+    let child_slot_w = Arc::clone(&child_slot);
     thread::spawn(move || {
-        let _ = child.wait();
-        *running_flag2.lock().unwrap() = false;
+        let status = child_slot_w.wait_exit();
+        let ok = status.map(|s| s.success()).unwrap_or(false);
+        if ok {
+            *session_started_flag.lock().unwrap() = true;
+        } else if !*session_started_flag.lock().unwrap() {
+            // First run never succeeded — next tick uses a fresh --session-id.
+            *session_id_slot.lock().unwrap() = uuid::Uuid::new_v4().to_string();
+        }
+        *running_flag.lock().unwrap() = false;
     });
 
     Ok(TickOutcome::Spawned)
@@ -341,11 +420,6 @@ fn push_log_line(log: &Mutex<Vec<String>>, msg: String) {
 }
 
 /// Coalesce NDJSON `streaming-json` chunks into readable log lines.
-///
-/// Grok emits many tiny `{"type":"thought","data":"word"}` / `text` events. Prefixing
-/// each chunk with `[think]` produced garbage like `[think] The[think]  task…`.
-/// We buffer consecutive chunks of the same kind and emit one line when the kind changes
-/// or the stream ends.
 #[derive(Debug, Default)]
 pub struct StreamAssembler {
     kind: Option<StreamKind>,
@@ -401,7 +475,6 @@ impl StreamAssembler {
         }
     }
 
-    /// Flush any buffered partial stream at EOF.
     pub fn finish(&mut self) -> Vec<String> {
         self.flush()
     }
@@ -473,7 +546,16 @@ pub fn find_agent_mcp_bin() -> PathBuf {
     PathBuf::from("botc-agent-mcp")
 }
 
-/// Small delay helper for UI loops.
+/// True if the resolved agent MCP binary exists on disk (#50).
+pub fn agent_mcp_bin_ok(cfg: &HarnessConfig) -> bool {
+    resolve_agent_mcp_bin(cfg).exists()
+}
+
+/// Resolved path used for setup UI / error messages (#50).
+pub fn resolve_agent_mcp_bin_for_display(cfg: &HarnessConfig) -> PathBuf {
+    resolve_agent_mcp_bin(cfg)
+}
+
 pub fn sleep_ms(ms: u64) {
     thread::sleep(Duration::from_millis(ms));
 }
@@ -512,7 +594,6 @@ mod tests {
         );
         assert!(args.contains(&"--resume".into()));
         assert!(!args.contains(&"--session-id".into()));
-        // Still only one approve flag.
         assert_eq!(args.iter().filter(|a| *a == "--yolo").count(), 1);
         assert_eq!(args.iter().filter(|a| *a == "--always-approve").count(), 0);
     }
@@ -527,7 +608,6 @@ mod tests {
             "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
             false,
         );
-        // Each long flag should appear at most once.
         for flag in [
             "--prompt-file",
             "-m",
@@ -568,7 +648,29 @@ mod tests {
             ],
             "got {out:?}"
         );
-        // Must not look like the broken per-token prefix form.
         assert!(!out.iter().any(|s| s.contains("[think] The[think]")));
+    }
+
+    #[test]
+    fn stop_all_removes_work_root() {
+        let id = uuid::Uuid::new_v4();
+        let root = std::env::temp_dir().join(format!("botc-stop-test-{id}"));
+        let mut cfg = HarnessConfig::default();
+        cfg.work_root = root.clone();
+        cfg.socket_path = root.join("engine.sock");
+        let pool = AgentPool::prepare(
+            &cfg,
+            vec![AgentConfig {
+                role: AgentRole::Host,
+                display_name: "ST".into(),
+                token: "tok".into(),
+                game_id: 1,
+            }],
+        )
+        .unwrap();
+        assert!(root.exists());
+        assert!(root.join("host/agent.token").exists());
+        drop(pool); // Drop → stop_all → remove work root
+        assert!(!root.exists(), "work root should be removed on stop");
     }
 }

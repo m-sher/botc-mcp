@@ -116,12 +116,14 @@ fn handle_line(
                     "error": { "code": -32602, "message": "tools/call requires name" }
                 }).to_string());
             };
+            // Policy denial is Invalid params (-32602), not Method not found (-32601).
+            // -32601 would let a strict client conclude tools/call itself is unsupported (#51).
             if !proxy_acl::tool_allowed(name, is_host) {
                 return Some(json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "error": {
-                        "code": -32601,
+                        "code": proxy_acl::ACL_DENY_JSONRPC_CODE,
                         "message": format!("tool not available for this agent role: {name}")
                     }
                 }).to_string());
@@ -136,10 +138,14 @@ fn handle_line(
                 .map_err(|e| (-32000_i64, e))
         }
         other => {
-            if !proxy_acl::tool_allowed(other, is_host) {
+            // Unknown top-level method (not tools/call) — Method not found.
+            if other.starts_with("tools/") || other.is_empty() {
+                Err((-32601, format!("method not found: {other}")))
+            } else if !proxy_acl::tool_allowed(other, is_host) {
+                // Legacy bare-tool dispatch denied by ACL → Invalid params.
                 Err((
-                    -32601,
-                    format!("method/tool not available for this agent role: {other}"),
+                    proxy_acl::ACL_DENY_JSONRPC_CODE,
+                    format!("tool not available for this agent role: {other}"),
                 ))
             } else {
                 let mut arguments = params;
