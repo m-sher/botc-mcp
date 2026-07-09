@@ -1,9 +1,15 @@
-//! Binary entry — will host the MCP transport later.
+//! botc-mcp binary: JSON-RPC MCP transport over stdio.
 //!
-//! Library sketch: `botc_mcp`. Design: `docs/architecture.md`.
+//! Protocol: [`docs/mcp.md`]. Semantic tools: [`botc_mcp::tools`].
+
+use botc_mcp::mcp_server;
 
 fn main() {
-    println!("botc-mcp — engine sketch in lib; see docs/architecture.md");
+    let store = mcp_server::new_shared_store();
+    if let Err(e) = mcp_server::run_stdio(store) {
+        eprintln!("botc-mcp stdio error: {e}");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
