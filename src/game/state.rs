@@ -2,12 +2,11 @@
 
 use crate::auth::{Token, TokenBook};
 use crate::comms::{PrivateInboxes, PrivateMessage, PublicEvent, PublicLog};
+use crate::error::GameError;
+use crate::game::ids::{GameId, SeatId};
 use crate::game::phase::{NightStep, Phase};
-use crate::game::seat::{Seat, SeatId};
+use crate::game::seat::Seat;
 use crate::roles::{Character, CharacterType, Team};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct GameId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Winner {
@@ -252,13 +251,4 @@ impl Game {
             .collect::<Result<Vec<_>, _>>()?;
         self.start_game_assign(mapped)
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GameError {
-    NoSuchSeat,
-    Unauthorized,
-    WrongPhase,
-    IllegalAction(&'static str),
-    GameAlreadyEnded,
 }

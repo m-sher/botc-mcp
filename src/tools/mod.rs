@@ -5,18 +5,14 @@
 
 use crate::auth::{Actor, Token};
 use crate::comms::{EventId, PrivateMessage, PublicEvent};
+use crate::error::GameError;
 use crate::game::Phase;
 use crate::game::SeatId;
-use crate::game::{Game, GameError, PublicSeatView, Winner};
+use crate::game::{Game, PublicSeatView, Winner};
 use crate::roles::Character;
 
-/// Errors returned to the MCP client (safe strings; no other seats' secrets).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolError {
-    Unauthorized,
-    Game(GameError),
-    BadRequest(&'static str),
-}
+// Re-export for callers that import tool-layer errors from this module.
+pub use crate::error::ToolError;
 
 pub struct PublicStateView {
     pub phase: String,
