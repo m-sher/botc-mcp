@@ -13,7 +13,7 @@ mod win;
 pub use crate::error::GameError;
 pub use day::{
     close_vote, day_action_slay, end_nominations, execution_leader, meets_threshold, nominate,
-    open_nominations, resolve_execution, vote, ClosedNomination, OpenNomination,
+    open_nominations, pass_vote, resolve_execution, vote, ClosedNomination, OpenNomination,
 };
 pub use win::{apply_demon_death, end_game, living_count as count_living, win_check};
 pub use ids::{GameId, SeatId};

@@ -34,7 +34,12 @@ The **first** time the Virgin is nominated:
 1. Votes are counted in **clockwise** order starting from the nominee; nominee is last.
 2. Living players may vote on **every** nomination that day (one vote each per nomination).
 3. Dead players may spend their **single** ghost vote on one nomination (any day remaining).
-4. Storyteller tallies raised hands / declared votes.
+4. Dead players may **pass** (abstain) without spending the ghost vote; once the ghost is spent they cannot vote again (yes or no).
+5. Storyteller tallies raised hands / declared votes.
+
+### Engine auto-close
+
+The vote window auto-closes when **all living** players have voted **and** every dead player who still has a ghost vote available has either voted or called `pass_vote`. The host may `close_vote` earlier; missing votes count as no.
 
 ## Execution threshold
 

@@ -71,22 +71,16 @@ pub fn build_first_night_queue(game: &Game) -> Vec<NightStep> {
 
 /// Build the ordered other-night step list (no N1 setup/briefings; includes Imp kill).
 ///
-/// Ravenkeeper is included only when a seat in `deaths_tonight` faces as Ravenkeeper
-/// (typically filled after the demon kill resolves). Undertaker is included when the
-/// seat is alive **and** there was an execution today (`executed_today`).
+/// Ravenkeeper wakes are **not** pre-queued here: they are inserted after the demon kill
+/// via `die_from_demon` when a player-facing Ravenkeeper dies. Undertaker is included when
+/// the seat is alive **and** there was an execution today (`executed_today`).
 pub fn build_other_night_queue(game: &Game) -> Vec<NightStep> {
     let mut q = Vec::new();
 
     for slot in OTHER_NIGHT_CHARACTER_ORDER {
         match slot {
             OtherNightSlot::Ravenkeeper => {
-                // Usually inserted after demon kill via die_from_demon (player-facing RK).
-                // If deaths_tonight already lists a face-Ravenkeeper (rebuild mid-night), include them.
-                for &dead in &game.deaths_tonight {
-                    if seat_matches_wake(game, dead, Character::Ravenkeeper, false /* face */) {
-                        q.push(NightStep::Ravenkeeper { seat: dead });
-                    }
-                }
+                // Intentionally empty: death-wake is inserted by die_from_demon only.
             }
             OtherNightSlot::Undertaker => {
                 if game.executed_today.is_some() {

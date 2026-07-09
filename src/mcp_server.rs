@@ -151,6 +151,7 @@ const TOOL_NAMES: &[&str] = &[
     "day_action",
     "nominate",
     "vote",
+    "pass_vote",
     "open_nominations",
     "close_vote",
     "end_nominations",
@@ -172,7 +173,7 @@ fn tool_descriptors() -> Vec<Value> {
 
 fn tool_description(name: &str) -> &'static str {
     match name {
-        "create_game" => "Create a Trouble Brewing lobby (5–15 players); optional seed (omit = CSPRNG); returns game_id, host_token, player tokens",
+        "create_game" => "Create a Trouble Brewing lobby (5–15 players); optional seed/secret_salt (omit = CSPRNG); returns game_id, host_token, player tokens",
         "start_game" => "Host: lock lobby, assign bag (or fixed assignments), enter first night",
         "get_public_state" => "Public phase/seats/winner snapshot (no roles, no pending night seat)",
         "get_public_log" => "Public event log since cursor",
@@ -185,6 +186,7 @@ fn tool_description(name: &str) -> &'static str {
         "day_action" => "Player day ability (Slayer slay)",
         "nominate" => "Player nominate a living seat",
         "vote" => "Player cast yes/no on open nomination",
+        "pass_vote" => "Dead player: abstain without spending ghost vote",
         "open_nominations" => "Host: Discussion → Nominations",
         "close_vote" => "Host: close current vote window",
         "end_nominations" => "Host: execute vote leader (if any), begin next night",
@@ -233,6 +235,7 @@ fn invoke_tool(store: &SharedStore, name: &str, args: Value) -> Result<Value, Rp
         "day_action" => tool_day_action(store, args),
         "nominate" => tool_nominate(store, args),
         "vote" => tool_vote(store, args),
+        "pass_vote" => tool_pass_vote(store, args),
         "open_nominations" => tool_open_nominations(store, args),
         "close_vote" => tool_close_vote(store, args),
         "end_nominations" => tool_end_nominations(store, args),
@@ -376,9 +379,11 @@ fn tool_create_game(store: &SharedStore, args: Value) -> Result<Value, RpcError>
         .get("seed")
         .and_then(|v| v.as_u64())
         .unwrap_or_else(rand::random);
+    // Optional salt: omit → CSPRNG (production); provide with seed for full deterministic replay.
+    let secret_salt = args.get("secret_salt").and_then(|v| v.as_u64());
 
     with_store_mut(store, |st| {
-        let resp = tools::create_game(st, names, seed).map_err(tool_err)?;
+        let resp = tools::create_game(st, names, seed, secret_salt).map_err(tool_err)?;
         Ok(json!({
             "game_id": resp.game_id.0,
             "host_token": resp.host_token.as_str(),
@@ -763,6 +768,18 @@ fn tool_vote(store: &SharedStore, args: Value) -> Result<Value, RpcError> {
             .get_mut(game_id)
             .ok_or_else(|| tool_err(ToolError::BadRequest("unknown game_id")))?;
         tools::vote(game, &token, nominee, support).map_err(tool_err)?;
+        Ok(json!({ "ok": true }))
+    })
+}
+
+fn tool_pass_vote(store: &SharedStore, args: Value) -> Result<Value, RpcError> {
+    let game_id = require_game_id(&args)?;
+    let token = any_token(&args)?;
+    with_store_mut(store, |st| {
+        let game = st
+            .get_mut(game_id)
+            .ok_or_else(|| tool_err(ToolError::BadRequest("unknown game_id")))?;
+        tools::pass_vote(game, &token).map_err(tool_err)?;
         Ok(json!({ "ok": true }))
     })
 }

@@ -16,6 +16,8 @@ pub struct OpenNomination {
     pub target: SeatId,
     /// Explicit votes cast so far (`true` = support / yes).
     pub votes: Vec<(SeatId, bool)>,
+    /// Dead seats that passed (abstain without spending ghost vote).
+    pub passes: Vec<SeatId>,
 }
 
 /// Closed nomination record for the day (leader comparison).
@@ -163,6 +165,7 @@ pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameE
         by,
         target,
         votes: Vec::new(),
+        passes: Vec::new(),
     });
     Ok(())
 }
@@ -184,6 +187,9 @@ pub fn vote(game: &mut Game, seat: SeatId, nominee: SeatId, support: bool) -> Re
     if open.votes.iter().any(|(s, _)| *s == seat) {
         return Err(GameError::IllegalAction("already voted on this nomination"));
     }
+    if open.passes.contains(&seat) {
+        return Err(GameError::IllegalAction("already passed on this nomination"));
+    }
 
     let voter = seat_ref(game, seat)?;
     let alive = voter.alive;
@@ -193,10 +199,11 @@ pub fn vote(game: &mut Game, seat: SeatId, nominee: SeatId, support: bool) -> Re
     let butler_master = voter.butler_master;
 
     if !alive {
-        // Dead: may vote; yes spends the single ghost vote token.
-        if support && !ghost_ok {
+        // Dead with spent ghost: no further votes (yes or no).
+        if !ghost_ok {
             return Err(GameError::IllegalAction("ghost vote already spent"));
         }
+        // Dead with ghost available: yes spends; no does not spend but records a response.
     }
 
     if support && is_butler && alive && !butler_disabled {
@@ -229,8 +236,47 @@ pub fn vote(game: &mut Game, seat: SeatId, nominee: SeatId, support: bool) -> Re
         open.votes.push((seat, support));
     }
 
-    // Auto-close only when every living seat has voted AND every dead seat that still has
-    // a ghost vote available has also cast a vote (yes or no) on this nomination.
+    // Auto-close when living all voted and every dead with ghost remaining has voted or passed.
+    if nomination_ready_to_auto_close(game) {
+        close_vote_inner(game)?;
+    }
+    Ok(())
+}
+
+/// Dead player only: abstain on the open nomination without spending the ghost vote.
+///
+/// Marks the seat as having responded so auto-close can proceed once all living have voted
+/// and every other ghost-holder has voted or passed. Host [`close_vote`] may still force-close.
+pub fn pass_vote(game: &mut Game, seat: SeatId) -> Result<(), GameError> {
+    require_not_ended(game)?;
+    let (_day, stage) = day_stage(game)?;
+    if stage != DayStage::Nominations {
+        return Err(GameError::WrongPhase);
+    }
+    let open = game
+        .current_nomination
+        .as_ref()
+        .ok_or(GameError::IllegalAction("no open nomination"))?;
+    if open.votes.iter().any(|(s, _)| *s == seat) {
+        return Err(GameError::IllegalAction("already voted on this nomination"));
+    }
+    if open.passes.contains(&seat) {
+        return Err(GameError::IllegalAction("already passed on this nomination"));
+    }
+
+    let voter = seat_ref(game, seat)?;
+    if voter.alive {
+        return Err(GameError::IllegalAction("only dead players may pass a vote"));
+    }
+    if !voter.ghost_vote_available {
+        return Err(GameError::IllegalAction("ghost vote already spent"));
+    }
+
+    // Ghost token is retained; seat is recorded as responded for auto-close.
+    if let Some(open) = game.current_nomination.as_mut() {
+        open.passes.push(seat);
+    }
+
     if nomination_ready_to_auto_close(game) {
         close_vote_inner(game)?;
     }
@@ -247,7 +293,11 @@ fn all_living_have_voted(game: &Game) -> bool {
         .all(|s| open.votes.iter().any(|(id, _)| *id == s.id))
 }
 
-/// Living all voted, and every dead seat with remaining ghost vote has cast (yes or no).
+fn dead_responded(open: &OpenNomination, seat: SeatId) -> bool {
+    open.votes.iter().any(|(id, _)| *id == seat) || open.passes.contains(&seat)
+}
+
+/// Living all voted, and every dead seat with remaining ghost vote has voted or [`pass_vote`]d.
 /// Dead without ghost vote remaining are skipped. Host [`close_vote`] may still force-close.
 fn nomination_ready_to_auto_close(game: &Game) -> bool {
     let Some(open) = game.current_nomination.as_ref() else {
@@ -259,7 +309,7 @@ fn nomination_ready_to_auto_close(game: &Game) -> bool {
     game.seats
         .iter()
         .filter(|s| !s.alive && s.ghost_vote_available)
-        .all(|s| open.votes.iter().any(|(id, _)| *id == s.id))
+        .all(|s| dead_responded(open, s.id))
 }
 
 /// Host: finalize the current nomination's tally without executing.
@@ -420,7 +470,7 @@ pub fn resolve_execution(game: &mut Game, seat: SeatId) {
 /// Slayer once-per-game day action (design §10.3).
 ///
 /// Allowed in Day Discussion or Nominations. Spends `slayer_used` even on miss / disabled.
-/// Hit: target is true Imp and Slayer ability is active → immediate death + demon death / win check.
+/// Hit: target is true Imp (or Recluse registering as Demon) and Slayer is active → death + win check.
 pub fn day_action_slay(game: &mut Game, slayer: SeatId, target: SeatId) -> Result<(), GameError> {
     require_not_ended(game)?;
     let (_day, _stage) = day_stage(game)?;
@@ -445,18 +495,24 @@ pub fn day_action_slay(game: &mut Game, slayer: SeatId, target: SeatId) -> Resul
 
     seat_mut(game, slayer)?.slayer_used = true;
 
-    // Miss path: disabled, not true Slayer, wrong target, or dead target.
+    // Hit: true Imp, or Recluse registering as Demon (same p=0.5 as Fortune Teller).
     let target_seat = seat_ref(game, target)?;
+    let demon_label = format!("slayer_reg:day:{}", target.0);
+    let target_registers_demon = target_seat.true_character == Some(Character::Imp)
+        || crate::game::ability::register::register_demon_for_ft(game, target, &demon_label);
     let hit = true_is_slayer
         && !disabled
         && target_seat.alive
-        && target_seat.true_character == Some(Character::Imp);
+        && target_registers_demon;
 
     if !hit {
         // Silent miss (no public confirmation).
         return Ok(());
     }
 
+    let was_true_imp = seat_ref(game, target)?
+        .true_character
+        == Some(Character::Imp);
     let alive_before = living_count(game);
     if let Some(s) = game.seats.iter_mut().find(|s| s.id == target) {
         s.alive = false;
@@ -464,7 +520,10 @@ pub fn day_action_slay(game: &mut Game, slayer: SeatId, target: SeatId) -> Resul
     }
     game.public_log.push(PublicEvent::PlayerDied { seat: target });
     game.st_announce(format!("Seat {} dies.", target.0));
-    apply_demon_death(game, target, alive_before);
+    // Scarlet Woman conversion only when the true Imp dies.
+    if was_true_imp {
+        apply_demon_death(game, target, alive_before);
+    }
     win_check(game);
     Ok(())
 }
@@ -480,6 +539,10 @@ impl Game {
 
     pub fn vote(&mut self, seat: SeatId, nominee: SeatId, support: bool) -> Result<(), GameError> {
         vote(self, seat, nominee, support)
+    }
+
+    pub fn pass_vote(&mut self, seat: SeatId) -> Result<(), GameError> {
+        pass_vote(self, seat)
     }
 
     pub fn close_vote(&mut self, host: &Token) -> Result<(), GameError> {

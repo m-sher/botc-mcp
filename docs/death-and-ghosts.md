@@ -34,8 +34,9 @@ Useful for sink kills while bluffing Soldier / Monk.
 ## Ghost vote
 
 1. On death, the player has one remaining vote for the rest of the game.
-2. They cast it on **one** nomination total, then never vote again.
-3. They still cannot nominate.
+2. They cast it on **one** nomination total (a **yes** spends the ghost vote), then cannot vote again.
+3. They may **pass** / abstain on a nomination without spending the ghost vote (`pass_vote`).
+4. They still cannot nominate.
 
 ## Public information
 

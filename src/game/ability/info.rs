@@ -97,16 +97,6 @@ fn pair_message(game: &Game, ability: &str, info: &PairInfo) -> String {
     )
 }
 
-fn pick_two_distinct_seats(game: &Game, rng: &mut impl Rng) -> Option<(SeatId, SeatId)> {
-    let ids: Vec<SeatId> = game.seats.iter().map(|s| s.id).collect();
-    if ids.len() < 2 {
-        return None;
-    }
-    let mut pick = ids;
-    pick.shuffle(rng);
-    Some((pick[0], pick[1]))
-}
-
 fn seats_of_type(game: &Game, ty: CharacterType) -> Vec<(SeatId, Character)> {
     game.seats
         .iter()
@@ -126,19 +116,29 @@ fn seats_of_type(game: &Game, ty: CharacterType) -> Vec<(SeatId, Character)> {
 /// True seats of `ty`, plus Spy/Recluse registration via [`super::register`]:
 /// - Spy may register as Townsfolk or Outsider
 /// - Recluse may register as Minion (or Demon for Demon-typed detections)
+///
+/// The `acting_seat` (info role) is never included as an owner — they do not learn
+/// about themselves as the pair's "correct" seat.
 fn pair_owners(
     game: &Game,
     ty: CharacterType,
     stream: &str,
+    acting_seat: SeatId,
     rng: &mut impl Rng,
 ) -> Vec<(SeatId, Character)> {
-    use super::register::register_as_type_owner;
+    use super::register::{register_as_type_owner_with, TypeOwnerOpts};
 
+    let opts = TypeOwnerOpts {
+        acting_seat: Some(acting_seat),
+    };
     let mut owners: Vec<(SeatId, Character)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for s in &game.seats {
+        if s.id == acting_seat {
+            continue;
+        }
         let lab = format!("{stream}:owner:{}", s.id.0);
-        if let Some(character) = register_as_type_owner(game, s.id, ty, &lab) {
+        if let Some(character) = register_as_type_owner_with(game, s.id, ty, &lab, opts) {
             if seen.insert(s.id) {
                 owners.push((s.id, character));
             }
@@ -154,19 +154,21 @@ fn truthful_pair_info(
     ty: CharacterType,
     pool: &[Character],
     stream: &str,
+    acting_seat: SeatId,
     rng: &mut impl Rng,
 ) -> Option<PairInfo> {
     let _ = pool;
-    let owners = pair_owners(game, ty, stream, rng);
+    let owners = pair_owners(game, ty, stream, acting_seat, rng);
     if owners.is_empty() {
         return None;
     }
     let (correct_seat, character) = owners[rng.gen_range(0..owners.len())];
+    // Decoy pool: everyone except correct owner and the acting info seat.
     let others: Vec<SeatId> = game
         .seats
         .iter()
         .map(|s| s.id)
-        .filter(|id| *id != correct_seat)
+        .filter(|id| *id != correct_seat && *id != acting_seat)
         .collect();
     if others.is_empty() {
         return None;
@@ -184,13 +186,28 @@ fn truthful_pair_info(
     })
 }
 
-fn lie_pair_info(game: &Game, pool: &[Character], rng: &mut impl Rng) -> Option<PairInfo> {
-    let (seat_a, seat_b) = pick_two_distinct_seats(game, rng)?;
+fn lie_pair_info(
+    game: &Game,
+    pool: &[Character],
+    acting_seat: SeatId,
+    rng: &mut impl Rng,
+) -> Option<PairInfo> {
+    let ids: Vec<SeatId> = game
+        .seats
+        .iter()
+        .map(|s| s.id)
+        .filter(|id| *id != acting_seat)
+        .collect();
+    if ids.len() < 2 {
+        return None;
+    }
+    let mut pick = ids;
+    pick.shuffle(rng);
     let character = *pool.choose(rng)?;
     Some(PairInfo {
         character,
-        seat_a,
-        seat_b,
+        seat_a: pick[0],
+        seat_b: pick[1],
     })
 }
 
@@ -210,7 +227,7 @@ fn resolve_pair_role(
     if !disabled {
         // Prefer truthful pair including Spy/Recluse registration (Spy-as-Outsider may
         // produce a pair even when true outsider bag is empty).
-        if let Some(info) = truthful_pair_info(game, ty, pool, stream, &mut rng) {
+        if let Some(info) = truthful_pair_info(game, ty, pool, stream, seat, &mut rng) {
             let text = pair_message(game, ability, &info);
             return Ok(push_result(game, seat, text));
         }
@@ -223,7 +240,7 @@ fn resolve_pair_role(
     }
 
     // Disabled, or no owners and no zero path: lie.
-    let info = lie_pair_info(game, pool, &mut rng).ok_or(GameError::IllegalAction(
+    let info = lie_pair_info(game, pool, seat, &mut rng).ok_or(GameError::IllegalAction(
         "cannot generate pair info",
     ))?;
     let text = pair_message(game, ability, &info);

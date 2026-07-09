@@ -39,16 +39,22 @@ pub struct CreateGameResponse {
 }
 
 /// Create a lobby, issue host + player tokens, insert into `store`.
+///
+/// `secret_salt`: `None` → CSPRNG salt (production); `Some(s)` → deterministic replay with `seed`.
 pub fn create_game(
     store: &mut GameStore,
     names: Vec<String>,
     seed: u64,
+    secret_salt: Option<u64>,
 ) -> Result<CreateGameResponse, ToolError> {
     let CreateGameResult {
         game,
         host_token,
         player_tokens,
-    } = Game::create(names, seed)?;
+    } = match secret_salt {
+        Some(salt) => Game::create_with_salt(names, seed, salt)?,
+        None => Game::create(names, seed)?,
+    };
 
     let players: Vec<PlayerSeatToken> = game
         .seats
@@ -75,8 +81,18 @@ pub fn create_game(
 /// [`GameStore`]. For stateful tests, use [`create_game`] with an owned store.
 /// Panics if lobby size is illegal (not 5–15).
 pub fn create_game_in_memory(names: Vec<String>, seed: u64) -> CreateGameResponse {
+    create_game_in_memory_with_salt(names, seed, None)
+}
+
+/// Like [`create_game_in_memory`] with optional fixed salt.
+pub fn create_game_in_memory_with_salt(
+    names: Vec<String>,
+    seed: u64,
+    secret_salt: Option<u64>,
+) -> CreateGameResponse {
     let mut store = GameStore::new();
-    create_game(&mut store, names, seed).expect("create_game_in_memory: valid player count 5–15")
+    create_game(&mut store, names, seed, secret_salt)
+        .expect("create_game_in_memory: valid player count 5–15")
 }
 
 /// Host locks lobby, assigns bag, enters First Night (and runs [`Game::night_tick`]).
@@ -288,7 +304,17 @@ pub fn vote(
     game.vote(seat, nominee, support).map_err(ToolError::from)
 }
 
-/// Host: close the current vote window (also auto-runs when all living have voted).
+/// Dead player: abstain without spending the ghost vote (enables auto-close).
+pub fn pass_vote(game: &mut Game, token: &Token) -> Result<(), ToolError> {
+    let actor = game.tokens.resolve(token).ok_or(ToolError::Unauthorized)?;
+    let seat = match actor {
+        Actor::Player { seat } => seat,
+        Actor::Host => return Err(ToolError::BadRequest("host cannot pass_vote")),
+    };
+    game.pass_vote(seat).map_err(ToolError::from)
+}
+
+/// Host: close the current vote window (also auto-runs when living + ghost-holders responded).
 pub fn close_vote(game: &mut Game, host: &Token) -> Result<(), ToolError> {
     game.close_vote(host).map_err(ToolError::from)
 }

@@ -79,10 +79,42 @@ pub fn registers_as_townsfolk(game: &Game, seat: SeatId, event_label: &str) -> b
     }
 }
 
+/// Characters currently in play (true tokens), optionally filtered by type.
+fn in_play_of_type(game: &Game, ty: CharacterType) -> Vec<Character> {
+    game.seats
+        .iter()
+        .filter_map(|s| s.true_character)
+        .filter(|c| c.character_type() == ty)
+        .collect()
+}
+
+/// Pick a misregister token from `preferred` (in-play) if non-empty after excludes, else `fallback`.
+fn pick_misreg_token(
+    preferred: &[Character],
+    fallback: &[Character],
+    exclude: &[Character],
+    rng: &mut impl Rng,
+) -> Character {
+    let pref: Vec<Character> = preferred
+        .iter()
+        .copied()
+        .filter(|c| !exclude.contains(c) && *c != Character::Drunk)
+        .collect();
+    if let Some(c) = pref.choose(rng) {
+        return *c;
+    }
+    let fb: Vec<Character> = fallback
+        .iter()
+        .copied()
+        .filter(|c| !exclude.contains(c) && *c != Character::Drunk)
+        .collect();
+    *fb.choose(rng).unwrap_or(&Character::Soldier)
+}
+
 /// Character shown to Undertaker / Ravenkeeper-style "learn their character" abilities.
 ///
-/// - Spy may register as a Townsfolk or Outsider (p=0.5 misregister)
-/// - Recluse may register as a Minion or Demon (p=0.5 misregister)
+/// - Spy may register as a Townsfolk or Outsider (p=0.5 misregister); prefers in-play tokens
+/// - Recluse may register as a Minion or Demon (p=0.5 misregister); prefers in-play tokens
 /// - Others: true token
 pub fn register_character(game: &Game, seat: SeatId, event_label: &str) -> Option<Character> {
     let s = game.seats.iter().find(|x| x.id == seat)?;
@@ -93,13 +125,23 @@ pub fn register_character(game: &Game, seat: SeatId, event_label: &str) -> Optio
             if rng.gen_bool(0.5) {
                 Some(Character::Spy)
             } else {
-                let pool: Vec<Character> = all_townsfolk()
+                let in_play: Vec<Character> = game
+                    .seats
+                    .iter()
+                    .filter_map(|x| x.true_character)
+                    .filter(|ch| {
+                        matches!(
+                            ch.character_type(),
+                            CharacterType::Townsfolk | CharacterType::Outsider
+                        ) && *ch != Character::Drunk
+                    })
+                    .collect();
+                let fallback: Vec<Character> = all_townsfolk()
                     .iter()
                     .chain(all_outsiders().iter())
                     .copied()
-                    .filter(|x| *x != Character::Drunk) // avoid leaking Drunk token as face-like
                     .collect();
-                Some(*pool.choose(&mut rng).unwrap_or(&Character::Soldier))
+                Some(pick_misreg_token(&in_play, &fallback, &[], &mut rng))
             }
         }
         Character::Recluse => {
@@ -107,16 +149,61 @@ pub fn register_character(game: &Game, seat: SeatId, event_label: &str) -> Optio
             if rng.gen_bool(0.5) {
                 Some(Character::Recluse)
             } else {
-                let pool: Vec<Character> = all_minions()
+                let in_play: Vec<Character> = game
+                    .seats
+                    .iter()
+                    .filter_map(|x| x.true_character)
+                    .filter(|ch| {
+                        matches!(
+                            ch.character_type(),
+                            CharacterType::Minion | CharacterType::Demon
+                        )
+                    })
+                    .collect();
+                let fallback: Vec<Character> = all_minions()
                     .iter()
                     .chain(all_demons().iter())
                     .copied()
                     .collect();
-                Some(*pool.choose(&mut rng).unwrap_or(&Character::Imp))
+                Some(pick_misreg_token(&in_play, &fallback, &[], &mut rng))
             }
         }
         other => Some(other),
     }
+}
+
+/// Options for [`register_as_type_owner`] token selection.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TypeOwnerOpts {
+    /// Info role acting seat: never name this seat's true/face character as the pair token
+    /// when Spy/Recluse misregisters (Washerwoman must not hear "you are the X").
+    pub acting_seat: Option<SeatId>,
+}
+
+/// Characters to exclude from named misregister tokens for the acting info role.
+fn acting_exclude_chars(game: &Game, acting: Option<SeatId>) -> Vec<Character> {
+    let Some(aid) = acting else {
+        return Vec::new();
+    };
+    let Some(s) = game.seats.iter().find(|x| x.id == aid) else {
+        return Vec::new();
+    };
+    let mut ex = Vec::new();
+    if let Some(c) = s.true_character {
+        ex.push(c);
+    }
+    if let Some(c) = s.believed_character {
+        if !ex.contains(&c) {
+            ex.push(c);
+        }
+    }
+    // Also exclude visible face (Drunk: believed; others: true).
+    if let Some(c) = s.visible_character() {
+        if !ex.contains(&c) {
+            ex.push(c);
+        }
+    }
+    ex
 }
 
 /// Whether `seat` may appear as an owner of `ty` for pair-info roles (WW/Lib/Inv).
@@ -124,26 +211,60 @@ pub fn register_character(game: &Game, seat: SeatId, event_label: &str) -> Optio
 /// In addition to true-type seats:
 /// - Spy may register as Townsfolk or Outsider (p=0.5 each detection)
 /// - Recluse may register as Minion or Demon (p=0.5)
+/// - Spy (true Minion) and Recluse (true Outsider) may **hide** from their true type with p=0.5
 ///
 /// Returns the character token to name in the pair message when registering.
+/// Named tokens for Spy/Recluse misregister prefer **in-play** characters of that type;
+/// exclude Drunk for outsider faces; never name the acting seat's true/face character.
 pub fn register_as_type_owner(
     game: &Game,
     seat: SeatId,
     ty: CharacterType,
     event_label: &str,
 ) -> Option<Character> {
+    register_as_type_owner_with(game, seat, ty, event_label, TypeOwnerOpts::default())
+}
+
+/// Like [`register_as_type_owner`] with acting-seat token exclusions.
+pub fn register_as_type_owner_with(
+    game: &Game,
+    seat: SeatId,
+    ty: CharacterType,
+    event_label: &str,
+    opts: TypeOwnerOpts,
+) -> Option<Character> {
     let s = game.seats.iter().find(|x| x.id == seat)?;
     let c = s.true_character?;
-    // True type always owns that type.
+    let exclude = acting_exclude_chars(game, opts.acting_seat);
+
+    // True type: Spy/Recluse may flip p=0.5 to hide from their true type detection.
     if c.character_type() == ty {
-        return Some(c);
+        match c {
+            Character::Spy if ty == CharacterType::Minion => {
+                let mut rng = game.rng.substream(event_label);
+                if rng.gen_bool(0.5) {
+                    return Some(Character::Spy);
+                }
+                return None;
+            }
+            Character::Recluse if ty == CharacterType::Outsider => {
+                let mut rng = game.rng.substream(event_label);
+                if rng.gen_bool(0.5) {
+                    return Some(Character::Recluse);
+                }
+                return None;
+            }
+            other => return Some(other),
+        }
     }
+
     match (c, ty) {
         (Character::Spy, CharacterType::Townsfolk) => {
             let mut rng = game.rng.substream(event_label);
             if rng.gen_bool(0.5) {
-                let pool = all_townsfolk();
-                Some(*pool.choose(&mut rng).unwrap_or(&Character::Soldier))
+                let in_play = in_play_of_type(game, CharacterType::Townsfolk);
+                let fallback = all_townsfolk().to_vec();
+                Some(pick_misreg_token(&in_play, &fallback, &exclude, &mut rng))
             } else {
                 None
             }
@@ -151,13 +272,16 @@ pub fn register_as_type_owner(
         (Character::Spy, CharacterType::Outsider) => {
             let mut rng = game.rng.substream(event_label);
             if rng.gen_bool(0.5) {
-                // Prefer non-Drunk outsider faces for the named token.
-                let pool: Vec<Character> = all_outsiders()
+                let in_play: Vec<Character> = in_play_of_type(game, CharacterType::Outsider)
+                    .into_iter()
+                    .filter(|x| *x != Character::Drunk)
+                    .collect();
+                let fallback: Vec<Character> = all_outsiders()
                     .iter()
                     .copied()
                     .filter(|x| *x != Character::Drunk)
                     .collect();
-                Some(*pool.choose(&mut rng).unwrap_or(&Character::Recluse))
+                Some(pick_misreg_token(&in_play, &fallback, &exclude, &mut rng))
             } else {
                 None
             }
@@ -165,8 +289,9 @@ pub fn register_as_type_owner(
         (Character::Recluse, CharacterType::Minion) => {
             let mut rng = game.rng.substream(event_label);
             if rng.gen_bool(0.5) {
-                let pool = all_minions();
-                Some(*pool.choose(&mut rng).unwrap_or(&Character::Poisoner))
+                let in_play = in_play_of_type(game, CharacterType::Minion);
+                let fallback = all_minions().to_vec();
+                Some(pick_misreg_token(&in_play, &fallback, &exclude, &mut rng))
             } else {
                 None
             }
@@ -219,5 +344,55 @@ mod tests {
         assert!(!register_evil(&g, SeatId(0), "t0"));
         assert!(register_evil(&g, SeatId(1), "t1"));
         assert!(register_evil(&g, SeatId(2), "t2"));
+    }
+
+    #[test]
+    fn spy_true_minion_can_hide_from_investigator() {
+        let g = game_with(
+            vec![
+                RoleAssignment::normal(SeatId(0), Character::Investigator),
+                RoleAssignment::normal(SeatId(1), Character::Spy),
+                RoleAssignment::normal(SeatId(2), Character::Soldier),
+                RoleAssignment::normal(SeatId(3), Character::Chef),
+                RoleAssignment::normal(SeatId(4), Character::Imp),
+            ],
+            2,
+        );
+        let mut saw_some = false;
+        let mut saw_none = false;
+        for i in 0..64u32 {
+            let lab = format!("spy_hide:{i}");
+            match register_as_type_owner(&g, SeatId(1), CharacterType::Minion, &lab) {
+                Some(Character::Spy) => saw_some = true,
+                None => saw_none = true,
+                Some(other) => panic!("Spy true minion owner should be Spy or None, got {other:?}"),
+            }
+        }
+        assert!(saw_some && saw_none, "Spy should flip hide ~50% as minion owner");
+    }
+
+    #[test]
+    fn recluse_true_outsider_can_hide_from_librarian() {
+        let g = game_with(
+            vec![
+                RoleAssignment::normal(SeatId(0), Character::Librarian),
+                RoleAssignment::normal(SeatId(1), Character::Recluse),
+                RoleAssignment::normal(SeatId(2), Character::Soldier),
+                RoleAssignment::normal(SeatId(3), Character::Poisoner),
+                RoleAssignment::normal(SeatId(4), Character::Imp),
+            ],
+            3,
+        );
+        let mut saw_some = false;
+        let mut saw_none = false;
+        for i in 0..64u32 {
+            let lab = format!("rec_hide:{i}");
+            match register_as_type_owner(&g, SeatId(1), CharacterType::Outsider, &lab) {
+                Some(Character::Recluse) => saw_some = true,
+                None => saw_none = true,
+                Some(other) => panic!("expected Recluse or None, got {other:?}"),
+            }
+        }
+        assert!(saw_some && saw_none);
     }
 }

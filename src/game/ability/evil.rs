@@ -155,7 +155,8 @@ fn kill_chain(game: &mut Game, target: SeatId) -> KillResult {
 }
 
 fn mayor_bounce(game: &mut Game, mayor: SeatId) -> KillResult {
-    // Official ST policy: bounce onto a *good* living player, never Demon/Minion.
+    // ST policy: bounce onto any killable living seat except the Imp (and other active
+    // Mayors, to avoid bounce chains). Minions are allowed.
     let mut candidates: Vec<SeatId> = game
         .seats
         .iter()
@@ -166,8 +167,8 @@ fn mayor_bounce(game: &mut Game, mayor: SeatId) -> KillResult {
             let Some(c) = s.true_character else {
                 return false;
             };
-            // Good only (Townsfolk / Outsider); exclude Imp, Minions, other active Mayors.
-            if c.team() != Team::Good {
+            // Exclude Imp only among evil; Minions may die to the bounce.
+            if c == Character::Imp {
                 return false;
             }
             if c == Character::Mayor && !s.ability_disabled() {
