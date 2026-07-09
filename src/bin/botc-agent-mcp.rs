@@ -138,14 +138,13 @@ fn handle_line(
                 .map_err(|e| (-32000_i64, e))
         }
         other => {
-            // #54: namespaced MCP methods (resources/list, prompts/list, …) are
-            // not tools — answer Method not found locally. Never forward them as
-            // bogus tool calls (ACL would allow them and the engine would return
-            // a tools/call-shaped success with isError).
-            if other.is_empty() || other.contains('/') {
+            // #54/#59: only forward genuine bare tool names. Namespaced MCP methods
+            // (resources/list, …) and unknown bare typos (nominatee, foobar) must get
+            // local -32601 — never a tools/call-shaped isError success via the engine.
+            if other.is_empty() || other.contains('/') || !mcp_server::is_known_tool(other) {
                 Err((-32601, format!("method not found: {other}")))
             } else if !proxy_acl::tool_allowed(other, is_host) {
-                // Legacy bare-tool dispatch denied by ACL → Invalid params.
+                // Known tool but denied for this agent role → Invalid params.
                 Err((
                     proxy_acl::ACL_DENY_JSONRPC_CODE,
                     format!("tool not available for this agent role: {other}"),

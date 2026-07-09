@@ -61,3 +61,18 @@ mod tests {
         assert_ne!(ACL_DENY_JSONRPC_CODE, -32601);
     }
 }
+
+// #59: bare unknown method must not pass a "known tool" gate (mirrors proxy other-arm).
+#[cfg(test)]
+mod bare_method_gate_tests {
+    use crate::mcp_server;
+
+    #[test]
+    fn unknown_bare_names_are_not_known_tools() {
+        assert!(!mcp_server::is_known_tool("foobar"));
+        assert!(!mcp_server::is_known_tool("nominatee"));
+        assert!(!mcp_server::is_known_tool("resources/list"));
+        assert!(mcp_server::is_known_tool("nominate"));
+        assert!(mcp_server::is_known_tool("say"));
+    }
+}
