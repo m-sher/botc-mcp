@@ -8,14 +8,16 @@ mod views;
 
 pub use rules_text::{load_character_rules_text, rules_markdown_path};
 pub use views::{
-    AwaitingView, CharacterRulesView, HostPendingView, HostSeatView, HostStateView,
-    PrivateStateView, PublicStateView,
+    AwaitingView, CharacterRulesView, HostDecisionView, HostPendingView, HostSeatView,
+    HostStateView, PrivateStateView, PublicStateView,
 };
 
 use crate::auth::{Actor, Token};
 use crate::comms::{EventId, PublicEvent};
 use crate::error::GameError;
-use crate::game::{CreateGameResult, Game, GameId, NightActionPayload, SeatId, StartOpts};
+use crate::game::{
+    CreateGameResult, Game, GameId, HostDecision, NightActionPayload, SeatId, StartOpts,
+};
 use crate::roles::Character;
 use crate::store::GameStore;
 
@@ -208,12 +210,20 @@ pub fn get_host_state(game: &Game, token: &Token) -> Result<HostStateView, ToolE
         step_debug: format!("{:?}", p.step),
     });
 
+    let pending_host = game
+        .pending_host
+        .as_ref()
+        .map(HostDecisionView::from_pending);
+
     Ok(HostStateView {
         seed: game.seed,
         secret_salt: game.secret_salt,
         phase: format!("{:?}", game.phase),
         seats,
         pending,
+        pending_host,
+        registration_mode: format!("{:?}", game.registration_mode),
+        host_lie_queue_len: game.host_lie_queue.len(),
         red_herring: game.red_herring,
         demon_bluffs: game
             .demon_bluffs
@@ -269,9 +279,23 @@ pub fn night_action(
     game.night_action(token, payload).map_err(ToolError::from)
 }
 
-/// Host only: apply default for pending wake and continue night_tick.
+/// Host only: apply default for pending wake (or pending host decision) and continue night_tick.
 pub fn skip_night_action(game: &mut Game, host: &Token) -> Result<(), ToolError> {
     game.skip_night_action(host).map_err(ToolError::from)
+}
+
+/// Host only: resolve Mayor bounce / starpass pick.
+pub fn host_decide(
+    game: &mut Game,
+    host: &Token,
+    decision: HostDecision,
+) -> Result<(), ToolError> {
+    game.host_decide(host, decision).map_err(ToolError::from)
+}
+
+/// Host only: enqueue free-text false info for the next disabled info result (FIFO).
+pub fn host_queue_lie(game: &mut Game, host: &Token, text: String) -> Result<(), ToolError> {
+    game.host_queue_lie(host, text).map_err(ToolError::from)
 }
 
 /// Host: Discussion → Nominations.

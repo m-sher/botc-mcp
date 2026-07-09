@@ -1,5 +1,7 @@
 //! `Game` aggregate: seats, phase, comms handles, win state.
 
+use std::collections::VecDeque;
+
 use crate::auth::{Actor, Token, TokenBook};
 use crate::comms::{PrivateInboxes, PrivateMessage, PublicEvent, PublicLog};
 use crate::error::GameError;
@@ -8,6 +10,9 @@ use crate::game::night::{build_first_night_queue, PendingWake};
 use crate::game::phase::{NightStep, Phase, Winner};
 use crate::game::seat::Seat;
 use crate::game::setup::{build_bag, setup_markers, validate_fixed_assignments, StartOpts};
+use crate::game::st_policy::{
+    HostDecision, MayorRedirectChoice, PendingHostDecision, RegistrationMode,
+};
 use crate::rng::SeededRng;
 use crate::roles::{Character, CharacterType, Team};
 
@@ -56,6 +61,12 @@ pub struct Game {
     pub night_cursor: usize,
     /// Active player wake, if the night machine is waiting on a choice.
     pub pending_night: Option<PendingWake>,
+    /// Host-only night decision (Mayor bounce / starpass); pauses night_tick.
+    pub pending_host: Option<PendingHostDecision>,
+    /// Spy/Recluse registration policy for this game.
+    pub registration_mode: RegistrationMode,
+    /// FIFO free-text lies for disabled info roles (host-authored; else seeded-random).
+    pub host_lie_queue: VecDeque<String>,
     /// Seats that died during the current night (demon kill, etc.).
     pub deaths_tonight: Vec<SeatId>,
     /// Seat executed during the current day, if any (Undertaker eligibility).
@@ -167,6 +178,9 @@ impl Game {
                 night_queue: Vec::new(),
                 night_cursor: 0,
                 pending_night: None,
+                pending_host: None,
+                registration_mode: RegistrationMode::Random,
+                host_lie_queue: VecDeque::new(),
                 deaths_tonight: Vec::new(),
                 executed_today: None,
                 day_nominators: Vec::new(),
@@ -233,16 +247,32 @@ impl Game {
         }
 
         let n = self.seats.len() as u8;
-        let (assignments, red_herring, demon_bluffs) = if let Some(fixed) = opts.assignments {
-            validate_fixed_assignments(self.seats.len(), &fixed)?;
-            let bag_set: Vec<Character> = fixed.iter().map(|a| a.true_character).collect();
-            let (red_herring, demon_bluffs) = setup_markers(&self.rng, n, &fixed, &bag_set);
-            (fixed, red_herring, demon_bluffs)
-        } else {
-            let bag = build_bag(&self.rng, n)?;
-            (bag.assignments, bag.red_herring, bag.demon_bluffs)
-        };
+        let (mut assignments, mut red_herring, mut demon_bluffs) =
+            if let Some(fixed) = opts.assignments {
+                validate_fixed_assignments(self.seats.len(), &fixed)?;
+                let bag_set: Vec<Character> = fixed.iter().map(|a| a.true_character).collect();
+                let (red_herring, demon_bluffs) = setup_markers(&self.rng, n, &fixed, &bag_set);
+                (fixed, red_herring, demon_bluffs)
+            } else {
+                let bag = build_bag(&self.rng, n)?;
+                (bag.assignments, bag.red_herring, bag.demon_bluffs)
+            };
 
+        let bag_set: Vec<Character> = assignments.iter().map(|a| a.true_character).collect();
+
+        if let Some(faces) = opts.drunk_faces {
+            apply_drunk_face_overrides(&mut assignments, &bag_set, &faces)?;
+        }
+
+        if let Some(rh) = opts.red_herring {
+            red_herring = Some(validate_red_herring_override(&assignments, &bag_set, rh)?);
+        }
+
+        if let Some(bluffs) = opts.demon_bluffs {
+            demon_bluffs = validate_demon_bluffs_override(&bag_set, &assignments, bluffs)?;
+        }
+
+        self.registration_mode = opts.registration_mode;
         self.red_herring = red_herring;
         self.demon_bluffs = demon_bluffs;
         self.apply_assignments_and_brief(assignments)
@@ -324,6 +354,7 @@ impl Game {
         self.current_nomination = None;
         self.closed_nominations.clear();
         self.pending_night = None;
+        self.pending_host = None;
         self.night_queue = build_first_night_queue(self);
         self.night_cursor = 0;
         self.phase = Phase::FirstNight { cursor: 0 };
@@ -352,4 +383,203 @@ impl Game {
             .collect::<Result<Vec<_>, _>>()?;
         self.start_game_assign(mapped)
     }
+
+    /// Host: push a free-text lie for the next disabled info result (FIFO).
+    pub fn host_queue_lie(&mut self, host: &Token, text: String) -> Result<(), GameError> {
+        match self.tokens.resolve(host) {
+            Some(Actor::Host) => {}
+            _ => return Err(GameError::Unauthorized),
+        }
+        self.host_lie_queue.push_back(text);
+        Ok(())
+    }
+
+    /// Host: resolve a pending Mayor bounce / starpass decision.
+    pub fn host_decide(&mut self, host: &Token, decision: HostDecision) -> Result<(), GameError> {
+        match self.tokens.resolve(host) {
+            Some(Actor::Host) => {}
+            _ => return Err(GameError::Unauthorized),
+        }
+        self.apply_host_decision(decision)
+    }
+
+    /// Pop the next host-authored lie, if any (used by disabled info paths).
+    pub fn take_host_lie(&mut self) -> Option<String> {
+        self.host_lie_queue.pop_front()
+    }
+
+    pub(crate) fn apply_host_decision(
+        &mut self,
+        decision: HostDecision,
+    ) -> Result<(), GameError> {
+        let pending = self
+            .pending_host
+            .clone()
+            .ok_or(GameError::IllegalAction("no pending host decision"))?;
+        match (pending, decision) {
+            (
+                PendingHostDecision::MayorRedirect { mayor, .. },
+                HostDecision::MayorRedirect { choice },
+            ) => {
+                self.pending_host = None;
+                crate::game::ability::evil::resolve_mayor_host_choice(self, mayor, choice);
+                self.advance_after_host_decision();
+                Ok(())
+            }
+            (
+                PendingHostDecision::StarpassPick {
+                    minions,
+                    dead_imp,
+                },
+                HostDecision::StarpassPick { minion },
+            ) => {
+                if !minions.contains(&minion) {
+                    return Err(GameError::IllegalAction(
+                        "starpass pick must be a living minion from the pending list",
+                    ));
+                }
+                self.pending_host = None;
+                crate::game::ability::evil::complete_starpass(self, dead_imp, minion);
+                self.advance_after_host_decision();
+                Ok(())
+            }
+            _ => Err(GameError::IllegalAction(
+                "host decision does not match pending decision type",
+            )),
+        }
+    }
+
+    pub(crate) fn apply_default_host_decision(&mut self) -> Result<(), GameError> {
+        let pending = self
+            .pending_host
+            .clone()
+            .ok_or(GameError::IllegalAction("no pending host decision"))?;
+        match pending {
+            PendingHostDecision::MayorRedirect { living_others, .. } => {
+                // Prefer nobody dies when any alternative seat exists; else kill Mayor.
+                let choice = if living_others.is_empty() {
+                    MayorRedirectChoice::KillMayor
+                } else {
+                    MayorRedirectChoice::Nobody
+                };
+                self.apply_host_decision(HostDecision::MayorRedirect { choice })
+            }
+            PendingHostDecision::StarpassPick { minions, dead_imp } => {
+                // Random among living minions (previous default).
+                let mut sorted = minions;
+                sorted.sort_by_key(|id| id.0);
+                let label = format!("starpass:c{}", self.night_cursor);
+                let mut rng = self.rng.substream(&label);
+                use rand::seq::SliceRandom;
+                let minion = *sorted
+                    .choose(&mut rng)
+                    .ok_or(GameError::IllegalAction("no minions for starpass default"))?;
+                let _ = dead_imp;
+                self.apply_host_decision(HostDecision::StarpassPick { minion })
+            }
+        }
+    }
+
+    fn advance_after_host_decision(&mut self) {
+        // DemonKill player step already cleared pending_night; advance cursor and continue.
+        self.night_cursor += 1;
+        match &mut self.phase {
+            Phase::FirstNight { cursor } => *cursor = self.night_cursor,
+            Phase::Night { cursor, .. } => *cursor = self.night_cursor,
+            _ => {}
+        }
+        self.night_tick();
+    }
+}
+
+fn apply_drunk_face_overrides(
+    assignments: &mut [RoleAssignment],
+    bag_set: &[Character],
+    faces: &[(SeatId, Character)],
+) -> Result<(), GameError> {
+    let in_bag: std::collections::HashSet<Character> = bag_set.iter().copied().collect();
+    for &(seat, face) in faces {
+        if face.character_type() != CharacterType::Townsfolk {
+            return Err(GameError::IllegalAction(
+                "drunk face override must be Townsfolk",
+            ));
+        }
+        if face == Character::Drunk {
+            return Err(GameError::IllegalAction("drunk face cannot be Drunk"));
+        }
+        if in_bag.contains(&face) {
+            return Err(GameError::IllegalAction(
+                "drunk face override must not be in the bag",
+            ));
+        }
+        let a = assignments
+            .iter_mut()
+            .find(|a| a.seat == seat)
+            .ok_or(GameError::NoSuchSeat)?;
+        if a.true_character != Character::Drunk {
+            return Err(GameError::IllegalAction(
+                "drunk face override only valid for Drunk seats",
+            ));
+        }
+        a.believed_character = Some(face);
+    }
+    Ok(())
+}
+
+fn validate_red_herring_override(
+    assignments: &[RoleAssignment],
+    bag_set: &[Character],
+    rh: SeatId,
+) -> Result<SeatId, GameError> {
+    if !bag_set.contains(&Character::FortuneTeller) {
+        return Err(GameError::IllegalAction(
+            "red_herring override requires Fortune Teller in play",
+        ));
+    }
+    let a = assignments
+        .iter()
+        .find(|a| a.seat == rh)
+        .ok_or(GameError::NoSuchSeat)?;
+    if a.true_character.team() != Team::Good {
+        return Err(GameError::IllegalAction(
+            "red_herring must be a good seat",
+        ));
+    }
+    Ok(rh)
+}
+
+fn validate_demon_bluffs_override(
+    bag_set: &[Character],
+    assignments: &[RoleAssignment],
+    bluffs: Vec<Character>,
+) -> Result<Vec<Character>, GameError> {
+    if bluffs.len() != 3 {
+        return Err(GameError::IllegalAction(
+            "demon_bluffs override must list exactly 3 characters",
+        ));
+    }
+    let in_bag: std::collections::HashSet<Character> = bag_set.iter().copied().collect();
+    let drunk_faces: std::collections::HashSet<Character> = assignments
+        .iter()
+        .filter(|a| a.true_character == Character::Drunk)
+        .filter_map(|a| a.believed_character)
+        .collect();
+    for c in &bluffs {
+        if c.team() != Team::Good {
+            return Err(GameError::IllegalAction(
+                "demon_bluffs must be good characters",
+            ));
+        }
+        if in_bag.contains(c) {
+            return Err(GameError::IllegalAction(
+                "demon_bluffs must not be in the bag",
+            ));
+        }
+        if drunk_faces.contains(c) {
+            return Err(GameError::IllegalAction(
+                "demon_bluffs must not match Drunk faces",
+            ));
+        }
+    }
+    Ok(bluffs)
 }

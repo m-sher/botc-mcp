@@ -6,6 +6,7 @@ use rand::Rng;
 use crate::error::GameError;
 use crate::game::ids::SeatId;
 use crate::game::state::RoleAssignment;
+use crate::game::st_policy::RegistrationMode;
 use crate::rng::SeededRng;
 use crate::roles::{
     all_minions, all_outsiders, all_townsfolk, Character, CharacterType, Team,
@@ -25,6 +26,15 @@ pub struct Composition {
 pub struct StartOpts {
     /// Full seat overrides for tests / scripted evals. Hard-fail if no Imp.
     pub assignments: Option<Vec<RoleAssignment>>,
+    /// Override Drunk faces for listed seats (must be Townsfolk not in the bag).
+    /// Applied after bag/fixed assignment; only seats that are true Drunk are updated.
+    pub drunk_faces: Option<Vec<(SeatId, Character)>>,
+    /// Override Fortune Teller red herring (must be a good seat when FT is in play).
+    pub red_herring: Option<SeatId>,
+    /// Override Imp bluffs (exactly 3 good characters not in the bag when provided).
+    pub demon_bluffs: Option<Vec<Character>>,
+    /// Spy/Recluse registration policy (default: random).
+    pub registration_mode: RegistrationMode,
 }
 
 /// Result of sampling a bag and assigning seats.

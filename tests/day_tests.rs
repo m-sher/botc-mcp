@@ -17,7 +17,7 @@ fn names(n: usize) -> Vec<String> {
 
 /// Finish first night (skip pending wakes) into Day 1 Discussion.
 fn to_day1(g: &mut Game, host: &botc_mcp::auth::Token) {
-    while g.pending_night.is_some() {
+    while g.pending_night.is_some() || g.pending_host.is_some() {
         skip_night_action(g, host).unwrap();
     }
     assert!(
@@ -47,7 +47,8 @@ fn vote_threshold_six_living_needs_three() {
                 RoleAssignment::normal(SeatId(4), Character::Poisoner),
                 RoleAssignment::normal(SeatId(5), Character::Imp),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -103,7 +104,8 @@ fn virgin_kills_townsfolk_nominator() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -140,7 +142,8 @@ fn drunk_nominator_does_not_trigger_virgin() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -171,7 +174,8 @@ fn ghost_yes_only_once() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -222,7 +226,8 @@ fn butler_yes_requires_master_yes() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -262,7 +267,8 @@ fn host_close_vote_without_all_living() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -297,7 +303,8 @@ fn poisoner_executed_clears_active_poison() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     // N1: Poisoner poisons Soldier (seat 0).
@@ -346,7 +353,8 @@ fn dead_pass_vote_keeps_ghost_and_allows_auto_close() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     to_day1(&mut g, &host);

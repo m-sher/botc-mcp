@@ -27,7 +27,8 @@ fn fixture_drunk_empath_face() -> Game {
                 RoleAssignment::normal(SeatId(3), Character::Chef),
                 RoleAssignment::normal(SeatId(4), Character::Soldier),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .expect("start_game");
     g
@@ -106,7 +107,8 @@ fn other_night_queue_has_demon_kill_and_monk_not_n1_setup() {
                 RoleAssignment::normal(SeatId(3), Character::Empath),
                 RoleAssignment::normal(SeatId(4), Character::Soldier),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     // Kill monk for eligibility checks later; queue uses alive seats.
@@ -153,7 +155,8 @@ fn seven_player_first_night_includes_briefings() {
                 RoleAssignment::normal(SeatId(5), Character::Imp),
                 RoleAssignment::normal(SeatId(6), Character::Soldier),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     let q = build_first_night_queue(&g);
@@ -211,7 +214,8 @@ fn fixture_7p_poisoner_imp() -> (Game, botc_mcp::auth::Token, Vec<botc_mcp::auth
                 RoleAssignment::normal(SeatId(5), Character::Imp),
                 RoleAssignment::normal(SeatId(6), Character::Soldier),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     (g, host, tokens)
@@ -354,7 +358,8 @@ fn empath_counts_living_evil_neighbors() {
                 RoleAssignment::normal(SeatId(3), Character::Chef), // good
                 RoleAssignment::normal(SeatId(4), Character::Soldier), // good
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     // No choice roles → night auto-resolves through Empath to dawn.
@@ -381,7 +386,8 @@ fn drunk_empath_gets_wrong_info() {
                 RoleAssignment::normal(SeatId(3), Character::Chef),
                 RoleAssignment::normal(SeatId(4), Character::Soldier),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     let results = night_results_for(&g, SeatId(0));
@@ -413,7 +419,8 @@ fn fortune_teller_red_herring_pings_yes() {
                 RoleAssignment::normal(SeatId(3), Character::Chef),
                 RoleAssignment::normal(SeatId(4), Character::Soldier),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     // Force herring to a good non-demon seat and pick herring + good townsfolk.
@@ -455,7 +462,8 @@ fn librarian_zero_outsiders_reports_zero() {
                 RoleAssignment::normal(SeatId(3), Character::Chef),
                 RoleAssignment::normal(SeatId(4), Character::Soldier),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     // Poison someone other than the Librarian so info stays truthful.
@@ -465,7 +473,7 @@ fn librarian_zero_outsiders_reports_zero() {
         NightActionPayload::PickOne { target: SeatId(4) },
     )
     .unwrap();
-    while g.pending_night.is_some() {
+    while g.pending_night.is_some() || g.pending_host.is_some() {
         skip_night_action(&mut g, &host).unwrap();
     }
     let results = night_results_for(&g, SeatId(0));
@@ -487,7 +495,7 @@ fn finish_n1_enter_n2(
     g: &mut Game,
     host: &botc_mcp::auth::Token,
 ) {
-    while g.pending_night.is_some() {
+    while g.pending_night.is_some() || g.pending_host.is_some() {
         skip_night_action(g, host).unwrap();
     }
     assert!(
@@ -514,7 +522,8 @@ fn fixture_n2_monk_imp_soldier() -> (Game, botc_mcp::auth::Token, Vec<botc_mcp::
                 RoleAssignment::normal(SeatId(3), Character::Empath),
                 RoleAssignment::normal(SeatId(4), Character::Soldier),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     finish_n1_enter_n2(&mut g, &host);
@@ -609,6 +618,8 @@ fn imp_starpass_transfers_to_minion() {
     )
     .unwrap();
     assert!(!g.seats[1].alive, "old Imp must be dead");
+    assert!(g.pending_host.is_some(), "starpass waits for host");
+    skip_night_action(&mut g, &host).unwrap();
     // Only minion is Poisoner seat 2 → becomes Imp
     assert_eq!(g.seats[2].true_character, Some(Character::Imp));
     assert!(g.seats[2].alive);
@@ -654,7 +665,9 @@ fn dawn_announces_deaths_publicly_not_roles() {
     .unwrap();
     assert!(!g.seats[3].alive);
     // Finish night (Empath auto if any remaining, Butler none, Dawn)
-    while g.pending_night.is_some() && !matches!(g.phase, Phase::Day { .. } | Phase::Ended { .. }) {
+    while (g.pending_night.is_some() || g.pending_host.is_some())
+        && !matches!(g.phase, Phase::Day { .. } | Phase::Ended { .. })
+    {
         skip_night_action(&mut g, &host).unwrap();
     }
     // If only auto steps left, night_tick should have dawned already after last skip.
@@ -729,7 +742,8 @@ fn spy_night_returns_true_grimoire_when_not_disabled() {
                 RoleAssignment::normal(SeatId(3), Character::Chef),
                 RoleAssignment::normal(SeatId(4), Character::Empath),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     // No choice roles → Spy auto-resolves on first night.
@@ -768,7 +782,8 @@ fn fortune_teller_rejects_same_seat_twice() {
                 RoleAssignment::normal(SeatId(3), Character::Chef),
                 RoleAssignment::normal(SeatId(4), Character::Soldier),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     let p = g.pending_night.as_ref().expect("FT pending");

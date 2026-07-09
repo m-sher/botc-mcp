@@ -7,7 +7,7 @@ use botc_mcp::game::{
     DayStage, EndReason, NightActionPayload, Phase, RoleAssignment, SeatId, Winner,
 };
 use botc_mcp::roles::Character;
-use botc_mcp::tools::{get_private_state, night_action};
+use botc_mcp::tools::{get_private_state, night_action, skip_night_action};
 
 use common::{
     advance_to_imp_kill, assert_good_wins_demon_dead, execute_seat, finish_night, living_count,
@@ -83,7 +83,7 @@ fn scenario_starpass_then_execute_new_imp_good_wins() {
     botc_mcp::tools::end_nominations(&mut g, &host).unwrap();
     assert!(matches!(g.phase, Phase::Night { night: 2, .. }));
 
-    // Starpass: Imp kills self → Poisoner becomes Imp.
+    // Starpass: Imp kills self → host picks (or skips →) Poisoner becomes Imp.
     advance_to_imp_kill(&mut g, &host, &tokens, SeatId(0), None);
     night_action(
         &mut g,
@@ -91,6 +91,8 @@ fn scenario_starpass_then_execute_new_imp_good_wins() {
         NightActionPayload::PickOne { target: SeatId(1) },
     )
     .unwrap();
+    assert!(g.pending_host.is_some());
+    skip_night_action(&mut g, &host).unwrap();
 
     assert!(!g.seats[1].alive);
     assert_eq!(g.seats[2].true_character, Some(Character::Imp));

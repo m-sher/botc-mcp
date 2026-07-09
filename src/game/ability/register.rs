@@ -5,9 +5,26 @@ use rand::Rng;
 
 use crate::game::ids::SeatId;
 use crate::game::state::Game;
+use crate::game::st_policy::RegistrationMode;
 use crate::roles::{
     all_demons, all_minions, all_outsiders, all_townsfolk, Character, CharacterType, Team,
 };
+
+/// Whether this detection takes the Spy/Recluse misregister/hide branch.
+///
+/// - [`RegistrationMode::Random`]: p=0.5
+/// - [`RegistrationMode::AlwaysTrue`]: never
+/// - [`RegistrationMode::AlwaysMisreg`]: always
+fn misreg_branch(game: &Game, event_label: &str) -> bool {
+    match game.registration_mode {
+        RegistrationMode::Random => {
+            let mut rng = game.rng.substream(event_label);
+            rng.gen_bool(0.5)
+        }
+        RegistrationMode::AlwaysTrue => false,
+        RegistrationMode::AlwaysMisreg => true,
+    }
+}
 
 /// Whether `seat` registers as **evil** for Empath / Chef this detection.
 ///
@@ -26,15 +43,10 @@ pub fn register_evil(game: &Game, seat: SeatId, event_label: &str) -> bool {
         return c.team() == Team::Evil;
     }
     match c {
-        Character::Recluse => {
-            let mut rng = game.rng.substream(event_label);
-            rng.gen_bool(0.5)
-        }
-        Character::Spy => {
-            let mut rng = game.rng.substream(event_label);
-            // Register as good with p=0.5 → evil otherwise.
-            !rng.gen_bool(0.5)
-        }
+        // Misreg → evil for Recluse.
+        Character::Recluse => misreg_branch(game, event_label),
+        // Misreg → good (not evil) for Spy.
+        Character::Spy => !misreg_branch(game, event_label),
         other => other.team() == Team::Evil,
     }
 }
@@ -57,10 +69,7 @@ pub fn register_demon_for_ft(game: &Game, seat: SeatId, event_label: &str) -> bo
     }
     match c {
         Character::Imp => true,
-        Character::Recluse => {
-            let mut rng = game.rng.substream(event_label);
-            rng.gen_bool(0.5)
-        }
+        Character::Recluse => misreg_branch(game, event_label),
         Character::Spy => false,
         _ => false,
     }
@@ -71,6 +80,7 @@ pub fn register_demon_for_ft(game: &Game, seat: SeatId, event_label: &str) -> bo
 /// - True Townsfolk: always
 /// - Spy: Townsfolk with p=0.5 (may register as good Townsfolk)
 /// - Others (incl. Drunk Outsider, Recluse): never as Townsfolk
+/// - Ability disabled: true character type only (poisoned Spy = Minion → false)
 pub fn registers_as_townsfolk(game: &Game, seat: SeatId, event_label: &str) -> bool {
     let Some(s) = game.seats.iter().find(|x| x.id == seat) else {
         return false;
@@ -78,11 +88,11 @@ pub fn registers_as_townsfolk(game: &Game, seat: SeatId, event_label: &str) -> b
     let Some(c) = s.true_character else {
         return false;
     };
+    if s.ability_disabled() {
+        return c.character_type() == CharacterType::Townsfolk;
+    }
     match c {
-        Character::Spy => {
-            let mut rng = game.rng.substream(event_label);
-            rng.gen_bool(0.5)
-        }
+        Character::Spy => misreg_branch(game, event_label),
         other => other.character_type() == CharacterType::Townsfolk,
     }
 }
@@ -143,10 +153,10 @@ pub fn register_character(
     let exclude = acting_exclude_chars(game, viewer);
     match c {
         Character::Spy => {
-            let mut rng = game.rng.substream(event_label);
-            if rng.gen_bool(0.5) {
+            if !misreg_branch(game, event_label) {
                 Some(Character::Spy)
             } else {
+                let mut rng = game.rng.substream(&format!("{event_label}:token"));
                 let in_play: Vec<Character> = game
                     .seats
                     .iter()
@@ -173,10 +183,10 @@ pub fn register_character(
             }
         }
         Character::Recluse => {
-            let mut rng = game.rng.substream(event_label);
-            if rng.gen_bool(0.5) {
+            if !misreg_branch(game, event_label) {
                 Some(Character::Recluse)
             } else {
+                let mut rng = game.rng.substream(&format!("{event_label}:token"));
                 let in_play: Vec<Character> = game
                     .seats
                     .iter()
@@ -314,11 +324,11 @@ pub fn register_as_type_owner_with(
                 {
                     return Some(Character::Spy);
                 }
-                let mut rng = game.rng.substream(event_label);
-                if rng.gen_bool(0.5) {
-                    return Some(Character::Spy);
+                // misreg_branch = hide from true minion type.
+                if misreg_branch(game, event_label) {
+                    return None;
                 }
-                return None;
+                return Some(Character::Spy);
             }
             Character::Recluse if ty == CharacterType::Outsider => {
                 if opts.force_true_type
@@ -326,11 +336,10 @@ pub fn register_as_type_owner_with(
                 {
                     return Some(Character::Recluse);
                 }
-                let mut rng = game.rng.substream(event_label);
-                if rng.gen_bool(0.5) {
-                    return Some(Character::Recluse);
+                if misreg_branch(game, event_label) {
+                    return None;
                 }
-                return None;
+                return Some(Character::Recluse);
             }
             other => return Some(other),
         }
@@ -342,63 +351,59 @@ pub fn register_as_type_owner_with(
 
     match (c, ty) {
         (Character::Spy, CharacterType::Townsfolk) => {
-            let mut rng = game.rng.substream(event_label);
-            if rng.gen_bool(0.5) {
-                let in_play = in_play_of_type(game, CharacterType::Townsfolk);
-                let fallback = all_townsfolk().to_vec();
-                Some(pick_misreg_token(
-                    &in_play,
-                    &fallback,
-                    &exclude,
-                    &mut rng,
-                    Character::Soldier,
-                ))
-            } else {
-                None
+            if !misreg_branch(game, event_label) {
+                return None;
             }
+            let mut rng = game.rng.substream(&format!("{event_label}:token"));
+            let in_play = in_play_of_type(game, CharacterType::Townsfolk);
+            let fallback = all_townsfolk().to_vec();
+            Some(pick_misreg_token(
+                &in_play,
+                &fallback,
+                &exclude,
+                &mut rng,
+                Character::Soldier,
+            ))
         }
         (Character::Spy, CharacterType::Outsider) => {
-            let mut rng = game.rng.substream(event_label);
-            if rng.gen_bool(0.5) {
-                let in_play: Vec<Character> = in_play_of_type(game, CharacterType::Outsider)
-                    .into_iter()
-                    .filter(|x| *x != Character::Drunk)
-                    .collect();
-                let fallback: Vec<Character> = all_outsiders()
-                    .iter()
-                    .copied()
-                    .filter(|x| *x != Character::Drunk)
-                    .collect();
-                Some(pick_misreg_token(
-                    &in_play,
-                    &fallback,
-                    &exclude,
-                    &mut rng,
-                    Character::Butler,
-                ))
-            } else {
-                None
+            if !misreg_branch(game, event_label) {
+                return None;
             }
+            let mut rng = game.rng.substream(&format!("{event_label}:token"));
+            let in_play: Vec<Character> = in_play_of_type(game, CharacterType::Outsider)
+                .into_iter()
+                .filter(|x| *x != Character::Drunk)
+                .collect();
+            let fallback: Vec<Character> = all_outsiders()
+                .iter()
+                .copied()
+                .filter(|x| *x != Character::Drunk)
+                .collect();
+            Some(pick_misreg_token(
+                &in_play,
+                &fallback,
+                &exclude,
+                &mut rng,
+                Character::Butler,
+            ))
         }
         (Character::Recluse, CharacterType::Minion) => {
-            let mut rng = game.rng.substream(event_label);
-            if rng.gen_bool(0.5) {
-                let in_play = in_play_of_type(game, CharacterType::Minion);
-                let fallback = all_minions().to_vec();
-                Some(pick_misreg_token(
-                    &in_play,
-                    &fallback,
-                    &exclude,
-                    &mut rng,
-                    Character::Poisoner,
-                ))
-            } else {
-                None
+            if !misreg_branch(game, event_label) {
+                return None;
             }
+            let mut rng = game.rng.substream(&format!("{event_label}:token"));
+            let in_play = in_play_of_type(game, CharacterType::Minion);
+            let fallback = all_minions().to_vec();
+            Some(pick_misreg_token(
+                &in_play,
+                &fallback,
+                &exclude,
+                &mut rng,
+                Character::Poisoner,
+            ))
         }
         (Character::Recluse, CharacterType::Demon) => {
-            let mut rng = game.rng.substream(event_label);
-            if rng.gen_bool(0.5) {
+            if misreg_branch(game, event_label) {
                 Some(Character::Imp)
             } else {
                 None
@@ -423,6 +428,7 @@ mod tests {
             &host,
             StartOpts {
                 assignments: Some(assignments),
+                ..Default::default()
             },
         )
         .unwrap();

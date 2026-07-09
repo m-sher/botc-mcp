@@ -24,14 +24,15 @@ fn start_scripted(seed: u64, salt: u64, assignments: Vec<RoleAssignment>) -> (Ga
         &host,
         StartOpts {
             assignments: Some(assignments),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     (g, host, tokens)
 }
 
 fn to_day1(g: &mut Game, host: &botc_mcp::auth::Token) {
-    while g.pending_night.is_some() {
+    while g.pending_night.is_some() || g.pending_host.is_some() {
         skip_night_action(g, host).unwrap();
     }
     assert!(matches!(
@@ -98,7 +99,7 @@ fn two_empaths_real_and_drunk_face_both_wake() {
 
     // Drive night; both should get Empath night results.
     let mut g = g;
-    while g.pending_night.is_some() {
+    while g.pending_night.is_some() || g.pending_host.is_some() {
         skip_night_action(&mut g, &host).unwrap();
     }
     let _ = tokens;
@@ -221,11 +222,14 @@ fn poisoned_ravenkeeper_still_wakes_on_death() {
     ));
 }
 
-/// 4. Mayor bounce never kills Imp; Minions are allowed.
+/// 4. Mayor bounce never kills Imp; Minions are allowed (host kill_other).
 #[test]
 fn mayor_bounce_never_kills_imp() {
-    // 5 seats: Mayor, Soldier, Chef, Poisoner, Imp — bounce may hit good or Minion, never Imp.
-    let (mut g, _host, _tokens) = start_scripted(
+    use botc_mcp::game::{HostDecision, MayorRedirectChoice};
+    use botc_mcp::game::ability::protect::is_demon_killable;
+
+    // 5 seats: Mayor, Soldier, Chef, Poisoner, Imp — host bounce may hit good or Minion, never Imp.
+    let (mut g, host, _tokens) = start_scripted(
         53,
         0,
         vec![
@@ -236,40 +240,51 @@ fn mayor_bounce_never_kills_imp() {
             RoleAssignment::normal(SeatId(4), Character::Imp),
         ],
     );
-    // Clear N1 poison; simulate night 2 kill chain directly.
     for s in &mut g.seats {
         s.poisoned = false;
     }
     g.night_cursor = 3;
-    let mut saw_minion = false;
-    for _ in 0..80 {
-        for s in &mut g.seats {
-            if s.id != SeatId(0) {
-                s.alive = true;
-            }
-        }
-        g.seats[0].alive = true;
-        g.deaths_tonight.clear();
-        g.winner = None;
-        g.phase = Phase::Night { night: 2, cursor: 3 };
-        let r = try_demon_kill(&mut g, SeatId(4), SeatId(0));
-        match r {
-            KillResult::Died(victim) => {
-                assert_ne!(victim, SeatId(4), "must never bounce onto Imp");
-                assert!(g.seats[4].alive, "Imp must remain alive after bounce");
-                assert!(
-                    victim == SeatId(1) || victim == SeatId(2) || victim == SeatId(3),
-                    "bounce victim should be Soldier/Chef/Poisoner, got {victim:?}"
-                );
-                if victim == SeatId(3) {
-                    saw_minion = true;
-                }
-            }
-            KillResult::Survived => {}
-            other => panic!("unexpected {other:?}"),
-        }
+    g.phase = Phase::Night { night: 2, cursor: 3 };
+    assert_eq!(
+        try_demon_kill(&mut g, SeatId(4), SeatId(0)),
+        KillResult::NeedsHost
+    );
+    // Host targeting Imp is treated as nobody dies (not a legal bounce victim).
+    g.host_decide(
+        &host,
+        HostDecision::MayorRedirect {
+            choice: MayorRedirectChoice::KillOther {
+                target: SeatId(4),
+            },
+        },
+    )
+    .unwrap();
+    assert!(g.seats[0].alive && g.seats[4].alive, "Imp target → survived");
+
+    // Fresh attack → bounce onto minion.
+    g.pending_host = None;
+    g.deaths_tonight.clear();
+    g.winner = None;
+    for s in &mut g.seats {
+        s.alive = true;
+        s.poisoned = false;
     }
-    assert!(saw_minion, "expected at least one bounce onto Minion over trials");
+    assert_eq!(
+        try_demon_kill(&mut g, SeatId(4), SeatId(0)),
+        KillResult::NeedsHost
+    );
+    assert!(is_demon_killable(&g, SeatId(3)));
+    g.host_decide(
+        &host,
+        HostDecision::MayorRedirect {
+            choice: MayorRedirectChoice::KillOther {
+                target: SeatId(3),
+            },
+        },
+    )
+    .unwrap();
+    assert!(!g.seats[3].alive, "minion bounce victim dies");
+    assert!(g.seats[4].alive, "Imp remains alive");
 }
 
 /// 5. Ghost vote: living finish voting first does not auto-close before dead votes.

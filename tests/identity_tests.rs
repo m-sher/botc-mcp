@@ -28,7 +28,8 @@ fn fixture_assigned_drunk() -> Game {
                 RoleAssignment::normal(SeatId(3), Character::Chef),
                 RoleAssignment::normal(SeatId(4), Character::Soldier),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .expect("start_game with fixed assignments");
     g
@@ -119,6 +120,7 @@ fn start_game_requires_host_and_imp() {
                     RoleAssignment::normal(SeatId(3), Character::Empath),
                     RoleAssignment::normal(SeatId(4), Character::Soldier),
                 ]),
+                ..Default::default()
             },
         )
         .unwrap_err();
@@ -135,6 +137,7 @@ fn start_game_requires_host_and_imp() {
                     RoleAssignment::normal(SeatId(3), Character::Soldier),
                     RoleAssignment::normal(SeatId(4), Character::Monk),
                 ]),
+                ..Default::default()
             },
         )
         .unwrap_err();
@@ -179,7 +182,8 @@ fn start_game_scripted_choice_role_pending_first_night() {
                 RoleAssignment::normal(SeatId(3), Character::Chef),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     assert!(

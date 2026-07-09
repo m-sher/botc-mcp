@@ -1,7 +1,7 @@
 //! Tool-layer view DTOs (public / private / host / character rules).
 
 use crate::comms::{EventId, PrivateMessage};
-use crate::game::{ChoiceSchema, PublicSeatView, SeatId, Winner};
+use crate::game::{ChoiceSchema, PendingHostDecision, PublicSeatView, SeatId, Winner};
 
 /// Public table snapshot — no roles, no pending night seat identity.
 #[derive(Debug, Clone)]
@@ -62,6 +62,14 @@ pub struct HostPendingView {
     pub step_debug: String,
 }
 
+/// Host-only pending Storyteller night decision (Mayor / starpass).
+#[derive(Debug, Clone)]
+pub struct HostDecisionView {
+    pub kind: String,
+    pub detail: String,
+    pub seats: Vec<SeatId>,
+}
+
 /// Host-only full grimoire + pending + seed/salt (eval/debug).
 #[derive(Debug, Clone)]
 pub struct HostStateView {
@@ -71,9 +79,36 @@ pub struct HostStateView {
     pub phase: String,
     pub seats: Vec<HostSeatView>,
     pub pending: Option<HostPendingView>,
+    /// Mayor bounce / starpass host choice (not shown on player views).
+    pub pending_host: Option<HostDecisionView>,
+    pub registration_mode: String,
+    pub host_lie_queue_len: usize,
     pub red_herring: Option<SeatId>,
     pub demon_bluffs: Vec<&'static str>,
     pub winner: Option<Winner>,
+}
+
+impl HostDecisionView {
+    pub fn from_pending(p: &PendingHostDecision) -> Self {
+        match p {
+            PendingHostDecision::MayorRedirect {
+                mayor,
+                living_others,
+            } => Self {
+                kind: "mayor_redirect".into(),
+                detail: format!("mayor seat {}", mayor.0),
+                seats: living_others.clone(),
+            },
+            PendingHostDecision::StarpassPick {
+                minions,
+                dead_imp,
+            } => Self {
+                kind: "starpass_pick".into(),
+                detail: format!("dead_imp seat {}", dead_imp.0),
+                seats: minions.clone(),
+            },
+        }
+    }
 }
 
 /// Public character sheet entry with loaded markdown body.

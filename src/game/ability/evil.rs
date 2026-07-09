@@ -1,11 +1,10 @@
 //! Poisoner, Imp kill, starpass, Mayor bounce (§9.4–9.5, §11.3–11.4).
 
-use rand::seq::SliceRandom;
-
 use crate::comms::PrivateMessage;
 use crate::game::ids::SeatId;
 use crate::game::phase::NightStep;
 use crate::game::state::Game;
+use crate::game::st_policy::{MayorRedirectChoice, PendingHostDecision};
 use crate::game::win;
 use crate::roles::{Character, CharacterType, Team};
 
@@ -16,7 +15,7 @@ use super::protect::{is_demon_killable, is_monk_protected, is_soldier_immune};
 pub enum KillResult {
     /// Target already dead — kill sinks with no public death.
     Sank,
-    /// No death (Monk, Soldier, Mayor bounce nowhere, or Imp poisoned).
+    /// No death (Monk, Soldier, Mayor nobody, or Imp poisoned).
     Survived,
     /// A seat died to the demon (normal kill or Mayor bounce victim).
     Died(SeatId),
@@ -25,6 +24,8 @@ pub enum KillResult {
         dead_imp: SeatId,
         new_imp: SeatId,
     },
+    /// Night paused for host Mayor bounce or starpass pick (`game.pending_host`).
+    NeedsHost,
 }
 
 /// Clear `poisoned` on every seat (start of Poisoner step).
@@ -71,7 +72,7 @@ pub fn try_demon_kill(game: &mut Game, demon_seat: SeatId, target: SeatId) -> Ki
 }
 
 fn resolve_starpass(game: &mut Game, imp_seat: SeatId) -> KillResult {
-    // Imp dies first.
+    // Imp dies first; host then picks which living minion becomes Imp.
     mark_dead(game, imp_seat);
 
     let mut living_minions: Vec<SeatId> = game
@@ -92,10 +93,15 @@ fn resolve_starpass(game: &mut Game, imp_seat: SeatId) -> KillResult {
     }
 
     living_minions.sort_by_key(|id| id.0);
-    let label = format!("starpass:c{}", game.night_cursor);
-    let mut rng = game.rng.substream(&label);
-    let new_imp = *living_minions.choose(&mut rng).expect("non-empty minions");
+    game.pending_host = Some(PendingHostDecision::StarpassPick {
+        minions: living_minions,
+        dead_imp: imp_seat,
+    });
+    KillResult::NeedsHost
+}
 
+/// Finish starpass after host (or default) picks `new_imp` minion seat.
+pub(crate) fn complete_starpass(game: &mut Game, dead_imp: SeatId, new_imp: SeatId) -> KillResult {
     let was_poisoner = game
         .seats
         .iter()
@@ -123,7 +129,7 @@ fn resolve_starpass(game: &mut Game, imp_seat: SeatId) -> KillResult {
 
     win::win_check(game);
     KillResult::Starpass {
-        dead_imp: imp_seat,
+        dead_imp,
         new_imp,
     }
 }
@@ -144,53 +150,66 @@ fn kill_chain(game: &mut Game, target: SeatId) -> KillResult {
         return KillResult::Survived;
     }
 
-    // Mayor bounce (§11.3).
+    // Mayor bounce (§11.3) — host chooses; do not auto-resolve.
     let is_mayor = seat.true_character == Some(Character::Mayor) && !seat.ability_disabled();
     if is_mayor {
-        return mayor_bounce(game, target);
+        return mayor_request_host(game, target);
     }
 
     die_from_demon(game, target);
     KillResult::Died(target)
 }
 
-fn mayor_bounce(game: &mut Game, mayor: SeatId) -> KillResult {
-    // ST policy: bounce onto any killable living seat except the Imp (and other active
-    // Mayors, to avoid bounce chains). Minions are allowed.
-    let mut candidates: Vec<SeatId> = game
+fn mayor_request_host(game: &mut Game, mayor: SeatId) -> KillResult {
+    let mut living_others: Vec<SeatId> = game
         .seats
         .iter()
-        .filter(|s| {
-            if s.id == mayor || !is_demon_killable(game, s.id) {
-                return false;
-            }
-            let Some(c) = s.true_character else {
-                return false;
-            };
-            // Exclude Imp only among evil; Minions may die to the bounce.
-            if c == Character::Imp {
-                return false;
-            }
-            if c == Character::Mayor && !s.ability_disabled() {
-                return false;
-            }
-            true
-        })
+        .filter(|s| s.alive && s.id != mayor)
         .map(|s| s.id)
         .collect();
-    candidates.sort_by_key(|id| id.0);
+    living_others.sort_by_key(|id| id.0);
+    game.pending_host = Some(PendingHostDecision::MayorRedirect {
+        mayor,
+        living_others,
+    });
+    KillResult::NeedsHost
+}
 
-    if candidates.is_empty() {
-        // Nowhere to bounce → Mayor dies to the demon.
-        die_from_demon(game, mayor);
-        return KillResult::Died(mayor);
+/// Apply host Mayor redirect choice (or skip default).
+pub(crate) fn resolve_mayor_host_choice(
+    game: &mut Game,
+    mayor: SeatId,
+    choice: MayorRedirectChoice,
+) -> KillResult {
+    match choice {
+        MayorRedirectChoice::KillMayor => {
+            die_from_demon(game, mayor);
+            KillResult::Died(mayor)
+        }
+        MayorRedirectChoice::Nobody => KillResult::Survived,
+        MayorRedirectChoice::KillOther { target } => {
+            if target == mayor {
+                die_from_demon(game, mayor);
+                return KillResult::Died(mayor);
+            }
+            // Non-killable / dead / missing → nobody dies (Survived).
+            if !is_demon_killable(game, target) {
+                return KillResult::Survived;
+            }
+            // Avoid bouncing onto Imp or chaining active Mayors (legacy bounce policy).
+            let Some(s) = game.seats.iter().find(|x| x.id == target) else {
+                return KillResult::Survived;
+            };
+            if s.true_character == Some(Character::Imp) {
+                return KillResult::Survived;
+            }
+            if s.true_character == Some(Character::Mayor) && !s.ability_disabled() {
+                return KillResult::Survived;
+            }
+            die_from_demon(game, target);
+            KillResult::Died(target)
+        }
     }
-
-    let label = format!("mayor_bounce:c{}", game.night_cursor);
-    let mut rng = game.rng.substream(&label);
-    let bounce = *candidates.choose(&mut rng).expect("non-empty candidates");
-    die_from_demon(game, bounce);
-    KillResult::Died(bounce)
 }
 
 /// Mark dead, track night death, maybe insert Ravenkeeper wake / SW conversion.

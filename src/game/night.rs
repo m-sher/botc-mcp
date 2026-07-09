@@ -176,7 +176,7 @@ impl Game {
     /// Process night queue from the cursor until a player choice is pending or dawn completes.
     pub fn night_tick(&mut self) {
         loop {
-            if self.pending_night.is_some() {
+            if self.pending_night.is_some() || self.pending_host.is_some() {
                 return;
             }
             if !matches!(self.phase, Phase::FirstNight { .. } | Phase::Night { .. }) {
@@ -213,11 +213,15 @@ impl Game {
         self.apply_night_action(seat, payload)
     }
 
-    /// Host applies a documented default for the pending wake and continues.
+    /// Host applies a documented default for the pending wake (or pending host decision) and continues.
     pub fn skip_night_action(&mut self, host: &Token) -> Result<(), GameError> {
         match self.tokens.resolve(host) {
             Some(Actor::Host) => {}
             _ => return Err(GameError::Unauthorized),
+        }
+        // Host decisions (Mayor / starpass) take priority when set.
+        if self.pending_host.is_some() {
+            return self.apply_default_host_decision();
         }
         let pending = self
             .pending_night
@@ -244,9 +248,13 @@ impl Game {
         }
 
         self.validate_payload(&pending, &payload)?;
-        self.resolve_pending_action(&pending, &payload)?;
+        let needs_host = self.resolve_pending_action(&pending, &payload)?;
 
         self.pending_night = None;
+        if needs_host {
+            // Cursor stays on DemonKill until host_decide / skip resolves pending_host.
+            return Ok(());
+        }
         self.advance_cursor();
         self.night_tick();
         Ok(())
@@ -476,6 +484,7 @@ impl Game {
     pub fn enter_night(&mut self, night: u32) {
         self.deaths_tonight.clear();
         self.pending_night = None;
+        self.pending_host = None;
         self.night_queue = build_other_night_queue(self);
         self.night_cursor = 0;
         self.phase = Phase::Night { night, cursor: 0 };
@@ -529,11 +538,13 @@ impl Game {
     }
 
     /// Resolve a submitted night choice (poison/monk/imp via ability; info via Task 8).
+    ///
+    /// Returns `true` when a host decision is now pending (cursor must not advance).
     fn resolve_pending_action(
         &mut self,
         pending: &PendingWake,
         payload: &NightActionPayload,
-    ) -> Result<(), GameError> {
+    ) -> Result<bool, GameError> {
         match pending.step {
             NightStep::Poisoner { seat: _ } => {
                 if let NightActionPayload::PickOne { target } = payload {
@@ -548,7 +559,7 @@ impl Game {
                         crate::game::ability::apply_poison(self, *target);
                     }
                 }
-                Ok(())
+                Ok(false)
             }
             NightStep::Monk { .. } => {
                 if let NightActionPayload::PickOne { target } = payload {
@@ -562,18 +573,22 @@ impl Game {
                         crate::game::ability::protect::apply_monk_protect(self, *target);
                     }
                 }
-                Ok(())
+                Ok(false)
             }
             NightStep::DemonKill { seat: demon } => {
                 if let NightActionPayload::PickOne { target } = payload {
-                    let _ = crate::game::ability::try_demon_kill(self, demon, *target);
+                    let result = crate::game::ability::try_demon_kill(self, demon, *target);
+                    return Ok(matches!(
+                        result,
+                        crate::game::ability::KillResult::NeedsHost
+                    ));
                 }
-                Ok(())
+                Ok(false)
             }
             // Info / Butler / Ravenkeeper (Task 8).
             step => {
                 crate::game::ability::resolve_night_step(self, step, Some(payload))?;
-                Ok(())
+                Ok(false)
             }
         }
     }
@@ -666,6 +681,7 @@ pub fn dawn(game: &mut Game) {
     game.night_queue.clear();
     game.night_cursor = 0;
     game.pending_night = None;
+    game.pending_host = None;
     // Undertaker already ran this night; clear execution marker for the new day.
     game.executed_today = None;
     crate::game::day::reset_day_vote_state(game);
@@ -701,6 +717,7 @@ mod unit_tests {
                     RoleAssignment::normal(SeatId(3), Character::Butler),
                     RoleAssignment::normal(SeatId(4), Character::Spy),
                 ]),
+                ..Default::default()
             },
         )
         .unwrap();

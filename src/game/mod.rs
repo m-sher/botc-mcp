@@ -7,6 +7,7 @@ pub mod night;
 mod phase;
 mod seat;
 pub mod setup;
+pub mod st_policy;
 mod state;
 mod win;
 
@@ -24,6 +25,9 @@ pub use night::{
 pub use phase::{DayStage, EndReason, NightStep, Phase, Winner};
 pub use seat::Seat;
 pub use setup::{BagResult, Composition, StartOpts};
+pub use st_policy::{
+    HostDecision, MayorRedirectChoice, PendingHostDecision, RegistrationMode,
+};
 pub use state::{
     CreateGameResult, Game, Lobby, PublicSeatView, RoleAssignment, MAX_PLAYERS, MIN_PLAYERS,
 };

@@ -29,14 +29,15 @@ fn start_scripted(
         &host,
         StartOpts {
             assignments: Some(assignments),
-        },
+                ..Default::default()
+            },
     )
     .unwrap();
     (g, host, tokens)
 }
 
 fn to_day1(g: &mut Game, host: &botc_mcp::auth::Token) {
-    while g.pending_night.is_some() {
+    while g.pending_night.is_some() || g.pending_host.is_some() {
         skip_night_action(g, host).unwrap();
     }
     assert!(matches!(
@@ -65,7 +66,7 @@ fn washerwoman_pair_excludes_acting_seat() {
     // Drive until day so Washerwoman has resolved (skip N1).
     // Capture WW night result by draining night carefully.
     // First pending is Poisoner; skip until Washerwoman result is in inbox.
-    while g.pending_night.is_some() {
+    while g.pending_night.is_some() || g.pending_host.is_some() {
         skip_night_action(&mut g, &host).unwrap();
     }
     let msgs = g.private_inboxes.since(SeatId(0), 0);
@@ -211,16 +212,18 @@ fn pass_then_ghost_yes_on_later_nomination() {
     assert!(!g.seats[2].ghost_vote_available);
 }
 
-/// #7 Mayor bounce can kill Minion.
+/// #7 Mayor bounce can kill Minion (host kill_other).
 #[test]
 fn mayor_bounce_can_kill_minion() {
-    let (mut g, _, _) = start_scripted(
+    use botc_mcp::game::{HostDecision, MayorRedirectChoice};
+
+    let (mut g, host, _) = start_scripted(
         103,
         0,
         vec![
             RoleAssignment::normal(SeatId(0), Character::Mayor),
             RoleAssignment::normal(SeatId(1), Character::Soldier), // immune
-            RoleAssignment::normal(SeatId(2), Character::Poisoner), // only soft target often
+            RoleAssignment::normal(SeatId(2), Character::Poisoner),
             RoleAssignment::normal(SeatId(3), Character::Spy),
             RoleAssignment::normal(SeatId(4), Character::Imp),
         ],
@@ -229,25 +232,22 @@ fn mayor_bounce_can_kill_minion() {
         s.poisoned = false;
     }
     g.night_cursor = 1;
-    let mut hit_minion = false;
-    for _ in 0..100 {
-        for s in &mut g.seats {
-            s.alive = true;
-        }
-        g.deaths_tonight.clear();
-        g.winner = None;
-        g.phase = Phase::Night { night: 2, cursor: 1 };
-        match try_demon_kill(&mut g, SeatId(4), SeatId(0)) {
-            KillResult::Died(v) if v == SeatId(2) || v == SeatId(3) => {
-                hit_minion = true;
-                break;
-            }
-            KillResult::Died(v) => assert_ne!(v, SeatId(4)),
-            KillResult::Survived => {}
-            other => panic!("{other:?}"),
-        }
-    }
-    assert!(hit_minion, "bounce should hit a minion sometime");
+    g.phase = Phase::Night { night: 2, cursor: 1 };
+    assert_eq!(
+        try_demon_kill(&mut g, SeatId(4), SeatId(0)),
+        KillResult::NeedsHost
+    );
+    g.host_decide(
+        &host,
+        HostDecision::MayorRedirect {
+            choice: MayorRedirectChoice::KillOther {
+                target: SeatId(2),
+            },
+        },
+    )
+    .unwrap();
+    assert!(!g.seats[2].alive, "host bounce onto Poisoner minion");
+    assert!(g.seats[0].alive, "Mayor survives bounce");
 }
 
 /// #8 Slayer kills Recluse when register_demon_for_ft is true.
@@ -546,10 +546,12 @@ fn poisoned_spy_register_character_always_spy() {
     }
 }
 
-/// #18 Mayor bounce with no candidates → Mayor dies.
+/// #18 Mayor bounce host kill_mayor when no soft bounce targets.
 #[test]
 fn mayor_bounce_empty_kills_mayor() {
-    let (mut g, _, _) = start_scripted(
+    use botc_mcp::game::{HostDecision, MayorRedirectChoice};
+
+    let (mut g, host, _) = start_scripted(
         207,
         0,
         vec![
@@ -560,21 +562,27 @@ fn mayor_bounce_empty_kills_mayor() {
             RoleAssignment::normal(SeatId(4), Character::Imp),
         ],
     );
-    // Kill everyone except Mayor + Imp so bounce has nowhere soft to land.
-    // Soldier immune; make Monk dead; make Poisoner dead; Imp excluded from bounce.
-    g.seats[1].alive = false; // Soldier dead
-    g.seats[2].alive = false; // Monk dead
-    g.seats[3].alive = false; // Poisoner dead
+    // Kill everyone except Mayor + Imp so only Imp remains as living_other.
+    g.seats[1].alive = false;
+    g.seats[2].alive = false;
+    g.seats[3].alive = false;
     for s in &mut g.seats {
         s.poisoned = false;
     }
     g.night_cursor = 1;
     g.deaths_tonight.clear();
-    match try_demon_kill(&mut g, SeatId(4), SeatId(0)) {
-        KillResult::Died(v) => assert_eq!(v, SeatId(0), "Mayor should die when bounce empty"),
-        other => panic!("expected Mayor death, got {other:?}"),
-    }
-    assert!(!g.seats[0].alive);
+    assert_eq!(
+        try_demon_kill(&mut g, SeatId(4), SeatId(0)),
+        KillResult::NeedsHost
+    );
+    g.host_decide(
+        &host,
+        HostDecision::MayorRedirect {
+            choice: MayorRedirectChoice::KillMayor,
+        },
+    )
+    .unwrap();
+    assert!(!g.seats[0].alive, "Mayor dies on host kill_mayor");
 }
 
 /// #16 healthy Investigator path still works with two minions.
@@ -638,11 +646,7 @@ fn ravenkeeper_resolve_excludes_own_token_from_spy() {
                 _ => None,
             })
             .expect("RK result");
-        assert!(
-            !text.contains("Ravenkeeper") || text.starts_with("Ravenkeeper:"),
-            // Message always starts with "Ravenkeeper:" — ensure character named is not Ravenkeeper.
-            "check body"
-        );
+        // Message is "Ravenkeeper: {seat} is the {character}." — assert character body only.
         assert!(
             !text.contains("is the Ravenkeeper"),
             "Spy must not show as Ravenkeeper to RK viewer: {text}"
