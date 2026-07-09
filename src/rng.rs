@@ -100,12 +100,13 @@ mod tests {
 
     #[test]
     fn mix_is_stable_known_vector() {
-        // Fixed vector so a future accidental hasher swap fails loudly.
+        // Fixed golden so a future accidental hasher swap fails loudly.
+        // mix(1, 2, "setup") = FNV-1a over LE seed, salt, then label bytes.
         let h = mix(1, 2, "setup");
+        assert_eq!(h, 0x7351_1a5b_7da1_f833);
         assert_eq!(h, mix(1, 2, "setup"));
         assert_ne!(h, mix(1, 3, "setup"));
         assert_ne!(h, mix(1, 2, "setup2"));
-        // Non-zero for this input (FNV of non-empty).
         assert_ne!(h, 0);
         assert_ne!(h, FNV_OFFSET);
     }

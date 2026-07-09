@@ -1,9 +1,10 @@
-//! Follow-up re-audit fixes (#3–#14).
+//! Follow-up re-audit fixes (#3–#20).
 
-use botc_mcp::game::ability::{register, try_demon_kill, KillResult};
+use botc_mcp::comms::PrivateMessage;
+use botc_mcp::game::ability::{register, resolve_night_step, try_demon_kill, KillResult};
 use botc_mcp::game::night::build_other_night_queue;
 use botc_mcp::game::{
-    DayStage, Game, NightStep, Phase, RoleAssignment, SeatId, StartOpts,
+    DayStage, Game, NightActionPayload, NightStep, Phase, RoleAssignment, SeatId, StartOpts,
 };
 use botc_mcp::roles::{Character, CharacterType};
 use botc_mcp::tools::{
@@ -145,6 +146,7 @@ fn spy_type_owner_prefers_in_play_and_excludes_actor_face() {
     );
     let opts = register::TypeOwnerOpts {
         acting_seat: Some(SeatId(0)),
+        force_true_type: false,
     };
     let in_play_tf = [Character::Washerwoman, Character::Soldier, Character::Chef];
     let mut named = std::collections::HashSet::new();
@@ -355,11 +357,295 @@ fn other_night_queue_omits_prelisted_ravenkeeper() {
     );
 }
 
-/// #11 stable mix differs by salt/label.
+/// #11 / #19 stable mix differs by salt/label; pin golden mix(1,2,"setup").
 #[test]
 fn mix_stable_and_salt_sensitive() {
     use botc_mcp::rng::mix;
     assert_eq!(mix(9, 8, "a"), mix(9, 8, "a"));
     assert_ne!(mix(9, 8, "a"), mix(9, 9, "a"));
     assert_ne!(mix(9, 8, "a"), mix(9, 8, "b"));
+    assert_eq!(mix(1, 2, "setup"), 0x7351_1a5b_7da1_f833);
+}
+
+/// #15 Ravenkeeper never learns their own face from Spy misreg.
+#[test]
+fn ravenkeeper_spy_misreg_excludes_viewer_face() {
+    let (g, _, _) = start_scripted(
+        201,
+        0,
+        vec![
+            RoleAssignment::normal(SeatId(0), Character::Ravenkeeper),
+            RoleAssignment::normal(SeatId(1), Character::Spy),
+            RoleAssignment::normal(SeatId(2), Character::Soldier),
+            RoleAssignment::normal(SeatId(3), Character::Chef),
+            RoleAssignment::normal(SeatId(4), Character::Imp),
+        ],
+    );
+    for i in 0..200u32 {
+        let lab = format!("rk_spy:{i}");
+        let shown = register::register_character(&g, SeatId(1), &lab, Some(SeatId(0)))
+            .expect("Spy registers");
+        assert_ne!(
+            shown,
+            Character::Ravenkeeper,
+            "RK viewer must never see Ravenkeeper token from Spy misreg (draw {i})"
+        );
+    }
+}
+
+fn last_night_result(g: &Game, seat: SeatId) -> String {
+    g.private_inboxes
+        .since(seat, 0)
+        .into_iter()
+        .rev()
+        .find_map(|(_, m)| match m {
+            PrivateMessage::NightResult { text } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("night result")
+}
+
+/// #16 Investigator sole Spy always gets a real minion (Spy) — never pure lie.
+#[test]
+fn investigator_sole_spy_always_truthful_minion() {
+    for seed in 300..380u64 {
+        let (mut g, _, _) = start_scripted(
+            seed,
+            seed,
+            vec![
+                RoleAssignment::normal(SeatId(0), Character::Investigator),
+                RoleAssignment::normal(SeatId(1), Character::Spy),
+                RoleAssignment::normal(SeatId(2), Character::Soldier),
+                RoleAssignment::normal(SeatId(3), Character::Chef),
+                RoleAssignment::normal(SeatId(4), Character::Imp),
+            ],
+        );
+        // Direct resolve — skip full night so Poisoner cannot disable Inv.
+        for s in &mut g.seats {
+            s.poisoned = false;
+        }
+        g.night_cursor = seed as usize % 7;
+        resolve_night_step(&mut g, NightStep::Investigator { seat: SeatId(0) }, None).unwrap();
+        let text = last_night_result(&g, SeatId(0));
+        assert!(
+            text.contains("Spy"),
+            "sole Spy must be named as minion token, got: {text}"
+        );
+        assert!(
+            text.contains("seat 1"),
+            "correct Spy seat should appear in pair: {text}"
+        );
+    }
+}
+
+/// #16 Librarian sole Recluse is truthful (cannot hide as sole outsider).
+#[test]
+fn librarian_sole_recluse_truthful() {
+    let (mut g, _, _) = start_scripted(
+        203,
+        0,
+        vec![
+            RoleAssignment::normal(SeatId(0), Character::Librarian),
+            RoleAssignment::normal(SeatId(1), Character::Recluse),
+            RoleAssignment::normal(SeatId(2), Character::Soldier),
+            RoleAssignment::normal(SeatId(3), Character::Poisoner),
+            RoleAssignment::normal(SeatId(4), Character::Imp),
+        ],
+    );
+    for s in &mut g.seats {
+        s.poisoned = false;
+    }
+    resolve_night_step(&mut g, NightStep::Librarian { seat: SeatId(0) }, None).unwrap();
+    let text = last_night_result(&g, SeatId(0));
+    assert!(
+        !text.contains("0 Outsiders"),
+        "sole Recluse must not yield 0 outsiders: {text}"
+    );
+    assert!(
+        text.contains("Recluse"),
+        "sole Recluse should be named: {text}"
+    );
+}
+
+/// #16 Librarian with no outsiders gets 0 message (not a lie pair).
+#[test]
+fn librarian_zero_outsiders_message() {
+    let (mut g, _, _) = start_scripted(
+        204,
+        0,
+        vec![
+            RoleAssignment::normal(SeatId(0), Character::Librarian),
+            RoleAssignment::normal(SeatId(1), Character::Soldier),
+            RoleAssignment::normal(SeatId(2), Character::Chef),
+            RoleAssignment::normal(SeatId(3), Character::Poisoner),
+            RoleAssignment::normal(SeatId(4), Character::Imp),
+        ],
+    );
+    for s in &mut g.seats {
+        s.poisoned = false;
+    }
+    resolve_night_step(&mut g, NightStep::Librarian { seat: SeatId(0) }, None).unwrap();
+    let text = last_night_result(&g, SeatId(0));
+    assert!(
+        text.contains("0 Outsiders"),
+        "expected 0 Outsiders message, got: {text}"
+    );
+}
+
+/// #16 sole TF Washerwoman still gets a pair naming their character (not pure lie).
+#[test]
+fn washerwoman_sole_tf_names_self_token() {
+    let (mut g, _, _) = start_scripted(
+        205,
+        0,
+        vec![
+            RoleAssignment::normal(SeatId(0), Character::Washerwoman),
+            RoleAssignment::normal(SeatId(1), Character::Recluse),
+            RoleAssignment::normal(SeatId(2), Character::Butler),
+            RoleAssignment::normal(SeatId(3), Character::Poisoner),
+            RoleAssignment::normal(SeatId(4), Character::Imp),
+        ],
+    );
+    for s in &mut g.seats {
+        s.poisoned = false;
+    }
+    resolve_night_step(&mut g, NightStep::Washerwoman { seat: SeatId(0) }, None).unwrap();
+    let text = last_night_result(&g, SeatId(0));
+    assert!(
+        text.contains("is the Washerwoman"),
+        "sole TF should name Washerwoman token: {text}"
+    );
+}
+
+/// #17 poisoned Spy/Recluse cannot misregister (unit covered in register.rs; integration).
+#[test]
+fn poisoned_spy_register_character_always_spy() {
+    let (mut g, _, _) = start_scripted(
+        206,
+        0,
+        vec![
+            RoleAssignment::normal(SeatId(0), Character::Ravenkeeper),
+            RoleAssignment::normal(SeatId(1), Character::Spy),
+            RoleAssignment::normal(SeatId(2), Character::Soldier),
+            RoleAssignment::normal(SeatId(3), Character::Chef),
+            RoleAssignment::normal(SeatId(4), Character::Imp),
+        ],
+    );
+    g.seats[1].poisoned = true;
+    for i in 0..40u32 {
+        let lab = format!("pspy:{i}");
+        assert_eq!(
+            register::register_character(&g, SeatId(1), &lab, Some(SeatId(0))),
+            Some(Character::Spy)
+        );
+        assert!(register::register_evil(&g, SeatId(1), &format!("pe:{i}")));
+        assert_eq!(
+            register::register_as_type_owner(&g, SeatId(1), CharacterType::Townsfolk, &format!("pt:{i}")),
+            None
+        );
+    }
+}
+
+/// #18 Mayor bounce with no candidates → Mayor dies.
+#[test]
+fn mayor_bounce_empty_kills_mayor() {
+    let (mut g, _, _) = start_scripted(
+        207,
+        0,
+        vec![
+            RoleAssignment::normal(SeatId(0), Character::Mayor),
+            RoleAssignment::normal(SeatId(1), Character::Soldier), // immune
+            RoleAssignment::normal(SeatId(2), Character::Monk),
+            RoleAssignment::normal(SeatId(3), Character::Poisoner),
+            RoleAssignment::normal(SeatId(4), Character::Imp),
+        ],
+    );
+    // Kill everyone except Mayor + Imp so bounce has nowhere soft to land.
+    // Soldier immune; make Monk dead; make Poisoner dead; Imp excluded from bounce.
+    g.seats[1].alive = false; // Soldier dead
+    g.seats[2].alive = false; // Monk dead
+    g.seats[3].alive = false; // Poisoner dead
+    for s in &mut g.seats {
+        s.poisoned = false;
+    }
+    g.night_cursor = 1;
+    g.deaths_tonight.clear();
+    match try_demon_kill(&mut g, SeatId(4), SeatId(0)) {
+        KillResult::Died(v) => assert_eq!(v, SeatId(0), "Mayor should die when bounce empty"),
+        other => panic!("expected Mayor death, got {other:?}"),
+    }
+    assert!(!g.seats[0].alive);
+}
+
+/// #16 healthy Investigator path still works with two minions.
+#[test]
+fn investigator_healthy_names_a_minion_token() {
+    let (mut g, _, _) = start_scripted(
+        208,
+        0,
+        vec![
+            RoleAssignment::normal(SeatId(0), Character::Investigator),
+            RoleAssignment::normal(SeatId(1), Character::Spy),
+            RoleAssignment::normal(SeatId(2), Character::Soldier),
+            RoleAssignment::normal(SeatId(3), Character::Poisoner),
+            RoleAssignment::normal(SeatId(4), Character::Imp),
+        ],
+    );
+    for s in &mut g.seats {
+        s.poisoned = false;
+    }
+    resolve_night_step(&mut g, NightStep::Investigator { seat: SeatId(0) }, None).unwrap();
+    let text = last_night_result(&g, SeatId(0));
+    assert!(
+        text.contains("Spy") || text.contains("Poisoner"),
+        "should name a minion token: {text}"
+    );
+}
+
+/// Direct register_character viewer exclusion (#15) via resolve_night_step Ravenkeeper.
+#[test]
+fn ravenkeeper_resolve_excludes_own_token_from_spy() {
+    let (mut g, _, _) = start_scripted(
+        209,
+        0,
+        vec![
+            RoleAssignment::normal(SeatId(0), Character::Ravenkeeper),
+            RoleAssignment::normal(SeatId(1), Character::Spy),
+            RoleAssignment::normal(SeatId(2), Character::Soldier),
+            RoleAssignment::normal(SeatId(3), Character::Chef),
+            RoleAssignment::normal(SeatId(4), Character::Imp),
+        ],
+    );
+    g.seats[0].alive = false;
+    g.night_cursor = 0;
+    for trial in 0..80u32 {
+        // Clear prior results for seat 0 by reading high watermark after each resolve.
+        let before = g.private_inboxes.since(SeatId(0), 0).len();
+        g.rng = botc_mcp::rng::SeededRng::from_seed_and_salt(500 + trial as u64, trial as u64);
+        resolve_night_step(
+            &mut g,
+            NightStep::Ravenkeeper { seat: SeatId(0) },
+            Some(&NightActionPayload::PickOne {
+                target: SeatId(1),
+            }),
+        )
+        .unwrap();
+        let msgs = g.private_inboxes.since(SeatId(0), 0);
+        let text = msgs[before..]
+            .iter()
+            .find_map(|(_, m)| match m {
+                PrivateMessage::NightResult { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("RK result");
+        assert!(
+            !text.contains("Ravenkeeper") || text.starts_with("Ravenkeeper:"),
+            // Message always starts with "Ravenkeeper:" — ensure character named is not Ravenkeeper.
+            "check body"
+        );
+        assert!(
+            !text.contains("is the Ravenkeeper"),
+            "Spy must not show as Ravenkeeper to RK viewer: {text}"
+        );
+    }
 }

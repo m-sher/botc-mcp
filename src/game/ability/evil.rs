@@ -181,7 +181,9 @@ fn mayor_bounce(game: &mut Game, mayor: SeatId) -> KillResult {
     candidates.sort_by_key(|id| id.0);
 
     if candidates.is_empty() {
-        return KillResult::Survived;
+        // Nowhere to bounce → Mayor dies to the demon.
+        die_from_demon(game, mayor);
+        return KillResult::Died(mayor);
     }
 
     let label = format!("mayor_bounce:c{}", game.night_cursor);
