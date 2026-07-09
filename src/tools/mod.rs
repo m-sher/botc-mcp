@@ -267,3 +267,27 @@ pub fn close_vote(game: &mut Game, host: &Token) -> Result<(), ToolError> {
 pub fn end_nominations(game: &mut Game, host: &Token) -> Result<(), ToolError> {
     game.end_nominations(host).map_err(ToolError::from)
 }
+
+/// Player day ability payload (Slayer slay for TB).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DayActionPayload {
+    Slay { target: SeatId },
+}
+
+/// Player: once-per-game day ability (Slayer).
+pub fn day_action(
+    game: &mut Game,
+    token: &Token,
+    payload: DayActionPayload,
+) -> Result<(), ToolError> {
+    let actor = game.tokens.resolve(token).ok_or(ToolError::Unauthorized)?;
+    let seat = match actor {
+        Actor::Player { seat } => seat,
+        Actor::Host => return Err(ToolError::BadRequest("host cannot use day_action")),
+    };
+    match payload {
+        DayActionPayload::Slay { target } => game
+            .day_action_slay(seat, target)
+            .map_err(ToolError::from),
+    }
+}

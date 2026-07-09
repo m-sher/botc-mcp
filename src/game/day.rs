@@ -4,9 +4,9 @@ use crate::auth::{Actor, Token};
 use crate::comms::PublicEvent;
 use crate::error::GameError;
 use crate::game::ids::SeatId;
-use crate::game::phase::{DayStage, Phase};
+use crate::game::phase::{DayStage, EndReason, Phase, Winner};
 use crate::game::state::Game;
-use crate::game::win::win_check;
+use crate::game::win::{apply_demon_death, end_game, living_count as win_living_count, win_check};
 use crate::roles::{Character, CharacterType};
 
 /// In-progress nomination with open vote window.
@@ -57,7 +57,7 @@ fn day_stage(game: &Game) -> Result<(u32, DayStage), GameError> {
 }
 
 fn living_count(game: &Game) -> u32 {
-    game.seats.iter().filter(|s| s.alive).count() as u32
+    win_living_count(game)
 }
 
 fn seat_ref(game: &Game, id: SeatId) -> Result<&crate::game::seat::Seat, GameError> {
@@ -332,8 +332,12 @@ pub fn end_nominations(game: &mut Game, host: &Token) -> Result<(), GameError> {
         } else {
             game.public_log.push(PublicEvent::NoExecution);
             game.st_announce("No execution today.");
-            // Mayor / other end-of-day checks land in Task 11.
-            win_check(game);
+            // Mayor: 3 living + no execution → Good (design §10 / docs/win-conditions).
+            if mayor_three_no_exec_wins(game) {
+                end_game(game, Winner::Good, EndReason::MayorThreeNoExec);
+            } else {
+                win_check(game);
+            }
         }
     }
 
@@ -347,8 +351,26 @@ pub fn end_nominations(game: &mut Game, host: &Token) -> Result<(), GameError> {
     Ok(())
 }
 
-/// Mark seat dead via execution, public event, win check (full Saint/SW in Task 11).
+/// True when living==3 and a living Mayor has an active (non-disabled) ability.
+fn mayor_three_no_exec_wins(game: &Game) -> bool {
+    if living_count(game) != 3 {
+        return false;
+    }
+    game.seats.iter().any(|s| {
+        s.alive && s.true_character == Some(Character::Mayor) && !s.ability_disabled()
+    })
+}
+
+/// Mark seat dead via execution; Saint → Evil; Imp → SW / demon death; then [`win_check`].
 pub fn resolve_execution(game: &mut Game, seat: SeatId) {
+    let alive_before = living_count(game);
+    let (true_char, disabled) = game
+        .seats
+        .iter()
+        .find(|s| s.id == seat)
+        .map(|s| (s.true_character, s.ability_disabled()))
+        .unwrap_or((None, true));
+
     if let Some(s) = game.seats.iter_mut().find(|s| s.id == seat) {
         if s.alive {
             s.alive = false;
@@ -360,7 +382,70 @@ pub fn resolve_execution(game: &mut Game, seat: SeatId) {
     game.public_log.push(PublicEvent::Executed { seat });
     // Also surface as immediate day death for consumers that listen for PlayerDied.
     game.public_log.push(PublicEvent::PlayerDied { seat });
+
+    // Saint: execution causes Evil win if ability is active (not poisoned/drunk).
+    if true_char == Some(Character::Saint) && !disabled {
+        end_game(game, Winner::Evil, EndReason::SaintExecuted);
+        return;
+    }
+
+    if true_char == Some(Character::Imp) {
+        apply_demon_death(game, seat, alive_before);
+    }
+
     win_check(game);
+}
+
+/// Slayer once-per-game day action (design §10.3).
+///
+/// Allowed in Day Discussion or Nominations. Spends `slayer_used` even on miss / disabled.
+/// Hit: target is true Imp and Slayer ability is active → immediate death + demon death / win check.
+pub fn day_action_slay(game: &mut Game, slayer: SeatId, target: SeatId) -> Result<(), GameError> {
+    require_not_ended(game)?;
+    let (_day, _stage) = day_stage(game)?;
+    // Discussion or Nominations both ok (design §10.3).
+
+    let slayer_seat = seat_ref(game, slayer)?;
+    if !slayer_seat.alive {
+        return Err(GameError::IllegalAction("dead players cannot slay"));
+    }
+    // Allow attempt if player-facing role is Slayer (Drunk face) or true Slayer.
+    let facing = slayer_seat.visible_character();
+    if facing != Some(Character::Slayer) {
+        return Err(GameError::IllegalAction("not the Slayer"));
+    }
+    if slayer_seat.slayer_used {
+        return Err(GameError::IllegalAction("Slayer ability already used"));
+    }
+
+    // Snapshot before mut.
+    let disabled = slayer_seat.ability_disabled();
+    let true_is_slayer = slayer_seat.true_character == Some(Character::Slayer);
+
+    seat_mut(game, slayer)?.slayer_used = true;
+
+    // Miss path: disabled, not true Slayer, wrong target, or dead target.
+    let target_seat = seat_ref(game, target)?;
+    let hit = true_is_slayer
+        && !disabled
+        && target_seat.alive
+        && target_seat.true_character == Some(Character::Imp);
+
+    if !hit {
+        // Silent miss (no public confirmation).
+        return Ok(());
+    }
+
+    let alive_before = living_count(game);
+    if let Some(s) = game.seats.iter_mut().find(|s| s.id == target) {
+        s.alive = false;
+        s.ghost_vote_available = true;
+    }
+    game.public_log.push(PublicEvent::PlayerDied { seat: target });
+    game.st_announce(format!("Seat {} dies.", target.0));
+    apply_demon_death(game, target, alive_before);
+    win_check(game);
+    Ok(())
 }
 
 impl Game {
@@ -382,6 +467,10 @@ impl Game {
 
     pub fn end_nominations(&mut self, host: &Token) -> Result<(), GameError> {
         end_nominations(self, host)
+    }
+
+    pub fn day_action_slay(&mut self, slayer: SeatId, target: SeatId) -> Result<(), GameError> {
+        day_action_slay(self, slayer, target)
     }
 }
 

@@ -12,9 +12,10 @@ mod win;
 
 pub use crate::error::GameError;
 pub use day::{
-    close_vote, end_nominations, execution_leader, meets_threshold, nominate, open_nominations,
-    resolve_execution, vote, ClosedNomination, OpenNomination,
+    close_vote, day_action_slay, end_nominations, execution_leader, meets_threshold, nominate,
+    open_nominations, resolve_execution, vote, ClosedNomination, OpenNomination,
 };
+pub use win::{apply_demon_death, end_game, living_count as count_living, win_check};
 pub use ids::{GameId, SeatId};
 pub use night::{
     build_first_night_queue, build_other_night_queue, ChoiceSchema, NightActionPayload,

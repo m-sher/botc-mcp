@@ -167,10 +167,10 @@ fn mayor_bounce(game: &mut Game, mayor: SeatId) -> KillResult {
     KillResult::Died(bounce)
 }
 
-/// Mark dead, track night death, maybe insert Ravenkeeper wake.
+/// Mark dead, track night death, maybe insert Ravenkeeper wake / SW conversion.
 fn die_from_demon(game: &mut Game, seat: SeatId) {
     // Snapshot ability/character before death mutations.
-    let (is_rk, was_disabled, is_poisoner) = game
+    let (is_rk, was_disabled, is_poisoner, is_imp) = game
         .seats
         .iter()
         .find(|s| s.id == seat)
@@ -179,10 +179,12 @@ fn die_from_demon(game: &mut Game, seat: SeatId) {
                 s.true_character == Some(Character::Ravenkeeper),
                 s.ability_disabled(),
                 s.true_character == Some(Character::Poisoner),
+                s.true_character == Some(Character::Imp),
             )
         })
-        .unwrap_or((false, true, false));
+        .unwrap_or((false, true, false, false));
 
+    let alive_before = win::living_count(game);
     mark_dead(game, seat);
 
     if is_poisoner {
@@ -192,6 +194,11 @@ fn die_from_demon(game: &mut Game, seat: SeatId) {
     // Ravenkeeper: true character, ability not disabled at death → insert wake.
     if is_rk && !was_disabled {
         insert_ravenkeeper_wake(game, seat);
+    }
+
+    // Non-starpass Imp death: Scarlet Woman may convert (alive_before includes Imp).
+    if is_imp {
+        win::apply_demon_death(game, seat, alive_before);
     }
 
     win::win_check(game);
