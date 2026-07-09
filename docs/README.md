@@ -30,6 +30,7 @@ prompting players.
 | Glossary | [glossary.md](glossary.md) |
 | Sources | [sources.md](sources.md) |
 | **Engine architecture sketch** | [architecture.md](architecture.md) |
+| **Engine design spec (full)** | [superpowers/specs/2026-07-08-botc-mcp-engine-design.md](superpowers/specs/2026-07-08-botc-mcp-engine-design.md) |
 
 ## Retrieval tips
 
