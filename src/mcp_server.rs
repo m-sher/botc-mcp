@@ -207,6 +207,16 @@ fn tool_description(name: &str) -> &'static str {
 }
 
 /// Invoke a named tool; wraps success as MCP `content` + structured `structuredContent`.
+/// Public tool invocation for the multi-agent harness (shared store over a socket).
+pub fn invoke_named_tool(store: &SharedStore, name: &str, args: Value) -> Result<Value, String> {
+    call_tool(store, name, args).map_err(|e| e.message)
+}
+
+/// Tool descriptors for MCP `tools/list` (shared with agent proxy).
+pub fn list_tool_descriptors() -> Vec<Value> {
+    tool_descriptors()
+}
+
 fn call_tool(store: &SharedStore, name: &str, args: Value) -> Result<Value, RpcError> {
     match invoke_tool(store, name, args) {
         Ok(structured) => {

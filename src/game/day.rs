@@ -629,6 +629,15 @@ pub fn day_action_slay(game: &mut Game, slayer: SeatId, target: SeatId) -> Resul
     let disabled = slayer_seat.ability_disabled();
     let true_is_slayer = slayer_seat.true_character == Some(Character::Slayer);
 
+    // Validate the target BEFORE spending / the disabled short-circuit so a Drunk-face or
+    // poisoned Slayer returns exactly the same result (error / silent miss) as a healthy
+    // Slayer for a given target — no disabled-status is inferable from an error
+    // (Drunk-illusion hardening).
+    let target_seat = seat_ref(game, target)?;
+    let target_alive = target_seat.alive;
+    let target_true = target_seat.true_character;
+    let target_disabled = target_seat.ability_disabled();
+
     seat_mut(game, slayer)?.slayer_used = true;
 
     if !true_is_slayer || disabled {
@@ -636,18 +645,17 @@ pub fn day_action_slay(game: &mut Game, slayer: SeatId, target: SeatId) -> Resul
         return Ok(());
     }
 
-    let target_seat = seat_ref(game, target)?;
-    if !target_seat.alive {
+    if !target_alive {
         return Ok(());
     }
 
     // True Imp: always a hit (no ST discretion).
-    if target_seat.true_character == Some(Character::Imp) {
+    if target_true == Some(Character::Imp) {
         return apply_slayer_kill(game, target, true);
     }
 
     // Recluse-as-Demon via `registration_mode` immediately (no day-blocking host pause — #41).
-    if target_seat.true_character == Some(Character::Recluse) && !target_seat.ability_disabled() {
+    if target_true == Some(Character::Recluse) && !target_disabled {
         let demon_label = format!("slayer_reg:day:{}", target.0);
         if crate::game::ability::register::register_demon_for_ft(game, target, &demon_label) {
             return apply_slayer_kill(game, target, false);

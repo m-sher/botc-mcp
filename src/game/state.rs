@@ -336,9 +336,10 @@ impl Game {
             .seats
             .iter()
             .filter_map(|seat| {
-                let true_c = seat.true_character?;
+                // Team is derived from the FACE, never true_character, so a Drunk's briefing
+                // can never diverge from the face even if the Team mapping later changes.
                 let facing = seat.visible_character()?;
-                Some((seat.id, facing, true_c.team()))
+                Some((seat.id, facing, facing.team()))
             })
             .collect();
 
