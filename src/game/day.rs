@@ -383,6 +383,11 @@ pub fn resolve_execution(game: &mut Game, seat: SeatId) {
     // Also surface as immediate day death for consumers that listen for PlayerDied.
     game.public_log.push(PublicEvent::PlayerDied { seat });
 
+    // Poison ends when the Poisoner dies (any path).
+    if true_char == Some(Character::Poisoner) {
+        crate::game::ability::on_poisoner_left_play(game);
+    }
+
     // Saint: execution causes Evil win if ability is active (not poisoned/drunk).
     if true_char == Some(Character::Saint) && !disabled {
         end_game(game, Winner::Evil, EndReason::SaintExecuted);

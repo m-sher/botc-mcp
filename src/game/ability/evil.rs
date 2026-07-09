@@ -34,6 +34,13 @@ pub fn clear_poisons(game: &mut Game) {
     }
 }
 
+/// Poison ends when the Poisoner dies or stops being the Poisoner (starpass, etc.).
+///
+/// Spec: active poison ends immediately when the Poisoner leaves play.
+pub fn on_poisoner_left_play(game: &mut Game) {
+    clear_poisons(game);
+}
+
 /// Mark `target` poisoned (Poisoner ability not disabled).
 pub fn apply_poison(game: &mut Game, target: SeatId) {
     if let Some(t) = game.seats.iter_mut().find(|s| s.id == target) {
@@ -89,10 +96,20 @@ fn resolve_starpass(game: &mut Game, imp_seat: SeatId) -> KillResult {
     let mut rng = game.rng.substream(&label);
     let new_imp = *living_minions.choose(&mut rng).expect("non-empty minions");
 
+    let was_poisoner = game
+        .seats
+        .iter()
+        .find(|s| s.id == new_imp)
+        .is_some_and(|s| s.true_character == Some(Character::Poisoner));
+
     if let Some(seat) = game.seats.iter_mut().find(|s| s.id == new_imp) {
         seat.true_character = Some(Character::Imp);
         seat.believed_character = None;
         seat.is_drunk_outsider = false;
+    }
+    // Poisoner who becomes Imp stops being Poisoner — active poison ends.
+    if was_poisoner {
+        on_poisoner_left_play(game);
     }
     game.private_inboxes.push(
         new_imp,
@@ -188,7 +205,7 @@ fn die_from_demon(game: &mut Game, seat: SeatId) {
     mark_dead(game, seat);
 
     if is_poisoner {
-        clear_poisons(game);
+        on_poisoner_left_play(game);
     }
 
     // Ravenkeeper: true character, ability not disabled at death → insert wake.

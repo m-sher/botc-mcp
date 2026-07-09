@@ -280,18 +280,8 @@ impl Game {
                 dawn(self);
                 StepOutcome::DawnDone
             }
-            // Spy grimoire still stub (Task 9+); info roles resolve now (§9.6 / Task 8).
-            NightStep::Spy { seat } => {
-                self.private_inboxes.push(
-                    seat,
-                    PrivateMessage::NightResult {
-                        text: "Spy: Grimoire (stub).".to_string(),
-                    },
-                );
-                self.advance_cursor();
-                StepOutcome::Advanced
-            }
-            NightStep::Washerwoman { .. }
+            NightStep::Spy { .. }
+            | NightStep::Washerwoman { .. }
             | NightStep::Librarian { .. }
             | NightStep::Investigator { .. }
             | NightStep::Chef { .. }
@@ -534,6 +524,11 @@ impl Game {
                 if !self.seats.iter().any(|s| s.id == *a) || !self.seats.iter().any(|s| s.id == *b)
                 {
                     return Err(GameError::NoSuchSeat);
+                }
+                if a == b {
+                    return Err(GameError::IllegalAction(
+                        "Fortune Teller must pick two different seats",
+                    ));
                 }
                 Ok(())
             }

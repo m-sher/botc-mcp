@@ -709,3 +709,89 @@ fn dawn_announces_deaths_publicly_not_roles() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Review fixes: Spy grimoire, FT distinct seats
+// ---------------------------------------------------------------------------
+
+#[test]
+fn spy_night_returns_true_grimoire_when_not_disabled() {
+    let lobby = Game::create(five_names(), 21).unwrap();
+    let host = lobby.host_token.clone();
+    let mut g = lobby.game;
+    g.start_game(
+        &host,
+        StartOpts {
+            assignments: Some(vec![
+                RoleAssignment::normal(SeatId(0), Character::Spy),
+                RoleAssignment::normal(SeatId(1), Character::Imp),
+                RoleAssignment::normal(SeatId(2), Character::Soldier),
+                RoleAssignment::normal(SeatId(3), Character::Chef),
+                RoleAssignment::normal(SeatId(4), Character::Empath),
+            ]),
+        },
+    )
+    .unwrap();
+    // No choice roles → Spy auto-resolves on first night.
+    let results = night_results_for(&g, SeatId(0));
+    let grimoire = results
+        .iter()
+        .find(|t| t.starts_with("Spy: Grimoire"))
+        .expect(&format!("Spy should receive grimoire: {results:?}"));
+    assert!(
+        grimoire.contains("Imp") && grimoire.contains("Soldier") && grimoire.contains("Spy"),
+        "true grimoire must list true roles: {grimoire}"
+    );
+    assert!(
+        grimoire.contains("seat 0") && grimoire.contains("seat 1"),
+        "grimoire lists seats: {grimoire}"
+    );
+    assert!(
+        grimoire.contains("alive") && grimoire.contains("poisoned="),
+        "grimoire includes alive/poisoned fields: {grimoire}"
+    );
+}
+
+#[test]
+fn fortune_teller_rejects_same_seat_twice() {
+    let lobby = Game::create(five_names(), 7).unwrap();
+    let host = lobby.host_token.clone();
+    let tokens = lobby.player_tokens.clone();
+    let mut g = lobby.game;
+    g.start_game(
+        &host,
+        StartOpts {
+            assignments: Some(vec![
+                RoleAssignment::normal(SeatId(0), Character::FortuneTeller),
+                RoleAssignment::normal(SeatId(1), Character::Imp),
+                RoleAssignment::normal(SeatId(2), Character::Soldier),
+                RoleAssignment::normal(SeatId(3), Character::Chef),
+                RoleAssignment::normal(SeatId(4), Character::Soldier),
+            ]),
+        },
+    )
+    .unwrap();
+    let p = g.pending_night.as_ref().expect("FT pending");
+    assert!(matches!(p.step, NightStep::FortuneTeller { seat: SeatId(0) }));
+    let err = night_action(
+        &mut g,
+        &tokens[0],
+        NightActionPayload::PickTwo {
+            a: SeatId(1),
+            b: SeatId(1),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            tools::ToolError::Game(botc_mcp::GameError::IllegalAction(_))
+        ),
+        "same seat twice must be rejected: {err:?}"
+    );
+    // Still pending on FT after illegal attempt.
+    assert!(matches!(
+        g.pending_night.as_ref().map(|p| &p.step),
+        Some(NightStep::FortuneTeller { seat: SeatId(0) })
+    ));
+}

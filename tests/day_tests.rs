@@ -5,8 +5,9 @@ use botc_mcp::game::{
     meets_threshold, DayStage, Game, Phase, RoleAssignment, SeatId, StartOpts, Winner,
 };
 use botc_mcp::roles::Character;
+use botc_mcp::game::NightActionPayload;
 use botc_mcp::tools::{
-    close_vote, end_nominations, nominate, open_nominations, skip_night_action, vote,
+    close_vote, end_nominations, nominate, night_action, open_nominations, skip_night_action, vote,
 };
 
 fn names(n: usize) -> Vec<String> {
@@ -273,4 +274,53 @@ fn host_close_vote_without_all_living() {
     // Without execution of imp, night should start with all still alive
     assert!(matches!(g.phase, Phase::Night { night: 2, .. }));
     assert!(g.public_log.since(0).iter().any(|(_, e)| matches!(e, PublicEvent::NoExecution)));
+}
+
+#[test]
+fn poisoner_executed_clears_active_poison() {
+    let lobby = Game::create(names(5), 17).unwrap();
+    let host = lobby.host_token.clone();
+    let tokens = lobby.player_tokens.clone();
+    let mut g = lobby.game;
+    g.start_game(
+        &host,
+        StartOpts {
+            assignments: Some(vec![
+                RoleAssignment::normal(SeatId(0), Character::Soldier),
+                RoleAssignment::normal(SeatId(1), Character::Chef),
+                RoleAssignment::normal(SeatId(2), Character::Empath),
+                RoleAssignment::normal(SeatId(3), Character::Poisoner),
+                RoleAssignment::normal(SeatId(4), Character::Imp),
+            ]),
+        },
+    )
+    .unwrap();
+    // N1: Poisoner poisons Soldier (seat 0).
+    let p = g.pending_night.as_ref().expect("Poisoner pending");
+    assert_eq!(p.seat, SeatId(3));
+    night_action(
+        &mut g,
+        &tokens[3],
+        NightActionPayload::PickOne { target: SeatId(0) },
+    )
+    .unwrap();
+    assert!(g.seats[0].poisoned, "Soldier should be poisoned overnight");
+    to_day1(&mut g, &host);
+    assert!(g.seats[0].poisoned, "poison lasts through the day");
+
+    open_nominations(&mut g, &host).unwrap();
+    nominate(&mut g, &tokens[0], SeatId(3)).unwrap();
+    // 5 living → need 3 yes (yes*2 >= living).
+    vote(&mut g, &tokens[0], SeatId(3), true).unwrap();
+    vote(&mut g, &tokens[1], SeatId(3), true).unwrap();
+    vote(&mut g, &tokens[2], SeatId(3), true).unwrap();
+    vote(&mut g, &tokens[3], SeatId(3), false).unwrap();
+    vote(&mut g, &tokens[4], SeatId(3), false).unwrap();
+    end_nominations(&mut g, &host).unwrap();
+
+    assert!(!g.seats[3].alive, "Poisoner must be executed");
+    assert!(
+        !g.seats[0].poisoned,
+        "poison must clear when Poisoner dies by execution"
+    );
 }

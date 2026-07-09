@@ -23,6 +23,7 @@ pub fn resolve(
     payload: Option<&NightActionPayload>,
 ) -> Result<NightEffect, GameError> {
     match step {
+        NightStep::Spy { seat } => resolve_spy(game, seat),
         NightStep::Washerwoman { seat } => resolve_washerwoman(game, seat),
         NightStep::Librarian { seat } => resolve_librarian(game, seat),
         NightStep::Investigator { seat } => resolve_investigator(game, seat),
@@ -120,13 +121,47 @@ fn seats_of_type(game: &Game, ty: CharacterType) -> Vec<(SeatId, Character)> {
         .collect()
 }
 
+/// Owners eligible for WW/Lib/Inv "correct" seat.
+///
+/// True seats of `ty`, plus for Townsfolk: Spy may register as a Townsfolk with p=0.5
+/// (design §11.2 / §11.5) and become a valid correct-seat owner for that character.
+fn pair_owners(
+    game: &Game,
+    ty: CharacterType,
+    pool: &[Character],
+    rng: &mut impl Rng,
+) -> Vec<(SeatId, Character)> {
+    let mut owners = seats_of_type(game, ty);
+    if ty == CharacterType::Townsfolk {
+        if let Some(spy_id) = game
+            .seats
+            .iter()
+            .find(|s| s.true_character == Some(Character::Spy))
+            .map(|s| s.id)
+        {
+            if rng.gen_bool(0.5) {
+                // Prefer an in-play Townsfolk token; else any from the townsfolk pool.
+                let character = if !owners.is_empty() {
+                    owners[rng.gen_range(0..owners.len())].1
+                } else if let Some(&c) = pool.choose(rng) {
+                    c
+                } else {
+                    Character::Soldier
+                };
+                owners.push((spy_id, character));
+            }
+        }
+    }
+    owners
+}
+
 fn truthful_pair_info(
     game: &Game,
     ty: CharacterType,
     pool: &[Character],
     rng: &mut impl Rng,
 ) -> Option<PairInfo> {
-    let owners = seats_of_type(game, ty);
+    let owners = pair_owners(game, ty, pool, rng);
     if owners.is_empty() {
         return None;
     }
@@ -146,7 +181,6 @@ fn truthful_pair_info(
     } else {
         (wrong, correct_seat)
     };
-    let _ = pool;
     Some(PairInfo {
         character,
         seat_a,
@@ -178,6 +212,7 @@ fn resolve_pair_role(
     let disabled = seat_disabled(game, seat);
 
     if !disabled {
+        // Zero-path uses true bag count only (Spy registration does not invent Outsiders).
         if seats_of_type(game, ty).is_empty() {
             if let Some(z) = zero_message {
                 return Ok(push_result(game, seat, z.to_string()));
@@ -195,6 +230,90 @@ fn resolve_pair_role(
     ))?;
     let text = pair_message(game, ability, &info);
     Ok(push_result(game, seat, text))
+}
+
+// ---------------------------------------------------------------------------
+// Spy grimoire
+// ---------------------------------------------------------------------------
+
+/// Structured grimoire snapshot for the Spy (true if ability active; seeded fake if disabled).
+fn resolve_spy(game: &mut Game, seat: SeatId) -> Result<NightEffect, GameError> {
+    let disabled = seat_disabled(game, seat);
+    let text = if disabled {
+        let label = stream_label(game, "spy_lie");
+        let mut rng = game.rng.substream(&label);
+        format_fake_grimoire(game, &mut rng)
+    } else {
+        format_true_grimoire(game)
+    };
+    Ok(push_result(game, seat, text))
+}
+
+fn format_true_grimoire(game: &Game) -> String {
+    let mut lines = vec!["Spy: Grimoire".to_string()];
+    for s in &game.seats {
+        lines.push(format_grimoire_seat_line(
+            &s.display_name,
+            s.id,
+            s.alive,
+            s.true_character,
+            s.poisoned,
+            s.believed_character,
+        ));
+    }
+    lines.join("\n")
+}
+
+fn format_fake_grimoire(game: &Game, rng: &mut impl Rng) -> String {
+    let pool: Vec<Character> = all_townsfolk()
+        .iter()
+        .chain(all_outsiders().iter())
+        .chain(all_minions().iter())
+        .chain(all_demons().iter())
+        .copied()
+        .collect();
+    let mut lines = vec!["Spy: Grimoire".to_string()];
+    for s in &game.seats {
+        // Keep name/alive/poisoned shape; scramble character tokens.
+        let fake_char = *pool.choose(rng).unwrap_or(&Character::Soldier);
+        // Occasionally invent a believed face for variety.
+        let believed = if rng.gen_bool(0.2) {
+            Some(*pool.choose(rng).unwrap_or(&Character::Soldier))
+        } else {
+            None
+        };
+        lines.push(format_grimoire_seat_line(
+            &s.display_name,
+            s.id,
+            s.alive,
+            Some(fake_char),
+            s.poisoned,
+            believed,
+        ));
+    }
+    lines.join("\n")
+}
+
+fn format_grimoire_seat_line(
+    name: &str,
+    id: SeatId,
+    alive: bool,
+    true_character: Option<Character>,
+    poisoned: bool,
+    believed: Option<Character>,
+) -> String {
+    let char_name = true_character
+        .map(|c| c.display_name())
+        .unwrap_or("unknown");
+    let alive_s = if alive { "alive" } else { "dead" };
+    let mut line = format!(
+        "- {name} (seat {}): {alive_s}, {char_name}, poisoned={poisoned}",
+        id.0
+    );
+    if let Some(b) = believed {
+        line.push_str(&format!(", believed={}", b.display_name()));
+    }
+    line
 }
 
 fn resolve_washerwoman(game: &mut Game, seat: SeatId) -> Result<NightEffect, GameError> {
