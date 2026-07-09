@@ -310,7 +310,8 @@ impl App {
         let log = agent.log.lock().unwrap();
         let skip = self.scroll_log.min(log.len().saturating_sub(1));
         let start = log.len().saturating_sub(100 + skip);
-        log[start..].join("")
+        // Each assembler entry is one logical line; join with newlines for the pane.
+        log[start..].join("\n")
     }
 }
 

@@ -296,8 +296,14 @@ fn spawn_grok_tick(
         thread::spawn(move || {
             use std::io::BufRead;
             let reader = std::io::BufReader::new(stdout);
+            let mut asm = StreamAssembler::default();
             for line in reader.lines().flatten() {
-                append_stream_line(&log, &line, false);
+                for piece in asm.push_line(&line) {
+                    push_log_line(&log, piece);
+                }
+            }
+            for piece in asm.finish() {
+                push_log_line(&log, piece);
             }
         });
     }
@@ -307,7 +313,8 @@ fn spawn_grok_tick(
             use std::io::BufRead;
             let reader = std::io::BufReader::new(stderr);
             for line in reader.lines().flatten() {
-                append_stream_line(&log, &line, true);
+                // stderr is not streaming-json; log whole lines.
+                push_log_line(&log, format!("[stderr] {line}"));
             }
         });
     }
@@ -321,31 +328,7 @@ fn spawn_grok_tick(
     Ok(TickOutcome::Spawned)
 }
 
-fn append_stream_line(log: &Mutex<Vec<String>>, line: &str, stderr: bool) {
-    let msg = if stderr {
-        // Surface clap/CLI errors clearly in the TUI stream.
-        format!("[stderr] {line}")
-    } else if let Ok(v) = serde_json::from_str::<Value>(line) {
-        match v.get("type").and_then(|t| t.as_str()) {
-            Some("text") => v
-                .get("data")
-                .and_then(|d| d.as_str())
-                .unwrap_or("")
-                .to_string(),
-            Some("thought") => format!(
-                "[think] {}",
-                v.get("data").and_then(|d| d.as_str()).unwrap_or("")
-            ),
-            Some("end") => "[turn end]".into(),
-            Some("error") => format!(
-                "ERROR {}",
-                v.get("message").and_then(|m| m.as_str()).unwrap_or("?")
-            ),
-            _ => line.to_string(),
-        }
-    } else {
-        line.to_string()
-    };
+fn push_log_line(log: &Mutex<Vec<String>>, msg: String) {
     if msg.is_empty() {
         return;
     }
@@ -354,6 +337,99 @@ fn append_stream_line(log: &Mutex<Vec<String>>, line: &str, stderr: bool) {
     if g.len() > 400 {
         let drain = g.len() - 400;
         g.drain(0..drain);
+    }
+}
+
+/// Coalesce NDJSON `streaming-json` chunks into readable log lines.
+///
+/// Grok emits many tiny `{"type":"thought","data":"word"}` / `text` events. Prefixing
+/// each chunk with `[think]` produced garbage like `[think] The[think]  task…`.
+/// We buffer consecutive chunks of the same kind and emit one line when the kind changes
+/// or the stream ends.
+#[derive(Debug, Default)]
+pub struct StreamAssembler {
+    kind: Option<StreamKind>,
+    buf: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamKind {
+    Text,
+    Thought,
+}
+
+impl StreamAssembler {
+    /// Ingest one stdout line; returns zero or more completed log lines.
+    pub fn push_line(&mut self, line: &str) -> Vec<String> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Vec::new();
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            let mut out = self.flush();
+            out.push(line.to_string());
+            return out;
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                self.push_chunk(StreamKind::Text, data)
+            }
+            Some("thought") => {
+                let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                self.push_chunk(StreamKind::Thought, data)
+            }
+            Some("end") => {
+                let mut out = self.flush();
+                out.push("[turn end]".into());
+                out
+            }
+            Some("error") => {
+                let mut out = self.flush();
+                let msg = v
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("?");
+                out.push(format!("ERROR {msg}"));
+                out
+            }
+            _ => {
+                let mut out = self.flush();
+                out.push(line.to_string());
+                out
+            }
+        }
+    }
+
+    /// Flush any buffered partial stream at EOF.
+    pub fn finish(&mut self) -> Vec<String> {
+        self.flush()
+    }
+
+    fn push_chunk(&mut self, kind: StreamKind, data: &str) -> Vec<String> {
+        if data.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if self.kind != Some(kind) {
+            out.extend(self.flush());
+            self.kind = Some(kind);
+        }
+        self.buf.push_str(data);
+        out
+    }
+
+    fn flush(&mut self) -> Vec<String> {
+        if self.buf.is_empty() {
+            self.kind = None;
+            return Vec::new();
+        }
+        let text = std::mem::take(&mut self.buf);
+        let line = match self.kind.take() {
+            Some(StreamKind::Thought) => format!("[think] {text}"),
+            Some(StreamKind::Text) | None => text,
+        };
+        vec![line]
     }
 }
 
@@ -466,5 +542,33 @@ mod tests {
             let c = args.iter().filter(|a| a.as_str() == flag).count();
             assert!(c <= 1, "flag {flag} appears {c} times: {args:?}");
         }
+    }
+
+    #[test]
+    fn stream_assembler_coalesces_thought_chunks() {
+        let mut a = StreamAssembler::default();
+        let mut out = Vec::new();
+        for line in [
+            r#"{"type":"thought","data":"The"}"#,
+            r#"{"type":"thought","data":" task"}"#,
+            r#"{"type":"thought","data":" is"}"#,
+            r#"{"type":"text","data":"Hello"}"#,
+            r#"{"type":"text","data":" world"}"#,
+            r#"{"type":"end","stopReason":"EndTurn","sessionId":"x"}"#,
+        ] {
+            out.extend(a.push_line(line));
+        }
+        out.extend(a.finish());
+        assert_eq!(
+            out,
+            vec![
+                "[think] The task is".to_string(),
+                "Hello world".to_string(),
+                "[turn end]".to_string(),
+            ],
+            "got {out:?}"
+        );
+        // Must not look like the broken per-token prefix form.
+        assert!(!out.iter().any(|s| s.contains("[think] The[think]")));
     }
 }
