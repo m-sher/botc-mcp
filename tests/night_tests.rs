@@ -474,3 +474,238 @@ fn librarian_zero_outsiders_reports_zero() {
         "Librarian with no Outsiders: {results:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 9: demon kill, soldier, monk, starpass, dawn
+// ---------------------------------------------------------------------------
+
+use botc_mcp::comms::PublicEvent;
+use botc_mcp::game::DayStage;
+
+/// Finish first night via host skips, then enter night 2.
+fn finish_n1_enter_n2(
+    g: &mut Game,
+    host: &botc_mcp::auth::Token,
+) {
+    while g.pending_night.is_some() {
+        skip_night_action(g, host).unwrap();
+    }
+    assert!(
+        matches!(g.phase, Phase::Day { day: 1, stage: DayStage::Discussion }),
+        "expected Day 1 Discussion, got {:?}",
+        g.phase
+    );
+    g.enter_night(2);
+}
+
+/// 5p other-night: Monk, Imp, Poisoner, Empath, Soldier.
+fn fixture_n2_monk_imp_soldier() -> (Game, botc_mcp::auth::Token, Vec<botc_mcp::auth::Token>) {
+    let lobby = Game::create(five_names(), 11).unwrap();
+    let host = lobby.host_token.clone();
+    let tokens = lobby.player_tokens.clone();
+    let mut g = lobby.game;
+    g.start_game(
+        &host,
+        StartOpts {
+            assignments: Some(vec![
+                RoleAssignment::normal(SeatId(0), Character::Monk),
+                RoleAssignment::normal(SeatId(1), Character::Imp),
+                RoleAssignment::normal(SeatId(2), Character::Poisoner),
+                RoleAssignment::normal(SeatId(3), Character::Empath),
+                RoleAssignment::normal(SeatId(4), Character::Soldier),
+            ]),
+        },
+    )
+    .unwrap();
+    finish_n1_enter_n2(&mut g, &host);
+    (g, host, tokens)
+}
+
+/// Drive N2 until Imp is pending (skip poisoner + monk with given payloads or defaults).
+fn advance_to_imp_kill(
+    g: &mut Game,
+    host: &botc_mcp::auth::Token,
+    tokens: &[botc_mcp::auth::Token],
+    poison_target: SeatId,
+    monk_target: Option<SeatId>,
+) {
+    // Poisoner
+    let p = g.pending_night.as_ref().expect("pending");
+    assert!(matches!(p.step, NightStep::Poisoner { .. }));
+    night_action(
+        g,
+        &tokens[p.seat.0 as usize],
+        NightActionPayload::PickOne {
+            target: poison_target,
+        },
+    )
+    .unwrap();
+    // Monk
+    let p = g.pending_night.as_ref().expect("monk pending");
+    assert!(matches!(p.step, NightStep::Monk { .. }));
+    if let Some(t) = monk_target {
+        night_action(
+            g,
+            &tokens[p.seat.0 as usize],
+            NightActionPayload::PickOne { target: t },
+        )
+        .unwrap();
+    } else {
+        skip_night_action(g, host).unwrap();
+    }
+    let p = g.pending_night.as_ref().expect("imp pending");
+    assert!(
+        matches!(p.step, NightStep::DemonKill { seat: SeatId(1) }),
+        "expected Imp kill, got {:?}",
+        p.step
+    );
+}
+
+#[test]
+fn soldier_survives_imp() {
+    let (mut g, host, tokens) = fixture_n2_monk_imp_soldier();
+    // Poison someone other than Soldier so Soldier ability stays active.
+    advance_to_imp_kill(&mut g, &host, &tokens, SeatId(3), Some(SeatId(3)));
+    night_action(
+        &mut g,
+        &tokens[1],
+        NightActionPayload::PickOne { target: SeatId(4) },
+    )
+    .unwrap();
+    assert!(
+        g.seats[4].alive,
+        "Soldier must survive Imp kill"
+    );
+    assert!(
+        !g.deaths_tonight.contains(&SeatId(4)),
+        "Soldier must not be in deaths_tonight"
+    );
+}
+
+#[test]
+fn monk_protects_target() {
+    let (mut g, host, tokens) = fixture_n2_monk_imp_soldier();
+    // Monk protects Empath; Imp kills Empath → survives.
+    advance_to_imp_kill(&mut g, &host, &tokens, SeatId(2), Some(SeatId(3)));
+    assert!(g.seats[3].monk_protected_tonight);
+    night_action(
+        &mut g,
+        &tokens[1],
+        NightActionPayload::PickOne { target: SeatId(3) },
+    )
+    .unwrap();
+    assert!(g.seats[3].alive, "Monk-protected Empath must live");
+    assert!(!g.deaths_tonight.contains(&SeatId(3)));
+}
+
+#[test]
+fn imp_starpass_transfers_to_minion() {
+    let (mut g, host, tokens) = fixture_n2_monk_imp_soldier();
+    advance_to_imp_kill(&mut g, &host, &tokens, SeatId(0), Some(SeatId(3)));
+    night_action(
+        &mut g,
+        &tokens[1],
+        NightActionPayload::PickOne { target: SeatId(1) }, // self
+    )
+    .unwrap();
+    assert!(!g.seats[1].alive, "old Imp must be dead");
+    // Only minion is Poisoner seat 2 → becomes Imp
+    assert_eq!(g.seats[2].true_character, Some(Character::Imp));
+    assert!(g.seats[2].alive);
+    let msgs = g.private_inboxes.since(SeatId(2), 0);
+    assert!(
+        msgs.iter().any(|(_, m)| matches!(
+            m,
+            PrivateMessage::YouAre {
+                character_label,
+                ..
+            } if character_label == "Imp"
+        )),
+        "new Imp must receive YouAre Imp: {msgs:?}"
+    );
+    // Game continues (living Imp exists). Night may auto-advance past Empath/Dawn.
+    assert!(g.winner.is_none());
+    assert!(!matches!(g.phase, Phase::Ended { .. }));
+    // Public death list (after dawn) includes old Imp, never roles.
+    let died_events: Vec<_> = g
+        .public_log
+        .since(0)
+        .into_iter()
+        .filter_map(|(_, e)| match e {
+            PublicEvent::DiedInNight { seats } if !seats.is_empty() => Some(seats.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        died_events.iter().any(|s| s.contains(&SeatId(1))),
+        "old Imp should appear in DiedInNight: {died_events:?}"
+    );
+}
+
+#[test]
+fn dawn_announces_deaths_publicly_not_roles() {
+    let (mut g, host, tokens) = fixture_n2_monk_imp_soldier();
+    advance_to_imp_kill(&mut g, &host, &tokens, SeatId(2), Some(SeatId(4)));
+    night_action(
+        &mut g,
+        &tokens[1],
+        NightActionPayload::PickOne { target: SeatId(3) }, // Empath
+    )
+    .unwrap();
+    assert!(!g.seats[3].alive);
+    // Finish night (Empath auto if any remaining, Butler none, Dawn)
+    while g.pending_night.is_some() && !matches!(g.phase, Phase::Day { .. } | Phase::Ended { .. }) {
+        skip_night_action(&mut g, &host).unwrap();
+    }
+    // If only auto steps left, night_tick should have dawned already after last skip.
+    while matches!(g.phase, Phase::Night { .. }) && g.pending_night.is_none() {
+        // stuck? shouldn't happen
+        break;
+    }
+    assert!(
+        matches!(g.phase, Phase::Day { day: 2, stage: DayStage::Discussion }),
+        "expected Day 2 Discussion after dawn, got {:?}",
+        g.phase
+    );
+
+    let events: Vec<_> = g
+        .public_log
+        .since(0)
+        .into_iter()
+        .map(|(_, e)| e.clone())
+        .collect();
+    // N1 dawn may have empty DiedInNight; N2 should list Empath (seat 3) only.
+    let night_deaths: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            PublicEvent::DiedInNight { seats } if !seats.is_empty() => Some(seats.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        night_deaths.iter().any(|s| s == &vec![SeatId(3)]),
+        "DiedInNight must list seat 3 only (no roles): {night_deaths:?}"
+    );
+    // Public announce names the player, never character roles.
+    let announces: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            PublicEvent::StorytellerAnnounce { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    let dawn_line = announces
+        .iter()
+        .find(|t| t.contains("Died in the night"))
+        .expect("dawn death announce");
+    assert!(
+        dawn_line.contains('D') || dawn_line.contains("seat"),
+        "dawn should name player: {dawn_line}"
+    );
+    for role in ["Empath", "Imp", "Poisoner", "Soldier", "Monk"] {
+        assert!(
+            !dawn_line.contains(role),
+            "dawn must not reveal roles ({role}): {dawn_line}"
+        );
+    }
+}

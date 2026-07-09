@@ -1,7 +1,11 @@
 //! Night ability dispatch and resolution.
 
+mod evil;
 mod info;
+pub mod protect;
 pub mod register;
+
+pub use evil::{apply_poison, clear_poisons, try_demon_kill, KillResult};
 
 use crate::comms::PrivateMessage;
 use crate::error::GameError;

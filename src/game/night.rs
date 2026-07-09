@@ -277,7 +277,7 @@ impl Game {
                 StepOutcome::Advanced
             }
             NightStep::Dawn => {
-                self.resolve_dawn();
+                dawn(self);
                 StepOutcome::DawnDone
             }
             // Spy grimoire still stub (Task 9+); info roles resolve now (§9.6 / Task 8).
@@ -303,6 +303,8 @@ impl Game {
             }
             // Choice-required wakes: set pending and stop.
             NightStep::Poisoner { seat } => {
+                // §9.4: clear previous poison at the start of the Poisoner step.
+                crate::game::ability::clear_poisons(self);
                 self.set_pending(
                     step,
                     seat,
@@ -488,47 +490,15 @@ impl Game {
         }
     }
 
-    fn resolve_dawn(&mut self) {
-        for seat in &mut self.seats {
-            seat.monk_protected_tonight = false;
-        }
-
-        let deaths = self.deaths_tonight.clone();
-        if deaths.is_empty() {
-            self.st_announce("Dawn. Nobody died.");
-            self.public_log
-                .push(PublicEvent::DiedInNight { seats: vec![] });
-        } else {
-            let names: Vec<String> = deaths
-                .iter()
-                .filter_map(|id| {
-                    self.seats
-                        .iter()
-                        .find(|s| s.id == *id)
-                        .map(|s| s.display_name.clone())
-                })
-                .collect();
-            self.st_announce(format!("Dawn. Died in the night: {}.", names.join(", ")));
-            self.public_log
-                .push(PublicEvent::DiedInNight { seats: deaths });
-        }
+    /// Enter other-night `night` (must be ≥ 2): build queue and tick to first pending.
+    pub fn enter_night(&mut self, night: u32) {
         self.deaths_tonight.clear();
-
-        let day = match self.phase {
-            Phase::FirstNight { .. } => 1u32,
-            Phase::Night { night, .. } => night,
-            _ => 1,
-        };
-        self.phase = Phase::Day {
-            day,
-            stage: DayStage::Discussion,
-        };
-        self.night_queue.clear();
-        self.night_cursor = 0;
         self.pending_night = None;
-        self.public_log.push(PublicEvent::PhaseChanged {
-            summary: format!("Day {day} — Discussion"),
-        });
+        self.night_queue = build_other_night_queue(self);
+        self.night_cursor = 0;
+        self.phase = Phase::Night { night, cursor: 0 };
+        self.st_announce(format!("Night falls. Night {night} begins."));
+        self.night_tick();
     }
 
     fn validate_payload(
@@ -571,7 +541,7 @@ impl Game {
         }
     }
 
-    /// Resolve a submitted night choice (info abilities via `ability`; poison/monk until Task 9).
+    /// Resolve a submitted night choice (poison/monk/imp via ability; info via Task 8).
     fn resolve_pending_action(
         &mut self,
         pending: &PendingWake,
@@ -580,20 +550,15 @@ impl Game {
         match pending.step {
             NightStep::Poisoner { seat: _ } => {
                 if let NightActionPayload::PickOne { target } = payload {
-                    // Clear prior poison; apply if ability not disabled.
                     let disabled = self
                         .seats
                         .iter()
                         .find(|s| s.id == pending.seat)
                         .map(|s| s.ability_disabled())
                         .unwrap_or(false);
-                    for s in &mut self.seats {
-                        s.poisoned = false;
-                    }
+                    // Prior poison already cleared at begin_step.
                     if !disabled {
-                        if let Some(t) = self.seats.iter_mut().find(|s| s.id == *target) {
-                            t.poisoned = true;
-                        }
+                        crate::game::ability::apply_poison(self, *target);
                     }
                 }
                 Ok(())
@@ -607,15 +572,17 @@ impl Game {
                         .map(|s| s.ability_disabled())
                         .unwrap_or(false);
                     if !disabled {
-                        if let Some(t) = self.seats.iter_mut().find(|s| s.id == *target) {
-                            t.monk_protected_tonight = true;
-                        }
+                        crate::game::ability::protect::apply_monk_protect(self, *target);
                     }
                 }
                 Ok(())
             }
-            // Demon kill deferred to Task 9; accept choice and advance.
-            NightStep::DemonKill { .. } => Ok(()),
+            NightStep::DemonKill { seat: demon } => {
+                if let NightActionPayload::PickOne { target } = payload {
+                    let _ = crate::game::ability::try_demon_kill(self, demon, *target);
+                }
+                Ok(())
+            }
             // Info / Butler / Ravenkeeper (Task 8).
             step => {
                 crate::game::ability::resolve_night_step(self, step, Some(payload))?;
@@ -673,6 +640,48 @@ enum StepOutcome {
     Advanced,
     Waiting,
     DawnDone,
+}
+
+/// Dawn: clear monk protect, announce deaths (names only), enter Day Discussion (§9.7).
+pub fn dawn(game: &mut Game) {
+    crate::game::ability::protect::clear_monk_protection(game);
+
+    let deaths = game.deaths_tonight.clone();
+    if deaths.is_empty() {
+        game.st_announce("Dawn. Nobody died.");
+        game.public_log
+            .push(PublicEvent::DiedInNight { seats: vec![] });
+    } else {
+        let names: Vec<String> = deaths
+            .iter()
+            .filter_map(|id| {
+                game.seats
+                    .iter()
+                    .find(|s| s.id == *id)
+                    .map(|s| s.display_name.clone())
+            })
+            .collect();
+        game.st_announce(format!("Dawn. Died in the night: {}.", names.join(", ")));
+        game.public_log
+            .push(PublicEvent::DiedInNight { seats: deaths });
+    }
+    game.deaths_tonight.clear();
+
+    let day = match game.phase {
+        Phase::FirstNight { .. } => 1u32,
+        Phase::Night { night, .. } => night,
+        _ => 1,
+    };
+    game.phase = Phase::Day {
+        day,
+        stage: DayStage::Discussion,
+    };
+    game.night_queue.clear();
+    game.night_cursor = 0;
+    game.pending_night = None;
+    game.public_log.push(PublicEvent::PhaseChanged {
+        summary: format!("Day {day} — Discussion"),
+    });
 }
 
 #[cfg(test)]

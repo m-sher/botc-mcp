@@ -7,6 +7,7 @@ mod phase;
 mod seat;
 pub mod setup;
 mod state;
+mod win;
 
 pub use crate::error::GameError;
 pub use ids::{GameId, SeatId};
