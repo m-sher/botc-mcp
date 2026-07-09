@@ -612,18 +612,15 @@ fn draw_monitor(f: &mut Frame, area: Rect, app: &App) {
         })
         .unwrap_or_else(|| "stream".into());
 
-    // #45: tail-anchor — keep newest lines in view via Paragraph::scroll.
+    // #45/#53: tail-anchor in *wrapped visual rows* (Paragraph::scroll unit), not
+    // logical lines — long Grok prose wraps in the ~40% stream column constantly.
     let log_text = app.agent_log_text();
-    let line_count = if log_text.is_empty() {
-        0
-    } else {
-        log_text.lines().count()
-    };
-    // Inner height excludes borders (top+bottom).
+    let inner_w = cols[2].width.saturating_sub(2);
     let view_h = cols[2].height.saturating_sub(2) as usize;
-    let max_scroll_top = line_count.saturating_sub(view_h);
-    // scroll_from_bottom=0 → show the end; larger → look further up.
-    let scroll_y = max_scroll_top.saturating_sub(app.scroll_from_bottom.min(max_scroll_top));
+    let row_count = stream_wrapped_row_count(&log_text, inner_w);
+    // scroll_from_bottom=0 → show the end; larger → look further up (row units).
+    let scroll_y = stream_scroll_y(row_count, view_h, app.scroll_from_bottom);
+    let scroll_y_u16 = u16::try_from(scroll_y).unwrap_or(u16::MAX);
     let tail_mark = if app.scroll_from_bottom == 0 {
         "·live"
     } else {
@@ -636,27 +633,140 @@ fn draw_monitor(f: &mut Frame, area: Rect, app: &App) {
                 .title(format!("{agent_title} {tail_mark}")),
         )
         .wrap(Wrap { trim: false })
-        .scroll((scroll_y as u16, 0));
+        .scroll((scroll_y_u16, 0));
     f.render_widget(log_p, cols[2]);
 }
 
-/// Pure helper for unit tests: compute vertical scroll that keeps the live tail
-/// (or an offset from it) in view (#45).
-pub fn stream_scroll_y(line_count: usize, view_h: usize, scroll_from_bottom: usize) -> usize {
-    let max_scroll_top = line_count.saturating_sub(view_h);
+/// Wrapped visual row count at `inner_w` — same unit as `Paragraph::scroll` (#53).
+///
+/// Uses ratatui's wrap math (no Block) so the count matches what the renderer
+/// produces inside a bordered pane of that inner width.
+pub fn stream_wrapped_row_count(text: &str, inner_w: u16) -> usize {
+    if text.is_empty() || inner_w == 0 {
+        return 0;
+    }
+    Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .line_count(inner_w)
+}
+
+/// Vertical scroll offset that keeps the live tail (or an offset from it) in view.
+/// `row_count` / `scroll_from_bottom` are in **wrapped visual rows** (#45/#53).
+pub fn stream_scroll_y(row_count: usize, view_h: usize, scroll_from_bottom: usize) -> usize {
+    let max_scroll_top = row_count.saturating_sub(view_h);
     max_scroll_top.saturating_sub(scroll_from_bottom.min(max_scroll_top))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn stream_scroll_defaults_to_tail() {
-        // 50 lines, 10-row pane, scroll_from_bottom=0 → scroll so last 10 show.
+        // 50 rows, 10-row pane, scroll_from_bottom=0 → scroll so last 10 show.
         assert_eq!(stream_scroll_y(50, 10, 0), 40);
         assert_eq!(stream_scroll_y(5, 10, 0), 0); // fits entirely
-        assert_eq!(stream_scroll_y(50, 10, 5), 35); // look 5 lines up from tail
+        assert_eq!(stream_scroll_y(50, 10, 5), 35); // look 5 rows up from tail
         assert_eq!(stream_scroll_y(50, 10, 999), 0); // clamped to top
+    }
+
+    #[test]
+    fn wrapped_row_count_exceeds_logical_when_lines_wrap() {
+        // 11 logical lines that each wrap to >1 row at width 10.
+        let mut lines: Vec<String> = (0..10)
+            .map(|i| format!("LINE{i}-ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+            .collect();
+        lines.push("MARKER-LAST-LINE".into());
+        let text = lines.join("\n");
+        let logical = text.lines().count();
+        let wrapped = stream_wrapped_row_count(&text, 18); // inner_w of a w=20 bordered pane
+        assert_eq!(logical, 11);
+        assert!(
+            wrapped > logical,
+            "expected wrap to inflate row count: logical={logical} wrapped={wrapped}"
+        );
+        // Issue repro numbers: logical scroll under-shoots; wrap-aware is larger.
+        assert!(
+            stream_scroll_y(wrapped, 6, 0) > stream_scroll_y(logical, 6, 0),
+            "wrap-aware tail scroll must be deeper than logical-only"
+        );
+    }
+
+    /// #53: with wrapping lines, live-tail scroll must keep MARKER on screen.
+    #[test]
+    fn wrap_aware_tail_anchor_shows_last_line_on_test_backend() {
+        // Pane w=20 / h=8 → inner 18×6 (borders). Matches issue repro shape.
+        let backend = TestBackend::new(20, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        let mut lines: Vec<String> = (0..10)
+            .map(|i| format!("LINE{i}-ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+            .collect();
+        lines.push("MARKER-LAST-LINE".into());
+        let log_text = lines.join("\n");
+
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                let inner_w = area.width.saturating_sub(2);
+                let view_h = area.height.saturating_sub(2) as usize;
+                let rows = stream_wrapped_row_count(&log_text, inner_w);
+                let scroll_y = stream_scroll_y(rows, view_h, 0);
+                // Sanity: logical-only would under-scroll (issue repro).
+                let logical = log_text.lines().count();
+                assert!(
+                    scroll_y > stream_scroll_y(logical, view_h, 0),
+                    "wrap-aware scroll_y={scroll_y} should exceed logical"
+                );
+                let p = Paragraph::new(log_text.as_str())
+                    .block(Block::default().borders(Borders::ALL).title("stream ·live"))
+                    .wrap(Wrap { trim: false })
+                    .scroll((u16::try_from(scroll_y).unwrap_or(u16::MAX), 0));
+                f.render_widget(p, area);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(
+            screen.contains("MARKER"),
+            "last line MARKER must be visible with wrap-aware tail scroll; screen:\n{screen}"
+        );
+
+        // Control: logical-only scroll must leave MARKER off-screen (documents the bug).
+        let backend2 = TestBackend::new(20, 8);
+        let mut terminal2 = Terminal::new(backend2).expect("terminal2");
+        terminal2
+            .draw(|f| {
+                let area = f.area();
+                let view_h = area.height.saturating_sub(2) as usize;
+                let logical = log_text.lines().count();
+                let bad_y = stream_scroll_y(logical, view_h, 0);
+                let p = Paragraph::new(log_text.as_str())
+                    .block(Block::default().borders(Borders::ALL).title("bad"))
+                    .wrap(Wrap { trim: false })
+                    .scroll((u16::try_from(bad_y).unwrap_or(u16::MAX), 0));
+                f.render_widget(p, area);
+            })
+            .expect("draw2");
+        let buf2 = terminal2.backend().buffer();
+        let mut screen2 = String::new();
+        for y in 0..buf2.area.height {
+            for x in 0..buf2.area.width {
+                screen2.push_str(buf2[(x, y)].symbol());
+            }
+            screen2.push('\n');
+        }
+        assert!(
+            !screen2.contains("MARKER"),
+            "logical-only scroll should still clip MARKER (proves wrap matters); screen:\n{screen2}"
+        );
     }
 }
