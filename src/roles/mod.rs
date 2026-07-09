@@ -1,6 +1,7 @@
 //! Character identity and static metadata (no per-game state).
 
 mod data;
+pub mod night_order;
 
 pub use data::{Character, CharacterType, Team};
 

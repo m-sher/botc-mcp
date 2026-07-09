@@ -4,7 +4,8 @@ use crate::auth::{Actor, Token, TokenBook};
 use crate::comms::{PrivateInboxes, PrivateMessage, PublicEvent, PublicLog};
 use crate::error::GameError;
 use crate::game::ids::{GameId, SeatId};
-use crate::game::phase::{NightStep, Phase};
+use crate::game::night::build_first_night_queue;
+use crate::game::phase::{NightStep, Phase, Winner};
 use crate::game::seat::Seat;
 use crate::game::setup::{build_bag, setup_markers, validate_fixed_assignments, StartOpts};
 use crate::rng::SeededRng;
@@ -13,12 +14,6 @@ use crate::roles::{Character, CharacterType, Team};
 /// Trouble Brewing table size (inclusive).
 pub const MIN_PLAYERS: usize = 5;
 pub const MAX_PLAYERS: usize = 15;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Winner {
-    Good,
-    Evil,
-}
 
 impl From<Winner> for Team {
     fn from(w: Winner) -> Self {
@@ -53,6 +48,14 @@ pub struct Game {
     pub red_herring: Option<SeatId>,
     /// Three not-in-play good characters shown to Imp (7+).
     pub demon_bluffs: Vec<Character>,
+    /// Concrete night steps for the current night (FirstNight or Night).
+    pub night_queue: Vec<NightStep>,
+    /// Index into `night_queue` (mirrors phase cursor while in night).
+    pub night_cursor: usize,
+    /// Seats that died during the current night (demon kill, etc.).
+    pub deaths_tonight: Vec<SeatId>,
+    /// Seat executed during the current day, if any (Undertaker eligibility).
+    pub executed_today: Option<SeatId>,
 }
 
 /// Result of opening a lobby: host token + player tokens in seat order.
@@ -136,6 +139,10 @@ impl Game {
                 winner: None,
                 red_herring: None,
                 demon_bluffs: Vec::new(),
+                night_queue: Vec::new(),
+                night_cursor: 0,
+                deaths_tonight: Vec::new(),
+                executed_today: None,
             },
             host_token,
             player_tokens,
@@ -280,9 +287,11 @@ impl Game {
             );
         }
 
-        self.phase = Phase::FirstNight {
-            step: NightStep::SetupMarkers,
-        };
+        self.deaths_tonight.clear();
+        self.executed_today = None;
+        self.night_queue = build_first_night_queue(self);
+        self.night_cursor = 0;
+        self.phase = Phase::FirstNight { cursor: 0 };
         self.st_announce("Night falls. Eyes closed. The first night begins.");
         Ok(())
     }
