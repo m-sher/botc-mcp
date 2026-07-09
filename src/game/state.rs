@@ -6,7 +6,12 @@ use crate::error::GameError;
 use crate::game::ids::{GameId, SeatId};
 use crate::game::phase::{NightStep, Phase};
 use crate::game::seat::Seat;
+use crate::rng::SeededRng;
 use crate::roles::{Character, CharacterType, Team};
+
+/// Trouble Brewing table size (inclusive).
+pub const MIN_PLAYERS: usize = 5;
+pub const MAX_PLAYERS: usize = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Winner {
@@ -35,6 +40,8 @@ pub struct PublicSeatView {
 #[derive(Debug)]
 pub struct Game {
     pub id: GameId,
+    pub seed: u64,
+    pub rng: SeededRng,
     pub phase: Phase,
     pub seats: Vec<Seat>,
     pub tokens: TokenBook,
@@ -48,11 +55,14 @@ pub struct Game {
 }
 
 /// Result of opening a lobby: host token + player tokens in seat order.
-pub struct Lobby {
+pub struct CreateGameResult {
     pub game: Game,
     pub host_token: Token,
     pub player_tokens: Vec<Token>,
 }
+
+/// Alias kept for older sketch call sites; prefer [`CreateGameResult`].
+pub type Lobby = CreateGameResult;
 
 /// Per-seat assignment at start. Drunk **must** include a Townsfolk face.
 #[derive(Debug, Clone)]
@@ -90,11 +100,19 @@ impl RoleAssignment {
 }
 
 impl Game {
-    pub fn new_lobby(id: GameId, names: Vec<String>) -> Lobby {
+    /// Open a lobby with seats and issued tokens. `id` is a placeholder until [`crate::store::GameStore::insert`].
+    pub fn create(player_names: Vec<String>, seed: u64) -> Result<CreateGameResult, GameError> {
+        let n = player_names.len();
+        if n < MIN_PLAYERS || n > MAX_PLAYERS {
+            return Err(GameError::BadRequest(
+                "player count must be between 5 and 15 inclusive",
+            ));
+        }
+
         let mut tokens = TokenBook::default();
         let host_token = tokens.issue_host();
-        let mut player_tokens = Vec::with_capacity(names.len());
-        let seats: Vec<Seat> = names
+        let mut player_tokens = Vec::with_capacity(n);
+        let seats: Vec<Seat> = player_names
             .into_iter()
             .enumerate()
             .map(|(i, name)| {
@@ -104,9 +122,11 @@ impl Game {
             })
             .collect();
 
-        Lobby {
+        Ok(CreateGameResult {
             game: Self {
-                id,
+                id: GameId(0),
+                seed,
+                rng: SeededRng::from_seed(seed),
                 phase: Phase::Lobby,
                 seats,
                 tokens,
@@ -118,7 +138,7 @@ impl Game {
             },
             host_token,
             player_tokens,
-        }
+        })
     }
 
     pub fn public_seats(&self) -> Vec<PublicSeatView> {

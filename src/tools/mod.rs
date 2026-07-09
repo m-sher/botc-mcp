@@ -8,11 +8,65 @@ use crate::comms::{EventId, PrivateMessage, PublicEvent};
 use crate::error::GameError;
 use crate::game::Phase;
 use crate::game::SeatId;
-use crate::game::{Game, PublicSeatView, Winner};
+use crate::game::{CreateGameResult, Game, GameId, PublicSeatView, Winner};
 use crate::roles::Character;
+use crate::store::GameStore;
 
 // Re-export for callers that import tool-layer errors from this module.
 pub use crate::error::ToolError;
+
+/// One seat’s credentials returned from [`create_game`].
+#[derive(Debug, Clone)]
+pub struct PlayerSeatToken {
+    pub seat_id: SeatId,
+    pub name: String,
+    pub player_token: Token,
+}
+
+/// Response for [`create_game`] / [`create_game_in_memory`].
+#[derive(Debug)]
+pub struct CreateGameResponse {
+    pub game_id: GameId,
+    pub host_token: Token,
+    pub players: Vec<PlayerSeatToken>,
+}
+
+/// Create a lobby, issue host + player tokens, insert into `store`.
+pub fn create_game(
+    store: &mut GameStore,
+    names: Vec<String>,
+    seed: u64,
+) -> Result<CreateGameResponse, ToolError> {
+    let CreateGameResult {
+        game,
+        host_token,
+        player_tokens,
+    } = Game::create(names, seed)?;
+
+    let players: Vec<PlayerSeatToken> = game
+        .seats
+        .iter()
+        .zip(player_tokens)
+        .map(|(seat, player_token)| PlayerSeatToken {
+            seat_id: seat.id,
+            name: seat.display_name.clone(),
+            player_token,
+        })
+        .collect();
+
+    let game_id = store.insert(game);
+    Ok(CreateGameResponse {
+        game_id,
+        host_token,
+        players,
+    })
+}
+
+/// Test helper: ephemeral store, panics if lobby size is illegal.
+pub fn create_game_in_memory(names: Vec<String>, seed: u64) -> CreateGameResponse {
+    let mut store = GameStore::new();
+    create_game(&mut store, names, seed).expect("create_game_in_memory: valid player count 5–15")
+}
 
 pub struct PublicStateView {
     pub phase: String,

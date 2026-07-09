@@ -15,8 +15,19 @@ mod smoke {
 
     #[test]
     fn public_chat_is_shared_roles_are_not() {
-        let lobby = Game::new_lobby(GameId(1), vec!["Alice".into(), "Bob".into()]);
+        let lobby = Game::create(
+            vec![
+                "Alice".into(),
+                "Bob".into(),
+                "C".into(),
+                "D".into(),
+                "E".into(),
+            ],
+            1,
+        )
+        .unwrap();
         let mut game = lobby.game;
+        game.id = GameId(1);
         let alice = lobby.player_tokens[0].clone();
         let bob = lobby.player_tokens[1].clone();
 
@@ -51,8 +62,19 @@ mod smoke {
 
     #[test]
     fn drunk_private_state_shows_townsfolk_face_not_drunk() {
-        let lobby = Game::new_lobby(GameId(2), vec!["Dana".into(), "Eve".into()]);
+        let lobby = Game::create(
+            vec![
+                "Dana".into(),
+                "Eve".into(),
+                "C".into(),
+                "D".into(),
+                "E".into(),
+            ],
+            2,
+        )
+        .unwrap();
         let mut game = lobby.game;
+        game.id = GameId(2);
         let dana = lobby.player_tokens[0].clone();
 
         game.start_game_assign(vec![
@@ -83,8 +105,13 @@ mod smoke {
 
     #[test]
     fn drunk_without_face_rejected() {
-        let lobby = Game::new_lobby(GameId(3), vec!["A".into()]);
+        let lobby = Game::create(
+            vec!["A".into(), "B".into(), "C".into(), "D".into(), "E".into()],
+            3,
+        )
+        .unwrap();
         let mut game = lobby.game;
+        game.id = GameId(3);
         let err = game
             .start_game_assign_for_sketch(vec![(SeatId(0), Character::Drunk)])
             .unwrap_err();

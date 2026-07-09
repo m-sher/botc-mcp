@@ -8,6 +8,7 @@ pub mod error;
 pub mod game;
 pub mod rng;
 pub mod roles;
+pub mod store;
 pub mod tools;
 
 pub use error::{GameError, ToolError};

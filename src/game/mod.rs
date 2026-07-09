@@ -9,4 +9,7 @@ pub use crate::error::GameError;
 pub use ids::{GameId, SeatId};
 pub use phase::{DayStage, NightStep, Phase};
 pub use seat::Seat;
-pub use state::{Game, Lobby, PublicSeatView, RoleAssignment, Winner};
+pub use state::{
+    CreateGameResult, Game, Lobby, PublicSeatView, RoleAssignment, Winner, MAX_PLAYERS,
+    MIN_PLAYERS,
+};
