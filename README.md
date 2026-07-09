@@ -7,7 +7,7 @@ character set only): one fixed gameplay loop under a Storyteller moderator.
 
 **Rules docs + engine/MCP architecture sketch.** Core loop not fully implemented yet.
 
-Design: [`docs/architecture.md`](docs/architecture.md). Implementer rules: [`AGENTS.md`](AGENTS.md). Full engine spec: [`docs/superpowers/specs/2026-07-08-botc-mcp-engine-design.md`](docs/superpowers/specs/2026-07-08-botc-mcp-engine-design.md). Rust modules under `src/` (`auth`, `comms`, `game`, `roles`, `tools`).
+Design: [`docs/architecture.md`](docs/architecture.md). Implementer rules: [`AGENTS.md`](AGENTS.md). Implementation plan: [`docs/superpowers/plans/2026-07-08-botc-mcp-engine.md`](docs/superpowers/plans/2026-07-08-botc-mcp-engine.md). Full engine spec: [`docs/superpowers/specs/2026-07-08-botc-mcp-engine-design.md`](docs/superpowers/specs/2026-07-08-botc-mcp-engine-design.md). Rust modules under `src/` (`auth`, `comms`, `game`, `roles`, `tools`).
 
 ## Rules
 
