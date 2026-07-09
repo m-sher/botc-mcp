@@ -62,7 +62,11 @@ pub fn create_game(
     })
 }
 
-/// Test helper: ephemeral store, panics if lobby size is illegal.
+/// Test helper: builds a lobby response only (ephemeral store is dropped).
+///
+/// Suitable for asserting token/shape fields; does **not** retain a live
+/// [`GameStore`]. For stateful tests, use [`create_game`] with an owned store.
+/// Panics if lobby size is illegal (not 5–15).
 pub fn create_game_in_memory(names: Vec<String>, seed: u64) -> CreateGameResponse {
     let mut store = GameStore::new();
     create_game(&mut store, names, seed).expect("create_game_in_memory: valid player count 5–15")

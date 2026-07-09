@@ -5,10 +5,16 @@ use std::collections::HashMap;
 use crate::game::{Game, GameId};
 
 /// Process-local store of live games (MCP layer wraps this in a mutex later).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct GameStore {
     next_id: u64,
     games: HashMap<GameId, Game>,
+}
+
+impl Default for GameStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GameStore {
@@ -69,5 +75,18 @@ mod tests {
         assert_eq!(id2, GameId(2));
         assert_eq!(store.get(id1).unwrap().seed, 1);
         assert_eq!(store.get_mut(id2).unwrap().seed, 2);
+    }
+
+    #[test]
+    fn default_insert_starts_at_game_id_one() {
+        let mut store = GameStore::default();
+        let created = Game::create(
+            vec!["A".into(), "B".into(), "C".into(), "D".into(), "E".into()],
+            0,
+        )
+        .unwrap();
+        let id = store.insert(created.game);
+        assert_eq!(id, GameId(1));
+        assert_eq!(store.get(id).unwrap().id, GameId(1));
     }
 }
