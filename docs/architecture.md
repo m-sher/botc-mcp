@@ -1,9 +1,10 @@
-# Architecture sketch — botc-mcp
+# Architecture — botc-mcp
 
-MCP server that runs one **Trouble Brewing** game for model agents: authoritative
+MCP server that runs **Trouble Brewing** games for model agents: authoritative
 Storyteller state, public agent-to-agent chat, private Storyteller→player channels only.
 
-This document is the design target. Implementation lives under `src/`.
+Implementation lives under `src/`. Wire protocol: [`mcp.md`](mcp.md).
+Implementer rules: root [`AGENTS.md`](../AGENTS.md).
 
 ---
 
@@ -33,9 +34,8 @@ There is no “spectator write” path. Eval harnesses use the host token for se
 ## Session & isolation
 
 ```
-create_game  →  game_id + host_token
-join_game    →  player_token bound to (game_id, seat_id)
-every tool   →  requires host_token XOR player_token
+create_game  →  game_id + host_token + player_tokens (one per seat/name)
+every tool   →  requires host_token XOR player_token (plus game_id on wire)
 ```
 
 - Tokens are opaque random secrets (not seat indices).
@@ -76,7 +76,7 @@ Lobby → Setup → FirstNight → Day → Night → Day → … → Ended
 
 Host (or auto-rules later) calls `advance_phase` when the current step is complete.
 
-### Night (sketch)
+### Night
 
 1. Phase = `Night { index, step }` walking [night-order](night-order.md).
 2. For each wake: mark seat `AwaitingNightAction` (or skip if dead / N/A).
@@ -84,7 +84,7 @@ Host (or auto-rules later) calls `advance_phase` when the current step is comple
 4. Server validates against **true** character + drunk/poisoned; writes private result to that seat’s inbox; may update Grimoire.
 5. When order complete → host advances → public dawn announcement (who died only).
 
-### Day (sketch)
+### Day
 
 1. Public discussion via `say` (no time limit enforced initially; host advances).
 2. `nominate` / `vote` with public visibility of nominations and tallies.
@@ -100,10 +100,10 @@ Auth: every tool takes `token` (host or player). Server rejects wrong role for t
 
 | Tool | Auth | Notes |
 | --- | --- | --- |
-| `create_game` | none or deploy secret | Returns `game_id`, `host_token`, seat list placeholders |
-| `join_game` | none | `{ game_id, seat_id or display_name }` → `player_token` + public seat map |
-| `start_game` | host | Locks joins, builds bag, assigns characters, enters First Night |
-| `advance_phase` | host | Dawn, open nominations, close day, etc., when legal |
+| `create_game` | none | `{ names, seed? }` → `game_id`, `host_token`, player tokens (see `mcp.md`) |
+| `start_game` | host | Builds bag / optional fixed assignments, enters First Night |
+| `open_nominations` / `close_vote` / `end_nominations` | host | Day control |
+| `skip_night_action` | host | Default ST skip for pending wake |
 
 ### Read models
 
@@ -205,14 +205,19 @@ Registration (Spy/Recluse/red herring) applied when **reading** for an info abil
 
 | Module | Responsibility |
 | --- | --- |
-| `auth` | Tokens, `Actor::Host | Player { seat }` |
-| `roles` | Character enum, team, type, static data (night\* flags) |
-| `game` | `Game`, phase machine, grimoire, seats, win checks |
+| `auth` | Tokens, `Actor::Host \| Player { seat }` |
+| `roles` | Character enum, team, type, night order data |
+| `game` | `Game`, phase machine, grimoire, seats, setup, night/day, win checks |
+| `game/ability` | Ability resolve/register (info, protect, evil) |
 | `comms` | Public log + per-seat private inbox |
-| `tools` | MCP tool handlers → game methods (thin) |
-| `main` | Process entry / later MCP transport |
+| `tools` | Tool handlers + player/host views (thin over `game`) |
+| `store` | Multi-game registry (`GameStore` by `game_id`) |
+| `mcp_server` | Line-delimited JSON-RPC MCP stdio (`initialize`, `tools/list`, `tools/call`) |
+| `rng` | Seeded RNG for bag/false-info policy |
+| `error` | `GameError` / `ToolError` |
+| `main` | Binary entry → `mcp_server::run_stdio` |
 
-Rules text remains in `docs/`; engine may load role markdown by path for `get_character_rules` / private ability blurb.
+Rules text remains in `docs/`; `tools` loads role markdown for `get_character_rules` / private ability blurbs.
 
 ---
 
@@ -221,14 +226,14 @@ Rules text remains in `docs/`; engine may load role markdown by path for `get_ch
 Suggested outer loop (not necessarily inside this repo):
 
 ```
-1. create_game + N × join_game → tokens
-2. start_game
+1. create_game(names, seed?) → tokens
+2. start_game (host; optional fixed assignments)
 3. Each agent: get_private_state once
 4. Loop:
      a. Each agent: get_public_log (cursor) + get_public_state
      b. Agents may say(...) any number of times  // all public
      c. If private prompt waiting: night_action / day_action / nominate / vote
-     d. Host: advance_phase when constraints met
+     d. Host: skip_night_action / open_nominations / close_vote / end_nominations
 5. Until GameEnded
 ```
 
@@ -236,7 +241,7 @@ Because chat is public-only, the harness can feed **the same public log** to eve
 
 ---
 
-## Non-goals (for this sketch)
+## Non-goals (v1)
 
 - Private player–player communication
 - Travellers / other editions

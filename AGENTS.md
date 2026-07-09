@@ -52,7 +52,8 @@ If you add a feature that can leak true identity to a Drunk seat (logs, errors, 
 
 ## Code
 
-- Prefer small modules: `auth`, `comms`, `game`, `roles`, `tools`.
+- Prefer small modules: `auth`, `comms`, `game`, `roles`, `tools`, `store`, `mcp_server`.
+- Transport is line-delimited JSON-RPC on stdio (`docs/mcp.md`); keep handlers in `tools`, not in the transport layer.
 - Keep player responses free of other seats’ secrets.
 - Tests should cover at least: public chat shared; private roles isolated; **Drunk face on private state**.
 

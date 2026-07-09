@@ -1,9 +1,9 @@
 # botc-mcp Engine Design Spec
 
-**Status:** Draft for review  
+**Status:** Implemented (JSON-RPC MCP stdio stub; full `rmcp` SDK optional later)  
 **Date:** 2026-07-08  
 **Scope:** Full playable Trouble Brewing simulation behind an MCP tool surface for model agents  
-**Related:** `AGENTS.md`, `docs/architecture.md`, `docs/*` rules reference  
+**Related:** `AGENTS.md`, `docs/architecture.md`, `docs/mcp.md`, `docs/*` rules reference  
 
 ---
 
