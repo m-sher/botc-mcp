@@ -6,6 +6,7 @@ use crate::error::GameError;
 use crate::game::ids::SeatId;
 use crate::game::phase::{DayStage, NightStep, Phase};
 use crate::game::state::Game;
+use crate::game::st_policy::{NightInfoPayload, PendingHostDecision, StChoiceMode};
 use crate::roles::night_order::{
     FirstNightSlot, OtherNightSlot, FIRST_NIGHT_CHARACTER_ORDER, OTHER_NIGHT_CHARACTER_ORDER,
 };
@@ -236,6 +237,8 @@ impl Game {
         seat: SeatId,
         payload: NightActionPayload,
     ) -> Result<(), GameError> {
+        // While a host ST decision is outstanding, players cannot advance the night (#36–#38).
+        self.require_no_pending_host()?;
         let pending = self
             .pending_night
             .clone()
@@ -280,16 +283,21 @@ impl Game {
                 dawn(self);
                 StepOutcome::DawnDone
             }
-            NightStep::Spy { .. }
-            | NightStep::Washerwoman { .. }
-            | NightStep::Librarian { .. }
-            | NightStep::Investigator { .. }
-            | NightStep::Chef { .. }
-            | NightStep::Empath { .. }
-            | NightStep::Undertaker { .. } => {
-                let _ = crate::game::ability::resolve_night_step(self, step, None);
-                self.advance_cursor();
-                StepOutcome::Advanced
+            NightStep::Spy { seat }
+            | NightStep::Washerwoman { seat }
+            | NightStep::Librarian { seat }
+            | NightStep::Investigator { seat }
+            | NightStep::Chef { seat }
+            | NightStep::Empath { seat }
+            | NightStep::Undertaker { seat } => {
+                if self.should_host_compose_night_info(step, seat, None) {
+                    self.request_night_info_host(step, seat, None);
+                    StepOutcome::Waiting
+                } else {
+                    let _ = crate::game::ability::resolve_night_step(self, step, None);
+                    self.advance_cursor();
+                    StepOutcome::Advanced
+                }
             }
             // Choice-required wakes: set pending and stop.
             NightStep::Poisoner { seat } => {
@@ -484,15 +492,18 @@ impl Game {
     ///
     /// Does **not** clear `host_lie_queue`: lies queued during the day apply to this
     /// night. Unused lies are cleared at dawn (#30 / #34).
-    pub fn enter_night(&mut self, night: u32) {
+    ///
+    /// Fails if a Storyteller decision is still pending (#36) — never silently drops it.
+    pub fn enter_night(&mut self, night: u32) -> Result<(), GameError> {
+        self.require_no_pending_host()?;
         self.deaths_tonight.clear();
         self.pending_night = None;
-        self.pending_host = None;
         self.night_queue = build_other_night_queue(self);
         self.night_cursor = 0;
         self.phase = Phase::Night { night, cursor: 0 };
         self.st_announce(format!("Night falls. Night {night} begins."));
         self.night_tick();
+        Ok(())
     }
 
     fn validate_payload(
@@ -588,7 +599,23 @@ impl Game {
                 }
                 Ok(false)
             }
-            // Info / Butler / Ravenkeeper (Task 8).
+            step @ (NightStep::FortuneTeller { seat } | NightStep::Ravenkeeper { seat }) => {
+                let info_payload = match payload {
+                    NightActionPayload::PickTwo { a, b } => {
+                        Some(NightInfoPayload::PickTwo { a: *a, b: *b })
+                    }
+                    NightActionPayload::PickOne { target } => {
+                        Some(NightInfoPayload::PickOne { target: *target })
+                    }
+                    _ => None,
+                };
+                if self.should_host_compose_night_info(step, seat, info_payload.as_ref()) {
+                    self.request_night_info_host(step, seat, info_payload);
+                    return Ok(true);
+                }
+                crate::game::ability::resolve_night_step(self, step, Some(payload))?;
+                Ok(false)
+            }
             step => {
                 crate::game::ability::resolve_night_step(self, step, Some(payload))?;
                 Ok(false)
@@ -596,6 +623,98 @@ impl Game {
         }
     }
 
+    /// Whether host-first mode requires the Storyteller to author this info result.
+    ///
+    /// In host-first, **all** Storyteller-delivered night info pauses uniformly (#40).
+    /// Conditional pauses (only when Spy/Recluse is in the pick) would leak hidden
+    /// identity via result delay. `skip_night_action` still applies the engine path.
+    fn should_host_compose_night_info(
+        &self,
+        step: NightStep,
+        seat: SeatId,
+        _payload: Option<&NightInfoPayload>,
+    ) -> bool {
+        if !matches!(self.st_choice_mode, StChoiceMode::HostFirst) {
+            return false;
+        }
+        // Pre-queued free-text lie: host already decided; engine will consume it.
+        let disabled = self
+            .seats
+            .iter()
+            .find(|s| s.id == seat)
+            .map(|s| s.ability_disabled())
+            .unwrap_or(true);
+        if disabled && !self.host_lie_queue.is_empty() {
+            return false;
+        }
+        matches!(
+            step,
+            NightStep::Spy { .. }
+                | NightStep::Washerwoman { .. }
+                | NightStep::Librarian { .. }
+                | NightStep::Investigator { .. }
+                | NightStep::Chef { .. }
+                | NightStep::Empath { .. }
+                | NightStep::Undertaker { .. }
+                | NightStep::FortuneTeller { .. }
+                | NightStep::Ravenkeeper { .. }
+        )
+    }
+
+    fn request_night_info_host(
+        &mut self,
+        step: NightStep,
+        seat: SeatId,
+        payload: Option<NightInfoPayload>,
+    ) {
+        let (ability, reason) = night_info_meta(step, self, seat);
+        self.pending_host = Some(PendingHostDecision::NightInfo {
+            seat,
+            step,
+            ability: ability.to_string(),
+            reason: reason.to_string(),
+            payload,
+        });
+    }
+}
+
+fn night_info_meta(step: NightStep, game: &Game, seat: SeatId) -> (&'static str, &'static str) {
+    let disabled = game
+        .seats
+        .iter()
+        .find(|s| s.id == seat)
+        .map(|s| s.ability_disabled())
+        .unwrap_or(true);
+    let ability = match step {
+        NightStep::Spy { .. } => "Spy",
+        NightStep::Washerwoman { .. } => "Washerwoman",
+        NightStep::Librarian { .. } => "Librarian",
+        NightStep::Investigator { .. } => "Investigator",
+        NightStep::Chef { .. } => "Chef",
+        NightStep::Empath { .. } => "Empath",
+        NightStep::Undertaker { .. } => "Undertaker",
+        NightStep::FortuneTeller { .. } => "Fortune Teller",
+        NightStep::Ravenkeeper { .. } => "Ravenkeeper",
+        _ => "Night info",
+    };
+    let reason = if disabled {
+        "false_info"
+    } else {
+        match step {
+            NightStep::Washerwoman { .. }
+            | NightStep::Librarian { .. }
+            | NightStep::Investigator { .. } => "pair_info",
+            NightStep::Chef { .. } | NightStep::Empath { .. } | NightStep::FortuneTeller { .. } => {
+                "registration"
+            }
+            NightStep::Undertaker { .. } | NightStep::Ravenkeeper { .. } => "registration",
+            _ => "storyteller_info",
+        }
+    };
+    (ability, reason)
+}
+
+impl Game {
     fn default_payload_for(
         &self,
         pending: &PendingWake,

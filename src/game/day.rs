@@ -82,12 +82,14 @@ pub fn open_nominations(game: &mut Game, host: &Token) -> Result<(), GameError> 
         Some(Actor::Host) => {}
         _ => return Err(GameError::Unauthorized),
     }
+    game.require_no_pending_host()?;
     open_nominations_inner(game)
 }
 
 /// Discussion → Nominations (no host auth; used by host tool and first nominate auto-open).
 fn open_nominations_inner(game: &mut Game) -> Result<(), GameError> {
     require_not_ended(game)?;
+    game.require_no_pending_host()?;
     let (day, stage) = day_stage(game)?;
     if stage != DayStage::Discussion {
         return Err(GameError::WrongPhase);
@@ -106,6 +108,18 @@ fn open_nominations_inner(game: &mut Game) -> Result<(), GameError> {
     Ok(())
 }
 
+/// Record a nomination on the public day trackers (after ST registration is known).
+fn commit_nomination_public(game: &mut Game, by: SeatId, target: SeatId) {
+    if !game.day_nominators.contains(&by) {
+        game.day_nominators.push(by);
+    }
+    if !game.day_nominees.contains(&target) {
+        game.day_nominees.push(target);
+    }
+    game.public_log
+        .push(PublicEvent::Nominated { by, target });
+}
+
 /// Player: open a nomination and start the vote window (or Virgin bounce).
 ///
 /// Allowed from Day Nominations, or from Discussion (auto-opens nominations first).
@@ -114,6 +128,7 @@ fn open_nominations_inner(game: &mut Game) -> Result<(), GameError> {
 /// rejected nominate never mutates phase or the public log (#32).
 pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameError> {
     require_not_ended(game)?;
+    game.require_no_pending_host()?;
     let (_day, stage) = day_stage(game)?;
     match stage {
         DayStage::Nominations | DayStage::Discussion => {}
@@ -158,30 +173,37 @@ pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameE
 
     // Virgin: first nomination always spends the once-per-game ability, even if poisoned/drunk.
     // Execution only if ability is active AND nominator registers as Townsfolk (Spy may).
-    let virgin_label = format!("virgin_reg:day:nom:{}", by.0);
-    let nominator_registers_townsfolk =
-        crate::game::ability::register::registers_as_townsfolk(game, by, &virgin_label);
-
-    game.day_nominators.push(by);
-    game.day_nominees.push(target);
-    game.public_log
-        .push(PublicEvent::Nominated { by, target });
-
+    //
+    // Spy/Recluse registration for the Virgin is resolved **immediately** via
+    // `registration_mode` (never a day-blocking host pause) so the public path is
+    // identical to a normal nomination — no limbo leak (#39) and no probe channel (#41).
     if is_virgin_first_nom {
         if let Ok(s) = seat_mut(game, target) {
             s.virgin_ability_used = true;
         }
-        if !virgin_disabled && nominator_registers_townsfolk {
-            // Immediate execution of nominator — day's execution, no vote.
-            game.st_announce("The Virgin's power triggers. The nominator is executed.");
-            resolve_execution(game, by);
-            // Day's execution done — auto-end day (no further noms/executions).
-            try_auto_end_day(game)?;
-            return Ok(());
+        commit_nomination_public(game, by, target);
+        if !virgin_disabled {
+            let virgin_label = format!("virgin_reg:day:nom:{}", by.0);
+            let nominator_registers_townsfolk =
+                crate::game::ability::register::registers_as_townsfolk(game, by, &virgin_label);
+            if nominator_registers_townsfolk {
+                game.st_announce("The Virgin's power triggers. The nominator is executed.");
+                resolve_execution(game, by);
+                try_auto_end_day(game)?;
+                return Ok(());
+            }
         }
         // Disabled, or nominator does not register as Townsfolk: ability spent, vote proceeds.
+        game.current_nomination = Some(OpenNomination {
+            by,
+            target,
+            votes: Vec::new(),
+            passes: Vec::new(),
+        });
+        return Ok(());
     }
 
+    commit_nomination_public(game, by, target);
     game.current_nomination = Some(OpenNomination {
         by,
         target,
@@ -194,6 +216,7 @@ pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameE
 /// Player: cast yes/no on the current open nomination.
 pub fn vote(game: &mut Game, seat: SeatId, nominee: SeatId, support: bool) -> Result<(), GameError> {
     require_not_ended(game)?;
+    game.require_no_pending_host()?;
     let (_day, stage) = day_stage(game)?;
     if stage != DayStage::Nominations {
         return Err(GameError::WrongPhase);
@@ -270,6 +293,7 @@ pub fn vote(game: &mut Game, seat: SeatId, nominee: SeatId, support: bool) -> Re
 /// and every other ghost-holder has voted or passed. Host [`close_vote`] may still force-close.
 pub fn pass_vote(game: &mut Game, seat: SeatId) -> Result<(), GameError> {
     require_not_ended(game)?;
+    game.require_no_pending_host()?;
     let (_day, stage) = day_stage(game)?;
     if stage != DayStage::Nominations {
         return Err(GameError::WrongPhase);
@@ -343,6 +367,7 @@ pub fn close_vote(game: &mut Game, host: &Token) -> Result<(), GameError> {
         _ => return Err(GameError::Unauthorized),
     }
     require_not_ended(game)?;
+    game.require_no_pending_host()?;
     let (_day, stage) = day_stage(game)?;
     if stage != DayStage::Nominations {
         return Err(GameError::WrongPhase);
@@ -407,6 +432,10 @@ fn try_auto_end_day(game: &mut Game) -> Result<(), GameError> {
     if game.winner.is_some() || matches!(game.phase, Phase::Ended { .. }) {
         return Ok(());
     }
+    // Never auto-end while a Storyteller decision is outstanding (#36).
+    if game.pending_host.is_some() {
+        return Ok(());
+    }
     let Ok((_, stage)) = day_stage(game) else {
         return Ok(());
     };
@@ -461,12 +490,14 @@ pub fn end_nominations(game: &mut Game, host: &Token) -> Result<(), GameError> {
         Some(Actor::Host) => {}
         _ => return Err(GameError::Unauthorized),
     }
+    game.require_no_pending_host()?;
     end_nominations_inner(game)
 }
 
 /// Execute the vote leader (if any), win checks, enter night. No host auth.
 fn end_nominations_inner(game: &mut Game) -> Result<(), GameError> {
     require_not_ended(game)?;
+    game.require_no_pending_host()?;
     let (day, stage) = day_stage(game)?;
     if stage != DayStage::Nominations {
         return Err(GameError::WrongPhase);
@@ -498,7 +529,7 @@ fn end_nominations_inner(game: &mut Game) -> Result<(), GameError> {
 
     // Auto-path: next night is day + 1 (Day 1 → Night 2).
     let next_night = day + 1;
-    game.enter_night(next_night);
+    game.enter_night(next_night)?;
     Ok(())
 }
 
@@ -577,6 +608,7 @@ pub fn resolve_execution(game: &mut Game, seat: SeatId) {
 /// Hit: target is true Imp (or Recluse registering as Demon) and Slayer is active → death + win check.
 pub fn day_action_slay(game: &mut Game, slayer: SeatId, target: SeatId) -> Result<(), GameError> {
     require_not_ended(game)?;
+    game.require_no_pending_host()?;
     let (_day, _stage) = day_stage(game)?;
     // Discussion or Nominations both ok (design §10.3).
 
@@ -599,24 +631,41 @@ pub fn day_action_slay(game: &mut Game, slayer: SeatId, target: SeatId) -> Resul
 
     seat_mut(game, slayer)?.slayer_used = true;
 
-    // Hit: true Imp, or Recluse registering as Demon (same p=0.5 as Fortune Teller).
-    let target_seat = seat_ref(game, target)?;
-    let demon_label = format!("slayer_reg:day:{}", target.0);
-    let target_registers_demon = target_seat.true_character == Some(Character::Imp)
-        || crate::game::ability::register::register_demon_for_ft(game, target, &demon_label);
-    let hit = true_is_slayer
-        && !disabled
-        && target_seat.alive
-        && target_registers_demon;
-
-    if !hit {
-        // Silent miss (no public confirmation).
+    if !true_is_slayer || disabled {
+        // Silent miss (Drunk face / poisoned / drunk).
         return Ok(());
     }
 
-    let was_true_imp = seat_ref(game, target)?
-        .true_character
-        == Some(Character::Imp);
+    let target_seat = seat_ref(game, target)?;
+    if !target_seat.alive {
+        return Ok(());
+    }
+
+    // True Imp: always a hit (no ST discretion).
+    if target_seat.true_character == Some(Character::Imp) {
+        return apply_slayer_kill(game, target, true);
+    }
+
+    // Recluse-as-Demon via `registration_mode` immediately (no day-blocking host pause — #41).
+    if target_seat.true_character == Some(Character::Recluse) && !target_seat.ability_disabled() {
+        let demon_label = format!("slayer_reg:day:{}", target.0);
+        if crate::game::ability::register::register_demon_for_ft(game, target, &demon_label) {
+            return apply_slayer_kill(game, target, false);
+        }
+        return Ok(());
+    }
+
+    // Silent miss.
+    Ok(())
+}
+
+fn apply_slayer_kill(game: &mut Game, target: SeatId, was_true_imp: bool) -> Result<(), GameError> {
+    let Some(s) = game.seats.iter().find(|s| s.id == target) else {
+        return Ok(());
+    };
+    if !s.alive {
+        return Ok(());
+    }
     let alive_before = living_count(game);
     if let Some(s) = game.seats.iter_mut().find(|s| s.id == target) {
         s.alive = false;
@@ -624,7 +673,6 @@ pub fn day_action_slay(game: &mut Game, slayer: SeatId, target: SeatId) -> Resul
     }
     game.public_log.push(PublicEvent::PlayerDied { seat: target });
     game.st_announce(format!("Seat {} dies.", target.0));
-    // Scarlet Woman conversion only when the true Imp dies.
     if was_true_imp {
         apply_demon_death(game, target, alive_before);
     }

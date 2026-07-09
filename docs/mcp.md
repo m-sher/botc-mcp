@@ -53,7 +53,10 @@ Auth: game tools take `game_id` plus `token` (or `host_token` / `player_token`).
 | `get_public_log` | `game_id`, `token`, `cursor?` | Events with id > cursor |
 | `get_private_state` | `game_id`, `token`, `private_cursor?` | Drunk → Townsfolk face only |
 | `get_host_state` | `game_id`, `host_token` | Full grimoire + `seed` + `secret_salt` (never on player views) |
-| `get_character_rules` | `character` | Public sheet markdown (no `game_id`) |
+| `get_character_rules` | `character` | Public sheet markdown for one role (no `game_id`) |
+| `list_characters` | (none) | Public TB pool: name, type, team, rules path |
+| `list_rules_topics` | (none) | Public gameplay topics (`gameplay_loop`, `voting`, …) |
+| `get_rules_topic` | `topic` | Load one public rules markdown by topic id |
 | `say` | `game_id`, `token`, `text` | Public chat only |
 | `st_announce` | `game_id`, `host_token`, `text` | Host public ST line |
 | `night_action` | `game_id`, `token`, payload | See below |
@@ -64,7 +67,9 @@ Auth: game tools take `game_id` plus `token` (or `host_token` / `player_token`).
 | `open_nominations` | `game_id`, `host_token` | Host |
 | `close_vote` | `game_id`, `host_token` | Host |
 | `end_nominations` | `game_id`, `host_token` | Host |
-| `skip_night_action` | `game_id`, `host_token` | Host default for pending wake |
+| `skip_night_action` | `game_id`, `host_token` | Host default for pending **player** wake **or** pending **host** decision (random/default fallback) |
+| `host_decide` | `game_id`, `host_token`, `type`, … | ST decision: `mayor_redirect`, `starpass_pick`, `night_info` (`text`) |
+| `host_queue_lie` | `game_id`, `host_token`, `text` | Pre-queue free-text false info for disabled roles |
 
 ### `night_action` payload
 

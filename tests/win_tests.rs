@@ -80,7 +80,7 @@ fn starpass_does_not_end_game_when_minion_becomes_imp() {
     while g.pending_night.is_some() || g.pending_host.is_some() {
         skip_night_action(&mut g, &host).unwrap();
     }
-    g.enter_night(2);
+    g.enter_night(2).unwrap();
     night_action(
         &mut g,
         &tokens[2],
@@ -127,7 +127,7 @@ fn imp_death_with_no_living_minion_good_wins() {
         skip_night_action(&mut g, &host).unwrap();
     }
     g.seats[2].alive = false;
-    g.enter_night(2);
+    g.enter_night(2).unwrap();
     let p = g.pending_night.as_ref().expect("imp");
     assert!(matches!(p.step, NightStep::DemonKill { .. }));
     night_action(

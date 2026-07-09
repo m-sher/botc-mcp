@@ -139,8 +139,12 @@ fn drunk_face_ravenkeeper_dies_at_night_wakes() {
     botc_mcp::tools::end_nominations(&mut g, &host).unwrap();
     assert!(matches!(g.phase, Phase::Night { night: 2, .. }));
 
-    // Advance to Imp kill.
+    // Advance to Imp kill (skip host-first night-info pauses).
     loop {
+        if g.pending_host.is_some() {
+            skip_night_action(&mut g, &host).unwrap();
+            continue;
+        }
         let p = g.pending_night.as_ref().expect("pending");
         match p.step {
             NightStep::DemonKill { .. } => break,
@@ -193,6 +197,10 @@ fn poisoned_ravenkeeper_still_wakes_on_death() {
     botc_mcp::tools::end_nominations(&mut g, &host).unwrap();
 
     loop {
+        if g.pending_host.is_some() {
+            skip_night_action(&mut g, &host).unwrap();
+            continue;
+        }
         let p = g.pending_night.as_ref().expect("pending");
         match p.step {
             NightStep::DemonKill { .. } => break,

@@ -15,7 +15,7 @@ use crate::comms::{PrivateMessage, PublicEvent};
 use crate::error::ToolError;
 use crate::game::{
     ChoiceSchema, GameId, HostDecision, MayorRedirectChoice, NightActionPayload, RegistrationMode,
-    RoleAssignment, SeatId, StartOpts, Winner,
+    RoleAssignment, SeatId, StChoiceMode, StartOpts, Winner,
 };
 use crate::roles::Character;
 use crate::store::GameStore;
@@ -145,6 +145,9 @@ const TOOL_NAMES: &[&str] = &[
     "get_public_log",
     "get_private_state",
     "get_character_rules",
+    "list_characters",
+    "list_rules_topics",
+    "get_rules_topic",
     "get_host_state",
     "say",
     "st_announce",
@@ -182,6 +185,9 @@ fn tool_description(name: &str) -> &'static str {
         "get_public_log" => "Public event log since cursor",
         "get_private_state" => "Player private view: face identity, inbox, awaiting action",
         "get_character_rules" => "Public character sheet markdown for one TB character",
+        "list_characters" => "Public TB character pool (names, types, teams, rules paths)",
+        "list_rules_topics" => "Public list of gameplay rules topics players may read",
+        "get_rules_topic" => "Load one public rules doc by topic id (e.g. gameplay_loop, voting)",
         "get_host_state" => "Host-only grimoire (true roles, markers, pending wake, seed, secret_salt)",
         "say" => "Player public table talk (no whispers)",
         "st_announce" => "Host public storyteller announcement",
@@ -193,8 +199,8 @@ fn tool_description(name: &str) -> &'static str {
         "open_nominations" => "Host: Discussion → Nominations",
         "close_vote" => "Host: close current vote window (may auto-end day when no noms remain)",
         "end_nominations" => "Host: execute vote leader (if any), begin next night",
-        "skip_night_action" => "Host: default pending wake or host decision and continue night",
-        "host_decide" => "Host: resolve Mayor redirect or starpass pick",
+        "skip_night_action" => "Host: default pending wake OR pending host decision (random/default fallback)",
+        "host_decide" => "Host: resolve ST decision (mayor_redirect, starpass_pick, night_info)",
         "host_queue_lie" => "Host: enqueue free-text false info for next disabled info result",
         _ => "botc-mcp tool",
     }
@@ -233,6 +239,9 @@ fn invoke_tool(store: &SharedStore, name: &str, args: Value) -> Result<Value, Rp
         "get_public_log" => tool_get_public_log(store, args),
         "get_private_state" => tool_get_private_state(store, args),
         "get_character_rules" => tool_get_character_rules(args),
+        "list_characters" => tool_list_characters(),
+        "list_rules_topics" => tool_list_rules_topics(),
+        "get_rules_topic" => tool_get_rules_topic(args),
         "get_host_state" => tool_get_host_state(store, args),
         "say" => tool_say(store, args),
         "st_announce" => tool_st_announce(store, args),
@@ -495,12 +504,29 @@ fn tool_start_game(store: &SharedStore, args: Value) -> Result<Value, RpcError> 
         None
     };
 
+    let st_choice_mode = match args
+        .get("st_choice_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("host_first")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "host_first" | "host" | "hostfirst" | "" => StChoiceMode::HostFirst,
+        "random" => StChoiceMode::Random,
+        other => {
+            return Err(invalid_params(format!(
+                "unknown st_choice_mode: {other} (host_first|random)"
+            )))
+        }
+    };
+
     let opts = StartOpts {
         assignments,
         drunk_faces,
         red_herring,
         demon_bluffs,
         registration_mode,
+        st_choice_mode,
     };
 
     with_store_mut(store, |st| {
@@ -600,6 +626,47 @@ fn tool_get_character_rules(args: Value) -> Result<Value, RpcError> {
     }))
 }
 
+fn tool_list_characters() -> Result<Value, RpcError> {
+    let list = tools::get_character_list();
+    Ok(json!({
+        "characters": list.iter().map(|c| json!({
+            "name": c.name,
+            "character_type": c.character_type,
+            "team": c.team,
+            "rules_path": c.rules_path,
+        })).collect::<Vec<_>>()
+    }))
+}
+
+fn tool_list_rules_topics() -> Result<Value, RpcError> {
+    let topics = tools::get_rules_topics();
+    Ok(json!({
+        "topics": topics.iter().map(|t| json!({
+            "id": t.id,
+            "title": t.title,
+            "description": t.description,
+            "path": t.path,
+        })).collect::<Vec<_>>()
+    }))
+}
+
+fn tool_get_rules_topic(args: Value) -> Result<Value, RpcError> {
+    let id = args
+        .get("topic")
+        .or_else(|| args.get("id"))
+        .or_else(|| args.get("name"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| invalid_params("get_rules_topic requires topic id"))?;
+    let (topic, text) = tools::get_rules_topic(id).map_err(tool_err)?;
+    Ok(json!({
+        "id": topic.id,
+        "title": topic.title,
+        "description": topic.description,
+        "path": topic.path,
+        "text": text,
+    }))
+}
+
 fn tool_get_host_state(store: &SharedStore, args: Value) -> Result<Value, RpcError> {
     let game_id = require_game_id(&args)?;
     let token = any_token(&args)?;
@@ -638,6 +705,7 @@ fn tool_get_host_state(store: &SharedStore, args: Value) -> Result<Value, RpcErr
                 "seats": p.seats.iter().map(|s| s.0).collect::<Vec<_>>(),
             })),
             "registration_mode": view.registration_mode,
+            "st_choice_mode": view.st_choice_mode,
             "host_lie_queue_len": view.host_lie_queue_len,
             "red_herring": view.red_herring.map(|s| s.0),
             "demon_bluffs": view.demon_bluffs,
@@ -942,6 +1010,14 @@ fn tool_host_decide(store: &SharedStore, args: Value) -> Result<Value, RpcError>
             HostDecision::StarpassPick {
                 minion: seat_id(minion)?,
             }
+        }
+        "night_info" => {
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| invalid_params("night_info requires text"))?
+                .to_string();
+            HostDecision::NightInfo { text }
         }
         other => {
             return Err(invalid_params(format!(

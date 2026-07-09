@@ -47,6 +47,10 @@ fn to_day1(g: &mut Game, host: &botc_mcp::auth::Token) {
 
 fn advance_to_imp_kill(g: &mut Game, host: &botc_mcp::auth::Token, tokens: &[botc_mcp::auth::Token]) {
     loop {
+        if g.pending_host.is_some() {
+            skip_night_action(g, host).unwrap();
+            continue;
+        }
         let Some(p) = g.pending_night.clone() else {
             panic!("no pending {:?}", g.phase);
         };

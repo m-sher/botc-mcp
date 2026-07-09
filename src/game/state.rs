@@ -11,7 +11,8 @@ use crate::game::phase::{NightStep, Phase, Winner};
 use crate::game::seat::Seat;
 use crate::game::setup::{build_bag, setup_markers, validate_fixed_assignments, StartOpts};
 use crate::game::st_policy::{
-    HostDecision, MayorRedirectChoice, PendingHostDecision, RegistrationMode,
+    HostDecision, MayorRedirectChoice, NightInfoPayload, PendingHostDecision, RegistrationMode,
+    StChoiceMode,
 };
 use crate::rng::SeededRng;
 use crate::roles::{Character, CharacterType, Team};
@@ -61,10 +62,12 @@ pub struct Game {
     pub night_cursor: usize,
     /// Active player wake, if the night machine is waiting on a choice.
     pub pending_night: Option<PendingWake>,
-    /// Host-only night decision (Mayor bounce / starpass); pauses night_tick.
+    /// Host Storyteller decision (Mayor / starpass / night info / day reg); pauses progress.
     pub pending_host: Option<PendingHostDecision>,
-    /// Spy/Recluse registration policy for this game.
+    /// Spy/Recluse registration policy for the random/skip path.
     pub registration_mode: RegistrationMode,
+    /// Host-first (default) vs immediate random Storyteller discretion.
+    pub st_choice_mode: StChoiceMode,
     /// FIFO free-text lies for disabled info roles (host-authored; else seeded-random).
     pub host_lie_queue: VecDeque<String>,
     /// Seats that died during the current night (demon kill, etc.).
@@ -180,6 +183,7 @@ impl Game {
                 pending_night: None,
                 pending_host: None,
                 registration_mode: RegistrationMode::Random,
+                st_choice_mode: StChoiceMode::HostFirst,
                 host_lie_queue: VecDeque::new(),
                 deaths_tonight: Vec::new(),
                 executed_today: None,
@@ -280,6 +284,7 @@ impl Game {
         }
 
         self.registration_mode = opts.registration_mode;
+        self.st_choice_mode = opts.st_choice_mode;
         self.red_herring = red_herring;
         self.demon_bluffs = demon_bluffs;
         self.apply_assignments_and_brief(assignments)
@@ -401,7 +406,7 @@ impl Game {
         Ok(())
     }
 
-    /// Host: resolve a pending Mayor bounce / starpass decision.
+    /// Host: resolve a pending Storyteller decision.
     pub fn host_decide(&mut self, host: &Token, decision: HostDecision) -> Result<(), GameError> {
         match self.tokens.resolve(host) {
             Some(Actor::Host) => {}
@@ -413,6 +418,18 @@ impl Game {
     /// Pop the next host-authored lie, if any (used by disabled info paths).
     pub fn take_host_lie(&mut self) -> Option<String> {
         self.host_lie_queue.pop_front()
+    }
+
+    /// Reject gameplay mutations while a Storyteller decision is outstanding (#36–#38).
+    ///
+    /// Only `host_decide` / `skip_night_action` may proceed while `pending_host` is set.
+    pub fn require_no_pending_host(&self) -> Result<(), GameError> {
+        if self.pending_host.is_some() {
+            return Err(GameError::IllegalAction(
+                "storyteller decision pending; resolve with host_decide or skip_night_action",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn apply_host_decision(
@@ -450,6 +467,16 @@ impl Game {
                 self.advance_after_host_decision();
                 Ok(())
             }
+            (
+                PendingHostDecision::NightInfo { seat, .. },
+                HostDecision::NightInfo { text },
+            ) => {
+                self.pending_host = None;
+                let msg = PrivateMessage::NightResult { text: text.clone() };
+                self.private_inboxes.push(seat, msg);
+                self.advance_after_host_decision();
+                Ok(())
+            }
             _ => Err(GameError::IllegalAction(
                 "host decision does not match pending decision type",
             )),
@@ -469,7 +496,7 @@ impl Game {
                 })
             }
             PendingHostDecision::StarpassPick { minions, dead_imp } => {
-                // Random among living minions (previous default).
+                // Random among living minions.
                 let mut sorted = minions;
                 sorted.sort_by_key(|id| id.0);
                 let label = format!("starpass:c{}", self.night_cursor);
@@ -481,11 +508,39 @@ impl Game {
                 let _ = dead_imp;
                 self.apply_host_decision(HostDecision::StarpassPick { minion })
             }
+            PendingHostDecision::NightInfo {
+                seat: _,
+                step,
+                payload,
+                ..
+            } => {
+                // Random path: run engine resolution for this step.
+                self.pending_host = None;
+                let night_payload = payload.map(|p| match p {
+                    NightInfoPayload::PickTwo { a, b } => {
+                        crate::game::night::NightActionPayload::PickTwo { a, b }
+                    }
+                    NightInfoPayload::PickOne { target } => {
+                        crate::game::night::NightActionPayload::PickOne { target }
+                    }
+                });
+                crate::game::ability::resolve_night_step(
+                    self,
+                    step,
+                    night_payload.as_ref(),
+                )?;
+                self.advance_after_host_decision();
+                Ok(())
+            }
         }
     }
 
     fn advance_after_host_decision(&mut self) {
-        // DemonKill player step already cleared pending_night; advance cursor and continue.
+        // Only advance the night cursor when we are still in a night phase.
+        if !matches!(self.phase, Phase::FirstNight { .. } | Phase::Night { .. }) {
+            return;
+        }
+        // DemonKill / night-info: clear pending and continue the queue.
         self.night_cursor += 1;
         match &mut self.phase {
             Phase::FirstNight { cursor } => *cursor = self.night_cursor,
