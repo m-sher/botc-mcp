@@ -172,13 +172,13 @@ fn tool_descriptors() -> Vec<Value> {
 
 fn tool_description(name: &str) -> &'static str {
     match name {
-        "create_game" => "Create a Trouble Brewing lobby (5–15 players); returns game_id, host_token, player tokens",
+        "create_game" => "Create a Trouble Brewing lobby (5–15 players); optional seed (omit = CSPRNG); returns game_id, host_token, player tokens",
         "start_game" => "Host: lock lobby, assign bag (or fixed assignments), enter first night",
         "get_public_state" => "Public phase/seats/winner snapshot (no roles, no pending night seat)",
         "get_public_log" => "Public event log since cursor",
         "get_private_state" => "Player private view: face identity, inbox, awaiting action",
         "get_character_rules" => "Public character sheet markdown for one TB character",
-        "get_host_state" => "Host-only grimoire (true roles, markers, pending wake)",
+        "get_host_state" => "Host-only grimoire (true roles, markers, pending wake, seed, secret_salt)",
         "say" => "Player public table talk (no whispers)",
         "st_announce" => "Host public storyteller announcement",
         "night_action" => "Player night choice for current pending wake",
@@ -371,7 +371,11 @@ fn tool_create_game(store: &SharedStore, args: Value) -> Result<Value, RpcError>
                 .ok_or_else(|| invalid_params("names entries must be strings"))
         })
         .collect::<Result<_, _>>()?;
-    let seed = args.get("seed").and_then(|v| v.as_u64()).unwrap_or(0);
+    // Never default to seed 0: omit → CSPRNG secret so bag/draws are not offline-reproducible.
+    let seed = args
+        .get("seed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(rand::random);
 
     with_store_mut(store, |st| {
         let resp = tools::create_game(st, names, seed).map_err(tool_err)?;
@@ -533,6 +537,7 @@ fn tool_get_host_state(store: &SharedStore, args: Value) -> Result<Value, RpcErr
         let view = tools::get_host_state(game, &token).map_err(tool_err)?;
         Ok(json!({
             "seed": view.seed,
+            "secret_salt": view.secret_salt,
             "phase": view.phase,
             "seats": view.seats.iter().map(|s| json!({
                 "seat_id": s.seat_id.0,
@@ -913,6 +918,38 @@ mod tests {
         assert_eq!(sc["game_id"], 1);
         assert!(sc["host_token"].as_str().unwrap().len() == 36);
         assert_eq!(sc["players"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn create_game_omitted_seed_is_not_zero() {
+        let store = new_shared_store();
+        let resp = call(
+            &store,
+            "create_game",
+            json!({
+                "names": ["A", "B", "C", "D", "E"]
+            }),
+        );
+        assert!(resp.get("error").is_none(), "{resp}");
+        let sc = &resp["result"]["structuredContent"];
+        let host = sc["host_token"].as_str().unwrap();
+        let game_id = sc["game_id"].as_u64().unwrap();
+        let host_resp = call(
+            &store,
+            "get_host_state",
+            json!({ "game_id": game_id, "host_token": host }),
+        );
+        assert!(host_resp.get("error").is_none(), "{host_resp}");
+        let seed = host_resp["result"]["structuredContent"]["seed"]
+            .as_u64()
+            .expect("seed");
+        let salt = host_resp["result"]["structuredContent"]["secret_salt"]
+            .as_u64()
+            .expect("secret_salt");
+        // CSPRNG seed: must not silently default to 0 (issue #1 #4).
+        assert_ne!(seed, 0, "omitted seed must not default to 0");
+        // secret_salt is present for host (player views never get it).
+        let _ = salt;
     }
 
     #[test]

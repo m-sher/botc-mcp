@@ -62,10 +62,12 @@ pub struct HostPendingView {
     pub step_debug: String,
 }
 
-/// Host-only full grimoire + pending + seed (eval/debug).
+/// Host-only full grimoire + pending + seed/salt (eval/debug).
 #[derive(Debug, Clone)]
 pub struct HostStateView {
     pub seed: u64,
+    /// Per-game secret mixed into RNG substreams. Never exposed on player views.
+    pub secret_salt: u64,
     pub phase: String,
     pub seats: Vec<HostSeatView>,
     pub pending: Option<HostPendingView>,

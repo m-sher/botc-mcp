@@ -37,6 +37,8 @@ pub struct PublicSeatView {
 pub struct Game {
     pub id: GameId,
     pub seed: u64,
+    /// Per-game CSPRNG salt mixed into every RNG substream. Host-only; never player views.
+    pub secret_salt: u64,
     pub rng: SeededRng,
     pub phase: Phase,
     pub seats: Vec<Seat>,
@@ -115,7 +117,19 @@ impl RoleAssignment {
 
 impl Game {
     /// Open a lobby with seats and issued tokens. `id` is a placeholder until [`crate::store::GameStore::insert`].
+    ///
+    /// Generates a fresh CSPRNG [`Self::secret_salt`] so substreams cannot be reconstructed from
+    /// `seed` and public labels alone.
     pub fn create(player_names: Vec<String>, seed: u64) -> Result<CreateGameResult, GameError> {
+        Self::create_with_salt(player_names, seed, rand::random())
+    }
+
+    /// Like [`Self::create`] but with an explicit secret salt (deterministic tests / replay).
+    pub fn create_with_salt(
+        player_names: Vec<String>,
+        seed: u64,
+        secret_salt: u64,
+    ) -> Result<CreateGameResult, GameError> {
         let n = player_names.len();
         if n < MIN_PLAYERS || n > MAX_PLAYERS {
             return Err(GameError::BadRequest(
@@ -140,7 +154,8 @@ impl Game {
             game: Self {
                 id: GameId(0),
                 seed,
-                rng: SeededRng::from_seed(seed),
+                secret_salt,
+                rng: SeededRng::from_seed_and_salt(seed, secret_salt),
                 phase: Phase::Lobby,
                 seats,
                 tokens,

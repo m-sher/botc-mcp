@@ -47,12 +47,12 @@ Auth: game tools take `game_id` plus `token` (or `host_token` / `player_token`).
 
 | Tool | Key arguments | Notes |
 | --- | --- | --- |
-| `create_game` | `names: string[]`, `seed?: u64` | Returns `game_id`, `host_token`, `players[]` |
+| `create_game` | `names: string[]`, `seed?: u64` | Returns `game_id`, `host_token`, `players[]`. If `seed` is omitted, the server draws a CSPRNG seed (never defaults to `0`). Each game also gets a host-only `secret_salt` mixed into every RNG substream so public labels alone cannot reconstruct draws; `get_host_state` exposes `seed` + `secret_salt`. |
 | `start_game` | `game_id`, `host_token`, `assignments?` | Optional fixed roles; Drunk needs `believed` |
 | `get_public_state` | `game_id`, `token` | No roles / no pending night seat |
 | `get_public_log` | `game_id`, `token`, `cursor?` | Events with id > cursor |
 | `get_private_state` | `game_id`, `token`, `private_cursor?` | Drunk → Townsfolk face only |
-| `get_host_state` | `game_id`, `host_token` | Full grimoire |
+| `get_host_state` | `game_id`, `host_token` | Full grimoire + `seed` + `secret_salt` (never on player views) |
 | `get_character_rules` | `character` | Public sheet markdown (no `game_id`) |
 | `say` | `game_id`, `token`, `text` | Public chat only |
 | `st_announce` | `game_id`, `host_token`, `text` | Host public ST line |

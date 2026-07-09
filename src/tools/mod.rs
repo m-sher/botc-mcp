@@ -194,6 +194,7 @@ pub fn get_host_state(game: &Game, token: &Token) -> Result<HostStateView, ToolE
 
     Ok(HostStateView {
         seed: game.seed,
+        secret_salt: game.secret_salt,
         phase: format!("{:?}", game.phase),
         seats,
         pending,
