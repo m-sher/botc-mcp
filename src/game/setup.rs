@@ -137,27 +137,7 @@ pub fn build_bag(rng: &SeededRng, n: u8) -> Result<BagResult, GameError> {
         }
     }
 
-    let red_herring = if bag_set.contains(&Character::FortuneTeller) {
-        let good_seats: Vec<SeatId> = assignments
-            .iter()
-            .filter(|a| a.true_character.team() == Team::Good)
-            .map(|a| a.seat)
-            .collect();
-        if good_seats.is_empty() {
-            None
-        } else {
-            let mut hrng = rng.substream("red_herring");
-            Some(good_seats[hrng.gen_range(0..good_seats.len())])
-        }
-    } else {
-        None
-    };
-
-    let demon_bluffs = if n >= 7 {
-        pick_demon_bluffs(rng, &bag_set)
-    } else {
-        Vec::new()
-    };
+    let (red_herring, demon_bluffs) = setup_markers(rng, n, &assignments, &bag_set);
 
     Ok(BagResult {
         assignments,
@@ -167,6 +147,47 @@ pub fn build_bag(rng: &SeededRng, n: u8) -> Result<BagResult, GameError> {
     })
 }
 
+/// Red herring (if FT in bag) + demon bluffs (n >= 7) after seats are assigned.
+///
+/// Used by random [`build_bag`] and by fixed [`crate::game::Game::start_game`] assignments.
+pub fn setup_markers(
+    rng: &SeededRng,
+    n: u8,
+    assignments: &[RoleAssignment],
+    bag_set: &[Character],
+) -> (Option<SeatId>, Vec<Character>) {
+    let red_herring = pick_red_herring(rng, bag_set, assignments);
+    let demon_bluffs = if n >= 7 {
+        pick_demon_bluffs(rng, bag_set)
+    } else {
+        Vec::new()
+    };
+    (red_herring, demon_bluffs)
+}
+
+/// If Fortune Teller is in the bag, pick a uniform random **good** seat as red herring.
+fn pick_red_herring(
+    rng: &SeededRng,
+    bag_set: &[Character],
+    assignments: &[RoleAssignment],
+) -> Option<SeatId> {
+    if !bag_set.contains(&Character::FortuneTeller) {
+        return None;
+    }
+    let good_seats: Vec<SeatId> = assignments
+        .iter()
+        .filter(|a| a.true_character.team() == Team::Good)
+        .map(|a| a.seat)
+        .collect();
+    if good_seats.is_empty() {
+        None
+    } else {
+        let mut hrng = rng.substream("red_herring");
+        Some(good_seats[hrng.gen_range(0..good_seats.len())])
+    }
+}
+
+/// Three not-in-play Townsfolk/Outsider characters for Imp bluffs.
 fn pick_demon_bluffs(rng: &SeededRng, bag_set: &[Character]) -> Vec<Character> {
     let in_bag: std::collections::HashSet<Character> = bag_set.iter().copied().collect();
     let mut good_not_in_play: Vec<Character> = all_townsfolk()

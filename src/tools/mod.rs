@@ -146,7 +146,7 @@ pub fn get_private_state(
         name: seat.display_name.clone(),
         alive: seat.alive,
         character_label: visible.map(|c| c.display_name().to_string()),
-        team_label: seat.true_character.map(|c| format!("{:?}", c.team())),
+        team_label: visible.map(|c| format!("{:?}", c.team())),
         rules_path: visible.map(|c| c.rules_doc_path().to_string()),
         private_messages_since: game
             .private_inboxes

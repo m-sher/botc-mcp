@@ -6,7 +6,7 @@ use crate::error::GameError;
 use crate::game::ids::{GameId, SeatId};
 use crate::game::phase::{NightStep, Phase};
 use crate::game::seat::Seat;
-use crate::game::setup::{build_bag, validate_fixed_assignments, StartOpts};
+use crate::game::setup::{build_bag, setup_markers, validate_fixed_assignments, StartOpts};
 use crate::rng::SeededRng;
 use crate::roles::{Character, CharacterType, Team};
 
@@ -198,7 +198,9 @@ impl Game {
         let n = self.seats.len() as u8;
         let (assignments, red_herring, demon_bluffs) = if let Some(fixed) = opts.assignments {
             validate_fixed_assignments(self.seats.len(), &fixed)?;
-            (fixed, None, Vec::new())
+            let bag_set: Vec<Character> = fixed.iter().map(|a| a.true_character).collect();
+            let (red_herring, demon_bluffs) = setup_markers(&self.rng, n, &fixed, &bag_set);
+            (fixed, red_herring, demon_bluffs)
         } else {
             let bag = build_bag(&self.rng, n)?;
             (bag.assignments, bag.red_herring, bag.demon_bluffs)
