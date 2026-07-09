@@ -1,15 +1,18 @@
-# Demon
+# Imp
 
-## Imp
+| | |
+| --- | --- |
+| **Type** | Demon |
+| **Team** | Evil |
 
 **Each night*, choose a player: they die. If you kill yourself this way, a Minion becomes the Imp.**
 
 ### Night kill
 
-- Every night except the first.
+- Every night except the first (`*`).
 - May choose living or dead players.
 - Choosing dead → no public death (sink kill).
-- Blocked by Monk protection, Soldier, etc.
+- Blocked by protection that stops Demon kills (e.g. Monk, Soldier).
 - Deaths announced at dawn without cause.
 
 ### First night briefing
@@ -24,17 +27,17 @@
 
 ### Starpass (self-kill)
 
-1. Imp chooses themself at night → Imp dies.
-2. Storyteller chooses a **living Minion** → becomes Imp.
+1. You choose yourself at night → you die.
+2. Storyteller chooses a **living Minion** → becomes the Imp.
 3. New Imp is told they are now the Imp.
 4. New Imp does **not** kill again that same night.
 5. Game continues.
 
-### Interaction notes
+### If you die
 
 | Situation | Result |
 | --- | --- |
-| Imp executed, no SW or SW ineligible | Good wins |
-| Imp dies, SW eligible (5+ alive) | SW becomes Imp |
-| Imp starpass | Minion becomes Imp |
-| Last Demon dead and two alive at once | Good wins |
+| You die and Scarlet Woman is ineligible or absent | Good wins |
+| You die with 5+ living and Scarlet Woman in play | Scarlet Woman becomes Imp |
+| You starpass | A Minion becomes Imp |
+| You die leaving exactly two alive at the same moment | Good wins |

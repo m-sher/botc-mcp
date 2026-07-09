@@ -20,12 +20,13 @@ prompting players.
 | Ability resolution | [abilities-rules.md](abilities-rules.md) |
 | Night wake order | [night-order.md](night-order.md) |
 | Storyteller (moderator) | [storyteller.md](storyteller.md) |
-| Character types | [roles/character-types.md](roles/character-types.md) |
-| Character list (pool) | [characters.md](characters.md) |
-| Townsfolk | [roles/townsfolk.md](roles/townsfolk.md) |
-| Outsiders | [roles/outsiders.md](roles/outsiders.md) |
-| Minions | [roles/minions.md](roles/minions.md) |
-| Demon (Imp) | [roles/demon.md](roles/demon.md) |
+| Character types (no abilities) | [roles/character-types.md](roles/character-types.md) |
+| Character pool index | [characters.md](characters.md) |
+| **Roles (one file each)** | [roles/README.md](roles/README.md) |
+| └ Townsfolk | [roles/townsfolk/](roles/townsfolk/) |
+| └ Outsiders | [roles/outsiders/](roles/outsiders/) |
+| └ Minions | [roles/minions/](roles/minions/) |
+| └ Demons | [roles/demons/](roles/demons/) |
 | Glossary | [glossary.md](glossary.md) |
 | Sources | [sources.md](sources.md) |
 
@@ -34,7 +35,7 @@ prompting players.
 - Day/night cycle → `gameplay-loop.md`
 - Who wins → `win-conditions.md`
 - Vote thresholds → `voting-and-nominations.md`
-- A specific role → `roles/*.md`
+- **A player’s role only** → `roles/<type>/<name>.md` (never the whole type folder’s contents at once unless indexing)
 - Wake order → `night-order.md`
 - Drunk / poison → `states.md`
 - Bag composition → `setup.md`
