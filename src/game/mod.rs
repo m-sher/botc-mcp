@@ -1,5 +1,6 @@
 //! Authoritative game state machine (sketch).
 
+pub mod ability;
 mod ids;
 pub mod night;
 mod phase;

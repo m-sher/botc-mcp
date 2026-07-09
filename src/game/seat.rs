@@ -43,4 +43,9 @@ impl Seat {
     pub fn visible_character(&self) -> Option<Character> {
         self.believed_character.or(self.true_character)
     }
+
+    /// Drunk outsider or currently poisoned: ability fizzles / false info (§9.3).
+    pub fn ability_disabled(&self) -> bool {
+        self.is_drunk_outsider || self.poisoned
+    }
 }

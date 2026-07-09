@@ -252,7 +252,7 @@ impl Game {
         }
 
         self.validate_payload(&pending, &payload)?;
-        self.resolve_pending_stub(&pending, &payload)?;
+        self.resolve_pending_action(&pending, &payload)?;
 
         self.pending_night = None;
         self.advance_cursor();
@@ -280,23 +280,24 @@ impl Game {
                 self.resolve_dawn();
                 StepOutcome::DawnDone
             }
-            // Info-only / ST-computed: stub NightResult and advance (full resolve Task 8–9).
-            NightStep::Spy { seat }
-            | NightStep::Washerwoman { seat }
-            | NightStep::Librarian { seat }
-            | NightStep::Investigator { seat }
-            | NightStep::Chef { seat }
-            | NightStep::Empath { seat }
-            | NightStep::Undertaker { seat } => {
+            // Spy grimoire still stub (Task 9+); info roles resolve now (§9.6 / Task 8).
+            NightStep::Spy { seat } => {
                 self.private_inboxes.push(
                     seat,
                     PrivateMessage::NightResult {
-                        text: format!(
-                            "Night information for {} (stub).",
-                            step_label(step)
-                        ),
+                        text: "Spy: Grimoire (stub).".to_string(),
                     },
                 );
+                self.advance_cursor();
+                StepOutcome::Advanced
+            }
+            NightStep::Washerwoman { .. }
+            | NightStep::Librarian { .. }
+            | NightStep::Investigator { .. }
+            | NightStep::Chef { .. }
+            | NightStep::Empath { .. }
+            | NightStep::Undertaker { .. } => {
+                let _ = crate::game::ability::resolve_night_step(self, step, None);
                 self.advance_cursor();
                 StepOutcome::Advanced
             }
@@ -570,8 +571,8 @@ impl Game {
         }
     }
 
-    /// Stub resolve: Poisoner applies poison; other choices only ack and advance (Task 8–9).
-    fn resolve_pending_stub(
+    /// Resolve a submitted night choice (info abilities via `ability`; poison/monk until Task 9).
+    fn resolve_pending_action(
         &mut self,
         pending: &PendingWake,
         payload: &NightActionPayload,
@@ -584,7 +585,7 @@ impl Game {
                         .seats
                         .iter()
                         .find(|s| s.id == pending.seat)
-                        .map(|s| s.poisoned || s.is_drunk_outsider)
+                        .map(|s| s.ability_disabled())
                         .unwrap_or(false);
                     for s in &mut self.seats {
                         s.poisoned = false;
@@ -597,21 +598,13 @@ impl Game {
                 }
                 Ok(())
             }
-            NightStep::Butler { .. } => {
-                if let NightActionPayload::PickOne { target } = payload {
-                    if let Some(s) = self.seats.iter_mut().find(|s| s.id == pending.seat) {
-                        s.butler_master = Some(*target);
-                    }
-                }
-                Ok(())
-            }
             NightStep::Monk { .. } => {
                 if let NightActionPayload::PickOne { target } = payload {
                     let disabled = self
                         .seats
                         .iter()
                         .find(|s| s.id == pending.seat)
-                        .map(|s| s.poisoned || s.is_drunk_outsider)
+                        .map(|s| s.ability_disabled())
                         .unwrap_or(false);
                     if !disabled {
                         if let Some(t) = self.seats.iter_mut().find(|s| s.id == *target) {
@@ -621,8 +614,13 @@ impl Game {
                 }
                 Ok(())
             }
-            // Full ability resolve is Task 8–9; accepting the choice is enough to advance.
-            _ => Ok(()),
+            // Demon kill deferred to Task 9; accept choice and advance.
+            NightStep::DemonKill { .. } => Ok(()),
+            // Info / Butler / Ravenkeeper (Task 8).
+            step => {
+                crate::game::ability::resolve_night_step(self, step, Some(payload))?;
+                Ok(())
+            }
         }
     }
 
@@ -675,28 +673,6 @@ enum StepOutcome {
     Advanced,
     Waiting,
     DawnDone,
-}
-
-fn step_label(step: NightStep) -> &'static str {
-    match step {
-        NightStep::SetupMarkers => "Setup",
-        NightStep::MinionBriefing => "Minion briefing",
-        NightStep::DemonBriefing => "Demon briefing",
-        NightStep::Poisoner { .. } => "Poisoner",
-        NightStep::Spy { .. } => "Spy",
-        NightStep::Washerwoman { .. } => "Washerwoman",
-        NightStep::Librarian { .. } => "Librarian",
-        NightStep::Investigator { .. } => "Investigator",
-        NightStep::Chef { .. } => "Chef",
-        NightStep::Empath { .. } => "Empath",
-        NightStep::FortuneTeller { .. } => "Fortune Teller",
-        NightStep::Butler { .. } => "Butler",
-        NightStep::Monk { .. } => "Monk",
-        NightStep::DemonKill { .. } => "Demon",
-        NightStep::Ravenkeeper { .. } => "Ravenkeeper",
-        NightStep::Undertaker { .. } => "Undertaker",
-        NightStep::Dawn => "Dawn",
-    }
 }
 
 #[cfg(test)]

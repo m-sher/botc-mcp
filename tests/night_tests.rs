@@ -322,3 +322,155 @@ fn five_player_no_evil_briefing() {
     assert!(g.pending_night.is_some());
     assert_eq!(g.pending_night.as_ref().unwrap().seat, SeatId(2));
 }
+
+// ---------------------------------------------------------------------------
+// Task 8: info ability resolution + disabled lies
+// ---------------------------------------------------------------------------
+
+fn night_results_for(game: &Game, seat: SeatId) -> Vec<String> {
+    game.private_inboxes
+        .since(seat, 0)
+        .into_iter()
+        .filter_map(|(_, m)| match m {
+            PrivateMessage::NightResult { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Circle: Good, Imp, Empath, Good, Good — Empath neighbors Imp + Good => 1
+#[test]
+fn empath_counts_living_evil_neighbors() {
+    let lobby = Game::create(five_names(), 42).unwrap();
+    let host = lobby.host_token.clone();
+    let mut g = lobby.game;
+    g.start_game(
+        &host,
+        StartOpts {
+            assignments: Some(vec![
+                RoleAssignment::normal(SeatId(0), Character::Soldier), // good
+                RoleAssignment::normal(SeatId(1), Character::Imp),     // evil
+                RoleAssignment::normal(SeatId(2), Character::Empath),
+                RoleAssignment::normal(SeatId(3), Character::Chef), // good
+                RoleAssignment::normal(SeatId(4), Character::Soldier), // good
+            ]),
+        },
+    )
+    .unwrap();
+    // No choice roles → night auto-resolves through Empath to dawn.
+    let results = night_results_for(&g, SeatId(2));
+    assert!(
+        results.iter().any(|t| t.contains("that 1 of")),
+        "Empath should learn 1 evil neighbor: {results:?}"
+    );
+}
+
+#[test]
+fn drunk_empath_gets_wrong_info() {
+    // Truth neighbors: Imp + Good => 1; disabled always lies => 0 or 2
+    let lobby = Game::create(five_names(), 42).unwrap();
+    let host = lobby.host_token.clone();
+    let mut g = lobby.game;
+    g.start_game(
+        &host,
+        StartOpts {
+            assignments: Some(vec![
+                RoleAssignment::drunk(SeatId(0), Character::Empath).unwrap(),
+                RoleAssignment::normal(SeatId(1), Character::Imp),
+                RoleAssignment::normal(SeatId(2), Character::Soldier),
+                RoleAssignment::normal(SeatId(3), Character::Chef),
+                RoleAssignment::normal(SeatId(4), Character::Soldier),
+            ]),
+        },
+    )
+    .unwrap();
+    let results = night_results_for(&g, SeatId(0));
+    assert!(
+        results
+            .iter()
+            .any(|t| t.contains("that 0 of") || t.contains("that 2 of")),
+        "Drunk Empath must get wrong count (not 1): {results:?}"
+    );
+    assert!(
+        !results.iter().any(|t| t.contains("that 1 of")),
+        "Drunk Empath must never get the true count 1: {results:?}"
+    );
+}
+
+#[test]
+fn fortune_teller_red_herring_pings_yes() {
+    let lobby = Game::create(five_names(), 7).unwrap();
+    let host = lobby.host_token.clone();
+    let tokens = lobby.player_tokens.clone();
+    let mut g = lobby.game;
+    g.start_game(
+        &host,
+        StartOpts {
+            assignments: Some(vec![
+                RoleAssignment::normal(SeatId(0), Character::FortuneTeller),
+                RoleAssignment::normal(SeatId(1), Character::Imp),
+                RoleAssignment::normal(SeatId(2), Character::Soldier),
+                RoleAssignment::normal(SeatId(3), Character::Chef),
+                RoleAssignment::normal(SeatId(4), Character::Soldier),
+            ]),
+        },
+    )
+    .unwrap();
+    // Force herring to a good non-demon seat and pick herring + good townsfolk.
+    g.red_herring = Some(SeatId(2));
+    let p = g.pending_night.as_ref().expect("FT pending");
+    assert!(matches!(p.step, NightStep::FortuneTeller { seat: SeatId(0) }));
+    night_action(
+        &mut g,
+        &tokens[0],
+        NightActionPayload::PickTwo {
+            a: SeatId(2),
+            b: SeatId(3),
+        },
+    )
+    .unwrap();
+    let results = night_results_for(&g, SeatId(0));
+    assert!(
+        results
+            .iter()
+            .any(|t| t.contains("YES") || t.contains("yes")),
+        "red herring + good should ping yes: {results:?}"
+    );
+}
+
+#[test]
+fn librarian_zero_outsiders_reports_zero() {
+    let lobby = Game::create(five_names(), 3).unwrap();
+    let host = lobby.host_token.clone();
+    let tokens = lobby.player_tokens.clone();
+    let mut g = lobby.game;
+    // 5p: no Outsiders in bag.
+    g.start_game(
+        &host,
+        StartOpts {
+            assignments: Some(vec![
+                RoleAssignment::normal(SeatId(0), Character::Librarian),
+                RoleAssignment::normal(SeatId(1), Character::Imp),
+                RoleAssignment::normal(SeatId(2), Character::Poisoner),
+                RoleAssignment::normal(SeatId(3), Character::Chef),
+                RoleAssignment::normal(SeatId(4), Character::Soldier),
+            ]),
+        },
+    )
+    .unwrap();
+    // Poison someone other than the Librarian so info stays truthful.
+    night_action(
+        &mut g,
+        &tokens[2],
+        NightActionPayload::PickOne { target: SeatId(4) },
+    )
+    .unwrap();
+    while g.pending_night.is_some() {
+        skip_night_action(&mut g, &host).unwrap();
+    }
+    let results = night_results_for(&g, SeatId(0));
+    assert!(
+        results.iter().any(|t| t.contains("0 Outsiders")),
+        "Librarian with no Outsiders: {results:?}"
+    );
+}
