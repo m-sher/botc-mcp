@@ -124,13 +124,33 @@ pub fn build_bag(rng: &SeededRng, n: u8) -> Result<BagResult, GameError> {
     bag.shuffle(&mut assign_rng);
 
     let mut face_rng = rng.substream("drunk_face");
-    let townsfolk_pool = all_townsfolk();
+    // Physical TB: Drunk face is a Townsfolk token *not otherwise in the bag*.
+    let in_bag: std::collections::HashSet<Character> = bag_set.iter().copied().collect();
+    let mut not_in_bag_tf: Vec<Character> = all_townsfolk()
+        .iter()
+        .copied()
+        .filter(|c| !in_bag.contains(c))
+        .collect();
+    if not_in_bag_tf.is_empty() {
+        // Fallback (illegal composition / scripted bags): any Townsfolk.
+        not_in_bag_tf = all_townsfolk().to_vec();
+    }
 
     let mut assignments = Vec::with_capacity(bag.len());
+    let mut used_faces: std::collections::HashSet<Character> = std::collections::HashSet::new();
     for (i, &ch) in bag.iter().enumerate() {
         let seat = SeatId(i as u8);
         if ch == Character::Drunk {
-            let face = townsfolk_pool[face_rng.gen_range(0..townsfolk_pool.len())];
+            let mut pool: Vec<Character> = not_in_bag_tf
+                .iter()
+                .copied()
+                .filter(|c| !used_faces.contains(c))
+                .collect();
+            if pool.is_empty() {
+                pool = not_in_bag_tf.clone();
+            }
+            let face = pool[face_rng.gen_range(0..pool.len())];
+            used_faces.insert(face);
             assignments.push(RoleAssignment::drunk(seat, face)?);
         } else {
             assignments.push(RoleAssignment::normal(seat, ch));
@@ -158,7 +178,12 @@ pub fn setup_markers(
 ) -> (Option<SeatId>, Vec<Character>) {
     let red_herring = pick_red_herring(rng, bag_set, assignments);
     let demon_bluffs = if n >= 7 {
-        pick_demon_bluffs(rng, bag_set)
+        let drunk_faces: Vec<Character> = assignments
+            .iter()
+            .filter(|a| a.true_character == Character::Drunk)
+            .filter_map(|a| a.believed_character)
+            .collect();
+        pick_demon_bluffs(rng, bag_set, &drunk_faces)
     } else {
         Vec::new()
     };
@@ -188,13 +213,21 @@ fn pick_red_herring(
 }
 
 /// Three not-in-play Townsfolk/Outsider characters for Imp bluffs.
-fn pick_demon_bluffs(rng: &SeededRng, bag_set: &[Character]) -> Vec<Character> {
+///
+/// Excludes Drunk face characters so the Imp cannot bluff the Drunk's sincere claim.
+fn pick_demon_bluffs(
+    rng: &SeededRng,
+    bag_set: &[Character],
+    drunk_faces: &[Character],
+) -> Vec<Character> {
     let in_bag: std::collections::HashSet<Character> = bag_set.iter().copied().collect();
+    let drunk_face_set: std::collections::HashSet<Character> =
+        drunk_faces.iter().copied().collect();
     let mut good_not_in_play: Vec<Character> = all_townsfolk()
         .iter()
         .chain(all_outsiders().iter())
         .copied()
-        .filter(|c| !in_bag.contains(c))
+        .filter(|c| !in_bag.contains(c) && !drunk_face_set.contains(c))
         .collect();
     let mut brng = rng.substream("demon_bluffs");
     good_not_in_play.shuffle(&mut brng);
@@ -300,6 +333,28 @@ mod tests {
                     found = true;
                     let face = a.believed_character.unwrap();
                     assert_eq!(face.character_type(), CharacterType::Townsfolk);
+                }
+            }
+        }
+        assert!(found, "expected Drunk in some 8p bags");
+    }
+
+    #[test]
+    fn drunk_face_not_in_bag() {
+        let mut found = false;
+        for seed in 0..400u64 {
+            let rng = SeededRng::from_seed(seed);
+            let bag = build_bag(&rng, 8).unwrap();
+            let bag_set: std::collections::HashSet<Character> =
+                bag.bag_set.iter().copied().collect();
+            for a in &bag.assignments {
+                if a.true_character == Character::Drunk {
+                    found = true;
+                    let face = a.believed_character.unwrap();
+                    assert!(
+                        !bag_set.contains(&face),
+                        "Drunk face {face:?} must not also be in bag (seed {seed})"
+                    );
                 }
             }
         }

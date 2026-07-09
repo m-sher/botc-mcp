@@ -143,14 +143,21 @@ fn start_game_requires_host_and_imp() {
 
 #[test]
 fn start_game_random_bag_assigns_all_seats() {
-    let lobby = Game::create(five_names(), 12345).unwrap();
+    // Fixed salt so bag is deterministic for this seed (secret_salt is otherwise CSPRNG).
+    let lobby = Game::create_with_salt(five_names(), 12345, 0).unwrap();
     let host = lobby.host_token.clone();
     let mut g = lobby.game;
     g.start_game(&host, StartOpts::default()).unwrap();
-    assert!(matches!(
-        g.phase,
-        botc_mcp::game::Phase::FirstNight { .. }
-    ));
+    // night_tick may already be pending a choice (FirstNight) or have finished to Day
+    // if the bag has no choice-required N1 roles.
+    assert!(
+        matches!(
+            g.phase,
+            botc_mcp::game::Phase::FirstNight { .. } | botc_mcp::game::Phase::Day { day: 1, .. }
+        ),
+        "unexpected phase {:?}",
+        g.phase
+    );
     assert_eq!(g.seats.len(), 5);
     assert!(g.seats.iter().all(|s| s.true_character.is_some()));
     assert!(g

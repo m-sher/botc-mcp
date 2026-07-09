@@ -59,7 +59,8 @@ pub fn build_first_night_queue(game: &Game) -> Vec<NightStep> {
     }
 
     for slot in FIRST_NIGHT_CHARACTER_ORDER {
-        if let Some(seat) = find_wake_seat(game, slot.character(), slot.uses_true_character()) {
+        // Wake *all* living seats whose true/face character matches (Drunk face + real).
+        for seat in find_wake_seats(game, slot.character(), slot.uses_true_character()) {
             q.push(first_night_step(*slot, seat));
         }
     }
@@ -79,30 +80,29 @@ pub fn build_other_night_queue(game: &Game) -> Vec<NightStep> {
     for slot in OTHER_NIGHT_CHARACTER_ORDER {
         match slot {
             OtherNightSlot::Ravenkeeper => {
-                // Spec: true Ravenkeeper who died to the demon (Drunk face is not true RK).
+                // Usually inserted after demon kill via die_from_demon (player-facing RK).
+                // If deaths_tonight already lists a face-Ravenkeeper (rebuild mid-night), include them.
                 for &dead in &game.deaths_tonight {
-                    if seat_matches_wake(game, dead, Character::Ravenkeeper, true) {
+                    if seat_matches_wake(game, dead, Character::Ravenkeeper, false /* face */) {
                         q.push(NightStep::Ravenkeeper { seat: dead });
                     }
                 }
             }
             OtherNightSlot::Undertaker => {
                 if game.executed_today.is_some() {
-                    if let Some(seat) =
-                        find_wake_seat(game, Character::Undertaker, false /* face */)
-                    {
+                    for seat in find_wake_seats(game, Character::Undertaker, false /* face */) {
                         q.push(NightStep::Undertaker { seat });
                     }
                 }
             }
             OtherNightSlot::Imp => {
-                if let Some(seat) = find_wake_seat(game, Character::Imp, true) {
+                for seat in find_wake_seats(game, Character::Imp, true) {
                     q.push(NightStep::DemonKill { seat });
                 }
             }
             other => {
                 let role = other.character();
-                if let Some(seat) = find_wake_seat(game, role, other.uses_true_character()) {
+                for seat in find_wake_seats(game, role, other.uses_true_character()) {
                     q.push(other_night_step(*other, seat));
                 }
             }
@@ -151,18 +151,16 @@ fn has_living_minion(game: &Game) -> bool {
     })
 }
 
-/// First living seat matching role via true character or player-facing character.
-fn find_wake_seat(game: &Game, role: Character, use_true: bool) -> Option<SeatId> {
-    game.seats.iter().find_map(|s| {
-        if !s.alive {
-            return None;
-        }
-        if seat_matches_wake(game, s.id, role, use_true) {
-            Some(s.id)
-        } else {
-            None
-        }
-    })
+/// All living seats matching role via true character or player-facing character.
+///
+/// Info Townsfolk (and similar face roles) must wake every seat that presents as that role —
+/// e.g. a real Empath and a Drunk with Empath face both get an Empath step.
+fn find_wake_seats(game: &Game, role: Character, use_true: bool) -> Vec<SeatId> {
+    game.seats
+        .iter()
+        .filter(|s| s.alive && seat_matches_wake(game, s.id, role, use_true))
+        .map(|s| s.id)
+        .collect()
 }
 
 fn seat_matches_wake(game: &Game, seat: SeatId, role: Character, use_true: bool) -> bool {
