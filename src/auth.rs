@@ -3,7 +3,6 @@
 use crate::game::SeatId;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Unguessable secret presented on every tool call.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -11,10 +10,7 @@ pub struct Token(String);
 
 impl Token {
     pub fn generate() -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(1);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        // Sketch only — swap for CSPRNG when adding `rand`.
-        Self(format!("tok_{n}_{n:x}"))
+        Self(uuid::Uuid::new_v4().to_string())
     }
 
     pub fn as_str(&self) -> &str {
@@ -71,5 +67,41 @@ impl TokenBook {
 
     pub fn player_token(&self, seat: SeatId) -> Option<&Token> {
         self.players.get(&seat)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokens_unique_and_resolve() {
+        let mut book = TokenBook::default();
+        let h = book.issue_host();
+        let p0 = book.issue_player(SeatId(0));
+        let p1 = book.issue_player(SeatId(1));
+        assert_ne!(h.as_str(), p0.as_str());
+        assert_ne!(h.as_str(), p1.as_str());
+        assert_ne!(p0.as_str(), p1.as_str());
+        assert!(matches!(book.resolve(&h), Some(Actor::Host)));
+        assert!(matches!(
+            book.resolve(&p0),
+            Some(Actor::Player { seat: SeatId(0) })
+        ));
+        assert!(matches!(
+            book.resolve(&p1),
+            Some(Actor::Player { seat: SeatId(1) })
+        ));
+        assert!(book.resolve(&Token::from_shared("nope")).is_none());
+        assert_eq!(book.host_token().map(Token::as_str), Some(h.as_str()));
+        assert_eq!(
+            book.player_token(SeatId(0)).map(Token::as_str),
+            Some(p0.as_str())
+        );
+        assert_eq!(format!("{:?}", h), "Token(***)");
+        // CSPRNG: UUID v4 hyphenated form (36 chars)
+        assert_eq!(h.as_str().len(), 36);
+        assert!(uuid::Uuid::parse_str(h.as_str()).is_ok());
+        assert!(uuid::Uuid::parse_str(p0.as_str()).is_ok());
     }
 }
