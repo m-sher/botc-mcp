@@ -7,7 +7,7 @@ character set only): one fixed gameplay loop under a Storyteller moderator.
 
 **Rules docs + engine/MCP architecture sketch.** Core loop not fully implemented yet.
 
-Design: [`docs/architecture.md`](docs/architecture.md). Rust modules under `src/` (`auth`, `comms`, `game`, `roles`, `tools`).
+Design: [`docs/architecture.md`](docs/architecture.md). Implementer rules: [`AGENTS.md`](AGENTS.md). Rust modules under `src/` (`auth`, `comms`, `game`, `roles`, `tools`).
 
 ## Rules
 

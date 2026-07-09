@@ -13,25 +13,35 @@ See [death-and-ghosts.md](death-and-ghosts.md).
 - In this game, alignment does not flip mid-game except that a Minion who becomes
   the Imp (Scarlet Woman conversion or Imp starpass) remains **evil** with a new character.
 
-## Character
+## Character (true vs player-facing)
 
-- Each player has one character.
-- **Imp starpass / Scarlet Woman:** a Minion’s character becomes Imp; they learn this
-  privately. They do **not** get a new evil briefing (they already knew the team).
-- **Drunk:** true character is Drunk; the player believes they are a Townsfolk.
+- Each seat has a **true character** in the Grimoire (Storyteller / engine only for secrecy).
+- Each seat has a **player-facing identity** returned by private role tools.
+- Usually these are the same.
+- **Drunk:** true = Drunk; player-facing = assigned Townsfolk face. The player is never told the truth.
+
+- **Imp starpass / Scarlet Woman:** true character changes and the player **is** told the new character.
 
 ## Drunk | Sober and Poisoned | Healthy
 
-**Drunk and poisoned do the same mechanical thing.**
+**Drunk and poisoned do the same mechanical thing** for ability success/failure.
 
 ### Effects
 
-- Player **has no ability**.
+- Player **has no ability** (effects do not apply; info may be false).
 - Storyteller still runs their night/day steps as if the ability worked.
-- Information abilities may receive **false** results (Storyteller chooses; usually should).
+- Information abilities may receive **false** results (Storyteller’s choice; usually should).
 - A once-per-game ability used while drunk/poisoned is **spent and failed**.
 - Do **not** tell them they are drunk or poisoned.
-- Always answer **rules** questions correctly.
+- Always answer **rules** questions correctly (what a character *would* do), without revealing their hidden state.
+
+### Drunk Outsider vs temporary drunk/poison
+
+| | Drunk Outsider | Poisoned / temp drunk |
+| --- | --- | --- |
+| Knows own character name? | **No** — sees Townsfolk face | **Yes** — true name |
+| Told status? | Never “you are Drunk” | Never “you are poisoned” |
+| Ability works? | No | No |
 
 ### Independence
 
@@ -43,8 +53,8 @@ See [death-and-ghosts.md](death-and-ghosts.md).
 
 ### Who is drunk/poisoned?
 
-The **player**. The Drunk Outsider is permanently “ability-faked” until death
-(they never learn). Poison lasts until the next Poisoner action / Poisoner death rules.
+The **player**. The Drunk Outsider remains ability-faked for the game (they never learn).
+Poison lasts until the next Poisoner action / Poisoner death rules.
 
 ## Registering as something else
 

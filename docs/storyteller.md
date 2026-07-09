@@ -28,3 +28,12 @@ hard-coding a winner.
 
 Night and secret day questions use private Storyteller ↔ player messages.
 Other players must not see those contents.
+
+
+## False identity (Drunk)
+
+- Never tell a Drunk seat they are the Drunk.
+- Private role tools and briefings show only the Townsfolk face.
+- Still run face-schedule wakes; give false info as needed; resolve no real effect.
+- True character remains Drunk for Grimoire and for abilities that learn characters.
+

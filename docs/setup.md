@@ -39,7 +39,7 @@
 | Character | Effect |
 | --- | --- |
 | **Baron** | `+2 Outsiders`, `−2 Townsfolk` |
-| **Drunk** | Player is not told they are Drunk. Storyteller assigns them a Townsfolk identity they *think* they are; their ability does not work. Bag still counts them as the Outsider. |
+| **Drunk** | Player is not told they are Drunk. Engine assigns a **Townsfolk face** they believe they are; `get_private_state` returns that face only. Ability does not work. Bag counts them as the Outsider. |
 
 After modifiers, retune so seats = tokens.
 

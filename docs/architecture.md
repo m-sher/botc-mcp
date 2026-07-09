@@ -14,6 +14,8 @@ This document is the design target. Implementation lives under `src/`.
 3. **Public speech is fully public.** No whispers, private DMs, or side channels between agents.
 4. **Abilities resolve from Grimoire truth**, not from what a player claims to be.
 5. **Bluffing is free in chat.** Claims are not state.
+6. **False identity is engine-enforced.** The Drunk (and similar) never learn their true
+   character via tools; see `AGENTS.md` (implementer rules).
 
 ---
 
@@ -109,7 +111,7 @@ Auth: every tool takes `token` (host or player). Server rejects wrong role for t
 | --- | --- | --- |
 | `get_public_state` | any token in game | Phase, seats (name, alive, ghost_vote_available), nominations today, vote history summary, winner if any |
 | `get_public_log` | any | Append-only **public** events: chat + ST broadcasts + nominations/votes/executions/deaths |
-| `get_private_state` | player | Believed character, team as known, ability summary/path, private inbox, whether ST expects an action now |
+| `get_private_state` | player | **Player-facing** character only (Drunk → Townsfolk face, never “Drunk”), team as known, face ability path, private inbox, whether ST expects an action now |
 | `get_character_rules` | any | Public sheet entry for one character name (pool knowledge; not “who is it”) |
 
 ### Communication
@@ -160,6 +162,14 @@ Storyteller **never** posts private content into the public log.
 
 ---
 
+
+---
+
+## Player-facing identity (Drunk)
+
+Implementers: root [`AGENTS.md`](../AGENTS.md) — player tools must never reveal Drunk; return the Townsfolk face. Ability resolution uses true character.
+
+
 ## Role assignment (init)
 
 On `start_game`:
@@ -167,7 +177,7 @@ On `start_game`:
 1. Host supplies player count seats already joined (or bag seed).
 2. Server builds composition from [setup](setup.md), applies Baron/Drunk, shuffles.
 3. Each seat gets `true_character` in Grimoire.
-4. Drunk: `believed_character = Some(Townsfolk)`; player private view shows believed, not Drunk.
+4. Drunk: `true_character = Drunk`, `believed_character = Some(Townsfolk face)`. All player role queries show the face only — never Drunk. See `AGENTS.md` (implementer rules).
 5. Red herring seat if Fortune Teller in play.
 6. Players call `get_private_state` — that is their “init”.
 

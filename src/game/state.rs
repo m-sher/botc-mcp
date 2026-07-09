@@ -4,7 +4,7 @@ use crate::auth::{Token, TokenBook};
 use crate::comms::{PrivateInboxes, PrivateMessage, PublicEvent, PublicLog};
 use crate::game::phase::{NightStep, Phase};
 use crate::game::seat::{Seat, SeatId};
-use crate::roles::{Character, Team};
+use crate::roles::{Character, CharacterType, Team};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GameId(pub u64);
@@ -53,6 +53,41 @@ pub struct Lobby {
     pub game: Game,
     pub host_token: Token,
     pub player_tokens: Vec<Token>,
+}
+
+/// Per-seat assignment at start. Drunk **must** include a Townsfolk face.
+#[derive(Debug, Clone)]
+pub struct RoleAssignment {
+    pub seat: SeatId,
+    pub true_character: Character,
+    /// Required when `true_character` is Drunk; ignored otherwise (should be None).
+    pub believed_character: Option<Character>,
+}
+
+impl RoleAssignment {
+    pub fn normal(seat: SeatId, true_character: Character) -> Self {
+        Self {
+            seat,
+            true_character,
+            believed_character: None,
+        }
+    }
+
+    pub fn drunk(seat: SeatId, townsfolk_face: Character) -> Result<Self, GameError> {
+        if townsfolk_face.character_type() != CharacterType::Townsfolk {
+            return Err(GameError::IllegalAction(
+                "Drunk face must be a Townsfolk character",
+            ));
+        }
+        if townsfolk_face == Character::Drunk {
+            return Err(GameError::IllegalAction("Drunk face cannot be Drunk"));
+        }
+        Ok(Self {
+            seat,
+            true_character: Character::Drunk,
+            believed_character: Some(townsfolk_face),
+        })
+    }
 }
 
 impl Game {
@@ -122,35 +157,100 @@ impl Game {
         self.private_inboxes.push(seat, msg);
     }
 
-    /// Sketch: assign characters & push private `YouAre` messages.
-    pub fn start_game_assign_for_sketch(&mut self, assignments: Vec<(SeatId, Character)>) {
-        for (seat_id, character) in &assignments {
-            if let Some(seat) = self.seats.iter_mut().find(|s| s.id == *seat_id) {
-                seat.true_character = Some(*character);
-                seat.is_drunk_outsider = matches!(character, Character::Drunk);
-                // Drunk face assignment is a later setup step; until then visible = true.
-                seat.believed_character = None;
+    /// Player-facing character for private role tools. Never returns Drunk when a face is set.
+    pub fn player_facing_character(&self, seat: SeatId) -> Option<Character> {
+        self.seats
+            .iter()
+            .find(|s| s.id == seat)
+            .and_then(|s| s.visible_character())
+    }
+
+    /// Assign characters and push private `YouAre` using **player-facing** identity only.
+    pub fn start_game_assign(
+        &mut self,
+        assignments: Vec<RoleAssignment>,
+    ) -> Result<(), GameError> {
+        for a in &assignments {
+            if a.true_character == Character::Drunk {
+                let face = a.believed_character.ok_or(GameError::IllegalAction(
+                    "Drunk assignment requires a Townsfolk believed_character face",
+                ))?;
+                if face.character_type() != CharacterType::Townsfolk {
+                    return Err(GameError::IllegalAction(
+                        "Drunk face must be a Townsfolk character",
+                    ));
+                }
+            } else if a.believed_character.is_some() {
+                return Err(GameError::IllegalAction(
+                    "believed_character only valid for Drunk",
+                ));
             }
         }
-        for seat in &self.seats {
-            let Some(true_c) = seat.true_character else {
-                continue;
-            };
-            let visible = seat.visible_character().unwrap_or(true_c);
+
+        for a in &assignments {
+            let seat = self
+                .seats
+                .iter_mut()
+                .find(|s| s.id == a.seat)
+                .ok_or(GameError::NoSuchSeat)?;
+            seat.true_character = Some(a.true_character);
+            seat.is_drunk_outsider = a.true_character == Character::Drunk;
+            seat.believed_character = a.believed_character;
+        }
+
+        // Snapshot faces for private messages (immutable borrow after mut loop).
+        let briefings: Vec<(SeatId, Character, Team)> = self
+            .seats
+            .iter()
+            .filter_map(|seat| {
+                let true_c = seat.true_character?;
+                let facing = seat.visible_character()?;
+                Some((seat.id, facing, true_c.team()))
+            })
+            .collect();
+
+        for (seat_id, facing, team) in briefings {
+            // facing is never Drunk if setup enforced a face.
+            debug_assert!(
+                facing != Character::Drunk,
+                "player-facing identity must not be Drunk"
+            );
             self.private_inboxes.push(
-                seat.id,
+                seat_id,
                 PrivateMessage::YouAre {
-                    character_label: visible.display_name().to_string(),
-                    team: true_c.team(),
-                    rules_path: visible.rules_doc_path().to_string(),
+                    character_label: facing.display_name().to_string(),
+                    team,
+                    rules_path: facing.rules_doc_path().to_string(),
                     note: None,
                 },
             );
         }
+
         self.phase = Phase::FirstNight {
             step: NightStep::SetupMarkers,
         };
         self.st_announce("Night falls. Eyes closed. The first night begins.");
+        Ok(())
+    }
+
+    /// Sketch helper: plain (seat, character) pairs. Drunk is rejected — use [`RoleAssignment::drunk`].
+    pub fn start_game_assign_for_sketch(
+        &mut self,
+        assignments: Vec<(SeatId, Character)>,
+    ) -> Result<(), GameError> {
+        let mapped = assignments
+            .into_iter()
+            .map(|(seat, c)| {
+                if c == Character::Drunk {
+                    Err(GameError::IllegalAction(
+                        "use RoleAssignment::drunk(seat, townsfolk_face) for Drunk",
+                    ))
+                } else {
+                    Ok(RoleAssignment::normal(seat, c))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.start_game_assign(mapped)
     }
 }
 

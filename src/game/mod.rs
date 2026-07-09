@@ -6,4 +6,4 @@ mod state;
 
 pub use phase::{DayStage, NightStep, Phase};
 pub use seat::{Seat, SeatId};
-pub use state::{Game, GameError, GameId, Lobby, PublicSeatView, Winner};
+pub use state::{Game, GameError, GameId, Lobby, PublicSeatView, RoleAssignment, Winner};
