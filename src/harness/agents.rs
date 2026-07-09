@@ -56,35 +56,73 @@ impl Default for HarnessConfig {
     }
 }
 
-/// Shared child handle so stop_all can kill while a waiter reaps.
+/// Per-agent child process coordination (#46 / #52).
+///
+/// Critical: **never** hold the slot mutex across a blocking `Child::wait()`.
+/// The waiter uses `try_wait` + short sleeps; `take_and_kill` must be able to
+/// acquire the lock while a child is still running and deliver SIGKILL.
+#[derive(Debug)]
+enum ChildState {
+    Empty,
+    Running(Child),
+    /// Reaped by kill or natural exit; waiter may still consume the status.
+    Exited(std::process::ExitStatus),
+}
+
+impl Default for ChildState {
+    fn default() -> Self {
+        Self::Empty
+    }
+}
+
 #[derive(Debug, Default)]
 struct ChildSlot {
-    inner: Mutex<Option<Child>>,
+    inner: Mutex<ChildState>,
 }
 
 impl ChildSlot {
     fn store(&self, child: Child) {
-        *self.inner.lock().unwrap() = Some(child);
+        *self.inner.lock().unwrap() = ChildState::Running(child);
     }
 
+    /// Kill + reap if still running. Must not block on a waiter-held lock (#52).
     fn take_and_kill(&self) {
-        if let Some(mut c) = self.inner.lock().unwrap().take() {
+        let mut g = self.inner.lock().unwrap();
+        if let ChildState::Running(mut c) = std::mem::replace(&mut *g, ChildState::Empty) {
             let _ = c.kill();
-            let _ = c.wait();
+            match c.wait() {
+                Ok(st) => *g = ChildState::Exited(st),
+                Err(_) => *g = ChildState::Empty,
+            }
         }
     }
 
+    /// Block until the child exits (or is killed/reaped). Only holds the mutex
+    /// briefly around `try_wait` / state reads — never across a blocking wait.
     fn wait_exit(&self) -> Option<std::process::ExitStatus> {
-        let mut g = self.inner.lock().unwrap();
-        let child = g.as_mut()?;
-        match child.wait() {
-            Ok(st) => {
-                *g = None;
-                Some(st)
-            }
-            Err(_) => {
-                *g = None;
-                None
+        loop {
+            let mut g = self.inner.lock().unwrap();
+            match &mut *g {
+                ChildState::Empty => return None,
+                ChildState::Exited(st) => {
+                    let st = *st;
+                    *g = ChildState::Empty;
+                    return Some(st);
+                }
+                ChildState::Running(c) => match c.try_wait() {
+                    Ok(Some(st)) => {
+                        *g = ChildState::Empty;
+                        return Some(st);
+                    }
+                    Ok(None) => {
+                        drop(g);
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => {
+                        *g = ChildState::Empty;
+                        return None;
+                    }
+                },
             }
         }
     }
@@ -672,5 +710,95 @@ mod tests {
         assert!(root.join("host/agent.token").exists());
         drop(pool); // Drop → stop_all → remove work root
         assert!(!root.exists(), "work root should be removed on stop");
+    }
+
+    /// #52 regression: waiter must not hold the slot lock across blocking wait,
+    /// or take_and_kill / stop_all deadlocks while a child is still running.
+    #[test]
+    fn take_and_kill_while_waiter_running_does_not_deadlock() {
+        let slot = Arc::new(ChildSlot::default());
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        slot.store(child);
+
+        let slot_w = Arc::clone(&slot);
+        let waiter = thread::spawn(move || slot_w.wait_exit());
+
+        // Give the waiter time to enter its poll loop.
+        thread::sleep(Duration::from_millis(50));
+
+        let start = std::time::Instant::now();
+        slot.take_and_kill();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "take_and_kill hung while waiter was running (deadlock #52)"
+        );
+
+        let status = waiter.join().expect("waiter join");
+        // Either we observed the killed exit status, or kill already cleared it.
+        if let Some(st) = status {
+            assert!(!st.success(), "killed child should not report success");
+        }
+        // Process must be gone (best-effort — already reaped by wait).
+        let _ = pid;
+    }
+
+    #[test]
+    fn stop_all_with_running_child_returns_quickly() {
+        let id = uuid::Uuid::new_v4();
+        let root = std::env::temp_dir().join(format!("botc-stop-run-{id}"));
+        let mut cfg = HarnessConfig::default();
+        cfg.work_root = root.clone();
+        cfg.socket_path = root.join("engine.sock");
+        let mut pool = AgentPool::prepare(
+            &cfg,
+            vec![AgentConfig {
+                role: AgentRole::Host,
+                display_name: "ST".into(),
+                token: "tok".into(),
+                game_id: 1,
+            }],
+        )
+        .unwrap();
+
+        // Inject a long-running child + waiter the same way spawn_grok_tick does.
+        let agent = &mut pool.agents[0];
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let _ = child.id();
+        agent.child.store(child);
+        *agent.running.lock().unwrap() = true;
+        let slot = Arc::clone(&agent.child);
+        let running = Arc::clone(&agent.running);
+        let started = Arc::clone(&agent.session_started);
+        let sid = Arc::clone(&agent.session_id);
+        thread::spawn(move || {
+            let status = slot.wait_exit();
+            let ok = status.map(|s| s.success()).unwrap_or(false);
+            if ok {
+                *started.lock().unwrap() = true;
+            } else if !*started.lock().unwrap() {
+                *sid.lock().unwrap() = uuid::Uuid::new_v4().to_string();
+            }
+            *running.lock().unwrap() = false;
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let start = std::time::Instant::now();
+        pool.stop_all();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "stop_all hung with running child (#52)"
+        );
+        assert!(!root.exists());
     }
 }
