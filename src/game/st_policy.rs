@@ -98,12 +98,6 @@ pub enum MayorRedirectChoice {
     Nobody,
 }
 
-impl StChoiceMode {
-    pub fn is_host_first(self) -> bool {
-        matches!(self, StChoiceMode::HostFirst)
-    }
-}
-
 impl PendingHostDecision {
     pub fn kind_str(&self) -> &'static str {
         match self {
