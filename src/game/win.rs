@@ -45,7 +45,8 @@ pub fn win_check(game: &mut Game) -> Option<Winner> {
     }
 
     let living = game.seats.iter().filter(|s| s.alive).count();
-    if living == 2 {
+    // Defensive: deaths are normally one-at-a-time, but `<= 2` covers multi-death edge cases.
+    if living <= 2 {
         end_game(game, Winner::Evil, EndReason::EvilTwoAlive);
         return Some(Winner::Evil);
     }

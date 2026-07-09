@@ -97,16 +97,6 @@ fn pair_message(game: &Game, ability: &str, info: &PairInfo) -> String {
     )
 }
 
-fn pick_two_distinct_seats(game: &Game, rng: &mut impl Rng) -> Option<(SeatId, SeatId)> {
-    let ids: Vec<SeatId> = game.seats.iter().map(|s| s.id).collect();
-    if ids.len() < 2 {
-        return None;
-    }
-    let mut pick = ids;
-    pick.shuffle(rng);
-    Some((pick[0], pick[1]))
-}
-
 fn seats_of_type(game: &Game, ty: CharacterType) -> Vec<(SeatId, Character)> {
     game.seats
         .iter()
@@ -123,54 +113,67 @@ fn seats_of_type(game: &Game, ty: CharacterType) -> Vec<(SeatId, Character)> {
 
 /// Owners eligible for WW/Lib/Inv "correct" seat.
 ///
-/// True seats of `ty`, plus for Townsfolk: Spy may register as a Townsfolk with p=0.5
-/// (design §11.2 / §11.5) and become a valid correct-seat owner for that character.
+/// True seats of `ty`, plus Spy/Recluse registration via [`super::register`]:
+/// - Spy may register as Townsfolk or Outsider
+/// - Recluse may register as Minion (or Demon for Demon-typed detections)
+///
+/// The `acting_seat` (info role) is never included as an owner — they do not learn
+/// about themselves as the pair's "correct" seat.
 fn pair_owners(
     game: &Game,
     ty: CharacterType,
-    pool: &[Character],
+    stream: &str,
+    acting_seat: SeatId,
     rng: &mut impl Rng,
 ) -> Vec<(SeatId, Character)> {
-    let mut owners = seats_of_type(game, ty);
-    if ty == CharacterType::Townsfolk {
-        if let Some(spy_id) = game
-            .seats
-            .iter()
-            .find(|s| s.true_character == Some(Character::Spy))
-            .map(|s| s.id)
-        {
-            if rng.gen_bool(0.5) {
-                // Prefer an in-play Townsfolk token; else any from the townsfolk pool.
-                let character = if !owners.is_empty() {
-                    owners[rng.gen_range(0..owners.len())].1
-                } else if let Some(&c) = pool.choose(rng) {
-                    c
-                } else {
-                    Character::Soldier
-                };
-                owners.push((spy_id, character));
+    use super::register::{register_as_type_owner_with, TypeOwnerOpts};
+
+    let opts = TypeOwnerOpts {
+        acting_seat: Some(acting_seat),
+    };
+    let mut owners: Vec<(SeatId, Character)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for s in &game.seats {
+        if s.id == acting_seat {
+            continue;
+        }
+        let lab = format!("{stream}:owner:{}", s.id.0);
+        if let Some(character) = register_as_type_owner_with(game, s.id, ty, &lab, opts) {
+            if seen.insert(s.id) {
+                owners.push((s.id, character));
             }
         }
     }
+    // Keep a stable random order for pick (caller may index randomly).
+    owners.shuffle(rng);
     owners
 }
 
-fn truthful_pair_info(
+fn pair_info_from_owners(
     game: &Game,
-    ty: CharacterType,
-    pool: &[Character],
+    owners: &[(SeatId, Character)],
+    acting_seat: SeatId,
     rng: &mut impl Rng,
 ) -> Option<PairInfo> {
-    let owners = pair_owners(game, ty, pool, rng);
     if owners.is_empty() {
         return None;
     }
     let (correct_seat, character) = owners[rng.gen_range(0..owners.len())];
+    // Decoy pool: everyone except correct owner and the acting info seat.
+    // Exception: when correct is the acting seat (sole-TF WW), decoys are any other seats.
     let others: Vec<SeatId> = game
         .seats
         .iter()
         .map(|s| s.id)
-        .filter(|id| *id != correct_seat)
+        .filter(|id| {
+            if *id == correct_seat {
+                return false;
+            }
+            if correct_seat != acting_seat && *id == acting_seat {
+                return false;
+            }
+            true
+        })
         .collect();
     if others.is_empty() {
         return None;
@@ -188,13 +191,60 @@ fn truthful_pair_info(
     })
 }
 
-fn lie_pair_info(game: &Game, pool: &[Character], rng: &mut impl Rng) -> Option<PairInfo> {
-    let (seat_a, seat_b) = pick_two_distinct_seats(game, rng)?;
+fn truthful_pair_info(
+    game: &Game,
+    ty: CharacterType,
+    pool: &[Character],
+    stream: &str,
+    acting_seat: SeatId,
+    rng: &mut impl Rng,
+) -> Option<PairInfo> {
+    let _ = pool;
+    let owners = pair_owners(game, ty, stream, acting_seat, rng);
+    pair_info_from_owners(game, &owners, acting_seat, rng)
+}
+
+/// When the only true owner of `ty` is the acting seat itself (sole TF Washerwoman),
+/// include them so the pair still names a real in-play character of that type.
+fn sole_actor_pair_info(
+    game: &Game,
+    ty: CharacterType,
+    acting_seat: SeatId,
+    rng: &mut impl Rng,
+) -> Option<PairInfo> {
+    let true_of_ty: Vec<(SeatId, Character)> = seats_of_type(game, ty);
+    if true_of_ty.len() != 1 {
+        return None;
+    }
+    let (only_seat, character) = true_of_ty[0];
+    if only_seat != acting_seat {
+        return None;
+    }
+    pair_info_from_owners(game, &[(acting_seat, character)], acting_seat, rng)
+}
+
+fn lie_pair_info(
+    game: &Game,
+    pool: &[Character],
+    acting_seat: SeatId,
+    rng: &mut impl Rng,
+) -> Option<PairInfo> {
+    let ids: Vec<SeatId> = game
+        .seats
+        .iter()
+        .map(|s| s.id)
+        .filter(|id| *id != acting_seat)
+        .collect();
+    if ids.len() < 2 {
+        return None;
+    }
+    let mut pick = ids;
+    pick.shuffle(rng);
     let character = *pool.choose(rng)?;
     Some(PairInfo {
         character,
-        seat_a,
-        seat_b,
+        seat_a: pick[0],
+        seat_b: pick[1],
     })
 }
 
@@ -211,21 +261,36 @@ fn resolve_pair_role(
     let mut rng = game.rng.substream(&label);
     let disabled = seat_disabled(game, seat);
 
-    if !disabled {
-        // Zero-path uses true bag count only (Spy registration does not invent Outsiders).
-        if seats_of_type(game, ty).is_empty() {
-            if let Some(z) = zero_message {
-                return Ok(push_result(game, seat, z.to_string()));
-            }
-        }
-        if let Some(info) = truthful_pair_info(game, ty, pool, &mut rng) {
-            let text = pair_message(game, ability, &info);
+    if disabled {
+        if let Some(text) = game.take_host_lie() {
             return Ok(push_result(game, seat, text));
         }
     }
 
-    // Disabled, or no owners and no zero path: lie.
-    let info = lie_pair_info(game, pool, &mut rng).ok_or(GameError::IllegalAction(
+    if !disabled {
+        // 1. Truthful pair via registration-aware owners (excludes acting seat).
+        //    Sole minion/outsider cannot hide (register sole-hide rule) so Investigator
+        //    always has a true owner when a minion is in play — no force-true fallback.
+        if let Some(info) = truthful_pair_info(game, ty, pool, stream, seat, &mut rng) {
+            let text = pair_message(game, ability, &info);
+            return Ok(push_result(game, seat, text));
+        }
+        // 2. Owners empty after registration (e.g. sole Recluse who hid for Librarian):
+        //    optional "0 of type" zero_message. Do not require seats_of_type empty.
+        if let Some(z) = zero_message {
+            return Ok(push_result(game, seat, z.to_string()));
+        }
+        // 3. Washerwoman sole TF: acting seat is the only true TF — include them as owner.
+        if ty == CharacterType::Townsfolk {
+            if let Some(info) = sole_actor_pair_info(game, ty, seat, &mut rng) {
+                let text = pair_message(game, ability, &info);
+                return Ok(push_result(game, seat, text));
+            }
+        }
+    }
+
+    // Disabled, or no owners and no zero path: lie (host queue already tried above).
+    let info = lie_pair_info(game, pool, seat, &mut rng).ok_or(GameError::IllegalAction(
         "cannot generate pair info",
     ))?;
     let text = pair_message(game, ability, &info);
@@ -239,6 +304,11 @@ fn resolve_pair_role(
 /// Structured grimoire snapshot for the Spy (true if ability active; seeded fake if disabled).
 fn resolve_spy(game: &mut Game, seat: SeatId) -> Result<NightEffect, GameError> {
     let disabled = seat_disabled(game, seat);
+    if disabled {
+        if let Some(text) = game.take_host_lie() {
+            return Ok(push_result(game, seat, text));
+        }
+    }
     let text = if disabled {
         let label = stream_label(game, "spy_lie");
         let mut rng = game.rng.substream(&label);
@@ -361,13 +431,19 @@ fn chef_true_count(game: &Game) -> u8 {
     if n < 2 {
         return 0;
     }
+    // Single registration per seat for this whole Chef detection (issue #1 #8).
+    // Evil–Recluse–Evil can only be 0 or 2, never a middle "1" from re-rolling the Recluse.
+    let evil: Vec<bool> = game
+        .seats
+        .iter()
+        .map(|s| {
+            let lab = format!("chef_reg:{}:{}", game.night_cursor, s.id.0);
+            register_evil(game, s.id, &lab)
+        })
+        .collect();
     let mut count = 0u8;
     for i in 0..n {
-        let a = game.seats[i].id;
-        let b = game.seats[(i + 1) % n].id;
-        let lab_a = format!("chef_reg:{}:{}:a", game.night_cursor, a.0);
-        let lab_b = format!("chef_reg:{}:{}:b", game.night_cursor, b.0);
-        if register_evil(game, a, &lab_a) && register_evil(game, b, &lab_b) {
+        if evil[i] && evil[(i + 1) % n] {
             count += 1;
         }
     }
@@ -375,6 +451,11 @@ fn chef_true_count(game: &Game) -> u8 {
 }
 
 fn resolve_chef(game: &mut Game, seat: SeatId) -> Result<NightEffect, GameError> {
+    if seat_disabled(game, seat) {
+        if let Some(text) = game.take_host_lie() {
+            return Ok(push_result(game, seat, text));
+        }
+    }
     let truth = chef_true_count(game);
     let shown = if seat_disabled(game, seat) {
         let label = stream_label(game, "chef_lie");
@@ -448,6 +529,11 @@ fn lie_count_0_2(rng: &mut impl Rng, truth: u8) -> u8 {
 }
 
 fn resolve_empath(game: &mut Game, seat: SeatId) -> Result<NightEffect, GameError> {
+    if seat_disabled(game, seat) {
+        if let Some(text) = game.take_host_lie() {
+            return Ok(push_result(game, seat, text));
+        }
+    }
     let truth = empath_true_count(game, seat);
     let shown = if seat_disabled(game, seat) {
         let label = stream_label(game, "empath_lie");
@@ -485,6 +571,11 @@ fn resolve_fortune_teller(
     let NightActionPayload::PickTwo { a, b } = payload else {
         return Err(GameError::WrongPayload);
     };
+    if seat_disabled(game, seat) {
+        if let Some(text) = game.take_host_lie() {
+            return Ok(push_result(game, seat, text));
+        }
+    }
     let truth = ft_true_yes(game, *a, *b);
     let shown = if seat_disabled(game, seat) {
         // §11.1: always lie when disabled.
@@ -526,17 +617,21 @@ fn resolve_butler(
 }
 
 fn resolve_undertaker(game: &mut Game, seat: SeatId) -> Result<NightEffect, GameError> {
+    use super::register::register_character;
+
+    if seat_disabled(game, seat) {
+        if let Some(text) = game.take_host_lie() {
+            return Ok(push_result(game, seat, text));
+        }
+    }
     let executed = game.executed_today;
     let shown = if seat_disabled(game, seat) {
         let label = stream_label(game, "undertaker_lie");
         let mut rng = game.rng.substream(&label);
         random_pool_character(&mut rng)
     } else if let Some(ex) = executed {
-        game.seats
-            .iter()
-            .find(|s| s.id == ex)
-            .and_then(|s| s.true_character)
-            .unwrap_or(Character::Imp)
+        let lab = format!("undertaker_reg:{}:{}", game.night_cursor, ex.0);
+        register_character(game, ex, &lab, Some(seat)).unwrap_or(Character::Imp)
     } else {
         // Should not wake without execution; soft fallback.
         return Ok(push_result(
@@ -557,20 +652,24 @@ fn resolve_ravenkeeper(
     seat: SeatId,
     payload: &NightActionPayload,
 ) -> Result<NightEffect, GameError> {
+    use super::register::register_character;
+
     let NightActionPayload::PickOne { target } = payload else {
         return Err(GameError::WrongPayload);
     };
+    if seat_disabled(game, seat) {
+        if let Some(text) = game.take_host_lie() {
+            return Ok(push_result(game, seat, text));
+        }
+    }
     let shown = if seat_disabled(game, seat) {
         let label = stream_label(game, "ravenkeeper_lie");
         let mut rng = game.rng.substream(&label);
         random_pool_character(&mut rng)
     } else {
-        // v1: true character token (Drunk → Drunk; Spy → Spy).
-        game.seats
-            .iter()
-            .find(|s| s.id == *target)
-            .and_then(|s| s.true_character)
-            .unwrap_or(Character::Soldier)
+        // Spy/Recluse may misregister; exclude viewer's face from misreg tokens.
+        let lab = format!("ravenkeeper_reg:{}:{}", game.night_cursor, target.0);
+        register_character(game, *target, &lab, Some(seat)).unwrap_or(Character::Soldier)
     };
     let text = format!(
         "Ravenkeeper: {} is the {}.",
@@ -627,6 +726,7 @@ mod unit_tests {
                     RoleAssignment::normal(SeatId(3), a3),
                     RoleAssignment::normal(SeatId(4), a4),
                 ]),
+                ..Default::default()
             },
         )
         .unwrap();

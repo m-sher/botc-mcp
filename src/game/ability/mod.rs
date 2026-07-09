@@ -1,6 +1,6 @@
 //! Night ability dispatch and resolution.
 
-mod evil;
+pub(crate) mod evil;
 mod info;
 pub mod protect;
 pub mod register;

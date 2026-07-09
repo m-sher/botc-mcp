@@ -36,15 +36,16 @@ pub fn start_scripted(
         &host_token,
         StartOpts {
             assignments: Some(assignments),
-        },
+                ..Default::default()
+            },
     )
     .expect("start_game");
     (game, host_token, player_tokens)
 }
 
-/// Host-skip all pending night wakes until the night ends (or game ends).
+/// Host-skip all pending night wakes / host decisions until the night ends (or game ends).
 pub fn finish_night(g: &mut Game, host: &Token) {
-    while g.pending_night.is_some()
+    while (g.pending_night.is_some() || g.pending_host.is_some())
         && !matches!(g.phase, Phase::Day { .. } | Phase::Ended { .. })
     {
         skip_night_action(g, host).expect("skip_night_action");

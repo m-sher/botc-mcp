@@ -47,19 +47,20 @@ Auth: game tools take `game_id` plus `token` (or `host_token` / `player_token`).
 
 | Tool | Key arguments | Notes |
 | --- | --- | --- |
-| `create_game` | `names: string[]`, `seed?: u64` | Returns `game_id`, `host_token`, `players[]` |
+| `create_game` | `names: string[]`, `seed?: u64`, `secret_salt?: u64` | Returns `game_id`, `host_token`, `players[]`. If `seed` is omitted, the server draws a CSPRNG seed (never defaults to `0`). If `secret_salt` is omitted, a CSPRNG salt is generated; if both `seed` and `secret_salt` are provided, bag assignment and all substream draws are fully deterministic for replay. Host-only: `get_host_state` exposes `seed` + `secret_salt`. |
 | `start_game` | `game_id`, `host_token`, `assignments?` | Optional fixed roles; Drunk needs `believed` |
 | `get_public_state` | `game_id`, `token` | No roles / no pending night seat |
 | `get_public_log` | `game_id`, `token`, `cursor?` | Events with id > cursor |
 | `get_private_state` | `game_id`, `token`, `private_cursor?` | Drunk → Townsfolk face only |
-| `get_host_state` | `game_id`, `host_token` | Full grimoire |
+| `get_host_state` | `game_id`, `host_token` | Full grimoire + `seed` + `secret_salt` (never on player views) |
 | `get_character_rules` | `character` | Public sheet markdown (no `game_id`) |
 | `say` | `game_id`, `token`, `text` | Public chat only |
 | `st_announce` | `game_id`, `host_token`, `text` | Host public ST line |
 | `night_action` | `game_id`, `token`, payload | See below |
 | `day_action` | `game_id`, `token`, `target` | Slayer slay |
 | `nominate` | `game_id`, `token`, `target` | Seat id |
-| `vote` | `game_id`, `token`, `nominee`, `support` | bool |
+| `vote` | `game_id`, `token`, `nominee`, `support` | bool; dead with spent ghost cannot vote |
+| `pass_vote` | `game_id`, `token` | Dead only: abstain without spending ghost (helps auto-close) |
 | `open_nominations` | `game_id`, `host_token` | Host |
 | `close_vote` | `game_id`, `host_token` | Host |
 | `end_nominations` | `game_id`, `host_token` | Host |

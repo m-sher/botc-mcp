@@ -59,7 +59,8 @@ pub fn build_first_night_queue(game: &Game) -> Vec<NightStep> {
     }
 
     for slot in FIRST_NIGHT_CHARACTER_ORDER {
-        if let Some(seat) = find_wake_seat(game, slot.character(), slot.uses_true_character()) {
+        // Wake *all* living seats whose true/face character matches (Drunk face + real).
+        for seat in find_wake_seats(game, slot.character(), slot.uses_true_character()) {
             q.push(first_night_step(*slot, seat));
         }
     }
@@ -70,39 +71,32 @@ pub fn build_first_night_queue(game: &Game) -> Vec<NightStep> {
 
 /// Build the ordered other-night step list (no N1 setup/briefings; includes Imp kill).
 ///
-/// Ravenkeeper is included only when a seat in `deaths_tonight` faces as Ravenkeeper
-/// (typically filled after the demon kill resolves). Undertaker is included when the
-/// seat is alive **and** there was an execution today (`executed_today`).
+/// Ravenkeeper wakes are **not** pre-queued here: they are inserted after the demon kill
+/// via `die_from_demon` when a player-facing Ravenkeeper dies. Undertaker is included when
+/// the seat is alive **and** there was an execution today (`executed_today`).
 pub fn build_other_night_queue(game: &Game) -> Vec<NightStep> {
     let mut q = Vec::new();
 
     for slot in OTHER_NIGHT_CHARACTER_ORDER {
         match slot {
             OtherNightSlot::Ravenkeeper => {
-                // Spec: true Ravenkeeper who died to the demon (Drunk face is not true RK).
-                for &dead in &game.deaths_tonight {
-                    if seat_matches_wake(game, dead, Character::Ravenkeeper, true) {
-                        q.push(NightStep::Ravenkeeper { seat: dead });
-                    }
-                }
+                // Intentionally empty: death-wake is inserted by die_from_demon only.
             }
             OtherNightSlot::Undertaker => {
                 if game.executed_today.is_some() {
-                    if let Some(seat) =
-                        find_wake_seat(game, Character::Undertaker, false /* face */)
-                    {
+                    for seat in find_wake_seats(game, Character::Undertaker, false /* face */) {
                         q.push(NightStep::Undertaker { seat });
                     }
                 }
             }
             OtherNightSlot::Imp => {
-                if let Some(seat) = find_wake_seat(game, Character::Imp, true) {
+                for seat in find_wake_seats(game, Character::Imp, true) {
                     q.push(NightStep::DemonKill { seat });
                 }
             }
             other => {
                 let role = other.character();
-                if let Some(seat) = find_wake_seat(game, role, other.uses_true_character()) {
+                for seat in find_wake_seats(game, role, other.uses_true_character()) {
                     q.push(other_night_step(*other, seat));
                 }
             }
@@ -151,18 +145,16 @@ fn has_living_minion(game: &Game) -> bool {
     })
 }
 
-/// First living seat matching role via true character or player-facing character.
-fn find_wake_seat(game: &Game, role: Character, use_true: bool) -> Option<SeatId> {
-    game.seats.iter().find_map(|s| {
-        if !s.alive {
-            return None;
-        }
-        if seat_matches_wake(game, s.id, role, use_true) {
-            Some(s.id)
-        } else {
-            None
-        }
-    })
+/// All living seats matching role via true character or player-facing character.
+///
+/// Info Townsfolk (and similar face roles) must wake every seat that presents as that role —
+/// e.g. a real Empath and a Drunk with Empath face both get an Empath step.
+fn find_wake_seats(game: &Game, role: Character, use_true: bool) -> Vec<SeatId> {
+    game.seats
+        .iter()
+        .filter(|s| s.alive && seat_matches_wake(game, s.id, role, use_true))
+        .map(|s| s.id)
+        .collect()
 }
 
 fn seat_matches_wake(game: &Game, seat: SeatId, role: Character, use_true: bool) -> bool {
@@ -184,7 +176,7 @@ impl Game {
     /// Process night queue from the cursor until a player choice is pending or dawn completes.
     pub fn night_tick(&mut self) {
         loop {
-            if self.pending_night.is_some() {
+            if self.pending_night.is_some() || self.pending_host.is_some() {
                 return;
             }
             if !matches!(self.phase, Phase::FirstNight { .. } | Phase::Night { .. }) {
@@ -221,11 +213,15 @@ impl Game {
         self.apply_night_action(seat, payload)
     }
 
-    /// Host applies a documented default for the pending wake and continues.
+    /// Host applies a documented default for the pending wake (or pending host decision) and continues.
     pub fn skip_night_action(&mut self, host: &Token) -> Result<(), GameError> {
         match self.tokens.resolve(host) {
             Some(Actor::Host) => {}
             _ => return Err(GameError::Unauthorized),
+        }
+        // Host decisions (Mayor / starpass) take priority when set.
+        if self.pending_host.is_some() {
+            return self.apply_default_host_decision();
         }
         let pending = self
             .pending_night
@@ -252,9 +248,13 @@ impl Game {
         }
 
         self.validate_payload(&pending, &payload)?;
-        self.resolve_pending_action(&pending, &payload)?;
+        let needs_host = self.resolve_pending_action(&pending, &payload)?;
 
         self.pending_night = None;
+        if needs_host {
+            // Cursor stays on DemonKill until host_decide / skip resolves pending_host.
+            return Ok(());
+        }
         self.advance_cursor();
         self.night_tick();
         Ok(())
@@ -481,9 +481,13 @@ impl Game {
     }
 
     /// Enter other-night `night` (must be ≥ 2): build queue and tick to first pending.
+    ///
+    /// Does **not** clear `host_lie_queue`: lies queued during the day apply to this
+    /// night. Unused lies are cleared at dawn (#30 / #34).
     pub fn enter_night(&mut self, night: u32) {
         self.deaths_tonight.clear();
         self.pending_night = None;
+        self.pending_host = None;
         self.night_queue = build_other_night_queue(self);
         self.night_cursor = 0;
         self.phase = Phase::Night { night, cursor: 0 };
@@ -537,11 +541,13 @@ impl Game {
     }
 
     /// Resolve a submitted night choice (poison/monk/imp via ability; info via Task 8).
+    ///
+    /// Returns `true` when a host decision is now pending (cursor must not advance).
     fn resolve_pending_action(
         &mut self,
         pending: &PendingWake,
         payload: &NightActionPayload,
-    ) -> Result<(), GameError> {
+    ) -> Result<bool, GameError> {
         match pending.step {
             NightStep::Poisoner { seat: _ } => {
                 if let NightActionPayload::PickOne { target } = payload {
@@ -556,7 +562,7 @@ impl Game {
                         crate::game::ability::apply_poison(self, *target);
                     }
                 }
-                Ok(())
+                Ok(false)
             }
             NightStep::Monk { .. } => {
                 if let NightActionPayload::PickOne { target } = payload {
@@ -570,18 +576,22 @@ impl Game {
                         crate::game::ability::protect::apply_monk_protect(self, *target);
                     }
                 }
-                Ok(())
+                Ok(false)
             }
             NightStep::DemonKill { seat: demon } => {
                 if let NightActionPayload::PickOne { target } = payload {
-                    let _ = crate::game::ability::try_demon_kill(self, demon, *target);
+                    let result = crate::game::ability::try_demon_kill(self, demon, *target);
+                    return Ok(matches!(
+                        result,
+                        crate::game::ability::KillResult::NeedsHost
+                    ));
                 }
-                Ok(())
+                Ok(false)
             }
             // Info / Butler / Ravenkeeper (Task 8).
             step => {
                 crate::game::ability::resolve_night_step(self, step, Some(payload))?;
-                Ok(())
+                Ok(false)
             }
         }
     }
@@ -661,6 +671,8 @@ pub fn dawn(game: &mut Game) {
             .push(PublicEvent::DiedInNight { seats: deaths });
     }
     game.deaths_tonight.clear();
+    // Unused host lies do not carry into the next day/night.
+    game.host_lie_queue.clear();
 
     let day = match game.phase {
         Phase::FirstNight { .. } => 1u32,
@@ -674,6 +686,7 @@ pub fn dawn(game: &mut Game) {
     game.night_queue.clear();
     game.night_cursor = 0;
     game.pending_night = None;
+    game.pending_host = None;
     // Undertaker already ran this night; clear execution marker for the new day.
     game.executed_today = None;
     crate::game::day::reset_day_vote_state(game);
@@ -709,6 +722,7 @@ mod unit_tests {
                     RoleAssignment::normal(SeatId(3), Character::Butler),
                     RoleAssignment::normal(SeatId(4), Character::Spy),
                 ]),
+                ..Default::default()
             },
         )
         .unwrap();

@@ -8,14 +8,16 @@ mod views;
 
 pub use rules_text::{load_character_rules_text, rules_markdown_path};
 pub use views::{
-    AwaitingView, CharacterRulesView, HostPendingView, HostSeatView, HostStateView,
-    PrivateStateView, PublicStateView,
+    AwaitingView, CharacterRulesView, HostDecisionView, HostPendingView, HostSeatView,
+    HostStateView, PrivateStateView, PublicStateView,
 };
 
 use crate::auth::{Actor, Token};
 use crate::comms::{EventId, PublicEvent};
 use crate::error::GameError;
-use crate::game::{CreateGameResult, Game, GameId, NightActionPayload, SeatId, StartOpts};
+use crate::game::{
+    CreateGameResult, Game, GameId, HostDecision, NightActionPayload, SeatId, StartOpts,
+};
 use crate::roles::Character;
 use crate::store::GameStore;
 
@@ -39,16 +41,22 @@ pub struct CreateGameResponse {
 }
 
 /// Create a lobby, issue host + player tokens, insert into `store`.
+///
+/// `secret_salt`: `None` → CSPRNG salt (production); `Some(s)` → deterministic replay with `seed`.
 pub fn create_game(
     store: &mut GameStore,
     names: Vec<String>,
     seed: u64,
+    secret_salt: Option<u64>,
 ) -> Result<CreateGameResponse, ToolError> {
     let CreateGameResult {
         game,
         host_token,
         player_tokens,
-    } = Game::create(names, seed)?;
+    } = match secret_salt {
+        Some(salt) => Game::create_with_salt(names, seed, salt)?,
+        None => Game::create(names, seed)?,
+    };
 
     let players: Vec<PlayerSeatToken> = game
         .seats
@@ -75,8 +83,18 @@ pub fn create_game(
 /// [`GameStore`]. For stateful tests, use [`create_game`] with an owned store.
 /// Panics if lobby size is illegal (not 5–15).
 pub fn create_game_in_memory(names: Vec<String>, seed: u64) -> CreateGameResponse {
+    create_game_in_memory_with_salt(names, seed, None)
+}
+
+/// Like [`create_game_in_memory`] with optional fixed salt.
+pub fn create_game_in_memory_with_salt(
+    names: Vec<String>,
+    seed: u64,
+    secret_salt: Option<u64>,
+) -> CreateGameResponse {
     let mut store = GameStore::new();
-    create_game(&mut store, names, seed).expect("create_game_in_memory: valid player count 5–15")
+    create_game(&mut store, names, seed, secret_salt)
+        .expect("create_game_in_memory: valid player count 5–15")
 }
 
 /// Host locks lobby, assigns bag, enters First Night (and runs [`Game::night_tick`]).
@@ -192,11 +210,20 @@ pub fn get_host_state(game: &Game, token: &Token) -> Result<HostStateView, ToolE
         step_debug: format!("{:?}", p.step),
     });
 
+    let pending_host = game
+        .pending_host
+        .as_ref()
+        .map(HostDecisionView::from_pending);
+
     Ok(HostStateView {
         seed: game.seed,
+        secret_salt: game.secret_salt,
         phase: format!("{:?}", game.phase),
         seats,
         pending,
+        pending_host,
+        registration_mode: format!("{:?}", game.registration_mode),
+        host_lie_queue_len: game.host_lie_queue.len(),
         red_herring: game.red_herring,
         demon_bluffs: game
             .demon_bluffs
@@ -252,9 +279,23 @@ pub fn night_action(
     game.night_action(token, payload).map_err(ToolError::from)
 }
 
-/// Host only: apply default for pending wake and continue night_tick.
+/// Host only: apply default for pending wake (or pending host decision) and continue night_tick.
 pub fn skip_night_action(game: &mut Game, host: &Token) -> Result<(), ToolError> {
     game.skip_night_action(host).map_err(ToolError::from)
+}
+
+/// Host only: resolve Mayor bounce / starpass pick.
+pub fn host_decide(
+    game: &mut Game,
+    host: &Token,
+    decision: HostDecision,
+) -> Result<(), ToolError> {
+    game.host_decide(host, decision).map_err(ToolError::from)
+}
+
+/// Host only: enqueue free-text false info for the next disabled info result (FIFO).
+pub fn host_queue_lie(game: &mut Game, host: &Token, text: String) -> Result<(), ToolError> {
+    game.host_queue_lie(host, text).map_err(ToolError::from)
 }
 
 /// Host: Discussion → Nominations.
@@ -287,7 +328,17 @@ pub fn vote(
     game.vote(seat, nominee, support).map_err(ToolError::from)
 }
 
-/// Host: close the current vote window (also auto-runs when all living have voted).
+/// Dead player: abstain without spending the ghost vote (enables auto-close).
+pub fn pass_vote(game: &mut Game, token: &Token) -> Result<(), ToolError> {
+    let actor = game.tokens.resolve(token).ok_or(ToolError::Unauthorized)?;
+    let seat = match actor {
+        Actor::Player { seat } => seat,
+        Actor::Host => return Err(ToolError::BadRequest("host cannot pass_vote")),
+    };
+    game.pass_vote(seat).map_err(ToolError::from)
+}
+
+/// Host: close the current vote window (also auto-runs when living + ghost-holders responded).
 pub fn close_vote(game: &mut Game, host: &Token) -> Result<(), ToolError> {
     game.close_vote(host).map_err(ToolError::from)
 }

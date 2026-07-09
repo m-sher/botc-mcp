@@ -7,13 +7,14 @@ pub mod night;
 mod phase;
 mod seat;
 pub mod setup;
+pub mod st_policy;
 mod state;
 mod win;
 
 pub use crate::error::GameError;
 pub use day::{
     close_vote, day_action_slay, end_nominations, execution_leader, meets_threshold, nominate,
-    open_nominations, resolve_execution, vote, ClosedNomination, OpenNomination,
+    open_nominations, pass_vote, resolve_execution, vote, ClosedNomination, OpenNomination,
 };
 pub use win::{apply_demon_death, end_game, living_count as count_living, win_check};
 pub use ids::{GameId, SeatId};
@@ -24,6 +25,9 @@ pub use night::{
 pub use phase::{DayStage, EndReason, NightStep, Phase, Winner};
 pub use seat::Seat;
 pub use setup::{BagResult, Composition, StartOpts};
+pub use st_policy::{
+    HostDecision, MayorRedirectChoice, PendingHostDecision, RegistrationMode,
+};
 pub use state::{
     CreateGameResult, Game, Lobby, PublicSeatView, RoleAssignment, MAX_PLAYERS, MIN_PLAYERS,
 };

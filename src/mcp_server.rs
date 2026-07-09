@@ -14,7 +14,8 @@ use crate::auth::Token;
 use crate::comms::{PrivateMessage, PublicEvent};
 use crate::error::ToolError;
 use crate::game::{
-    ChoiceSchema, GameId, NightActionPayload, RoleAssignment, SeatId, StartOpts, Winner,
+    ChoiceSchema, GameId, HostDecision, MayorRedirectChoice, NightActionPayload, RegistrationMode,
+    RoleAssignment, SeatId, StartOpts, Winner,
 };
 use crate::roles::Character;
 use crate::store::GameStore;
@@ -151,10 +152,13 @@ const TOOL_NAMES: &[&str] = &[
     "day_action",
     "nominate",
     "vote",
+    "pass_vote",
     "open_nominations",
     "close_vote",
     "end_nominations",
     "skip_night_action",
+    "host_decide",
+    "host_queue_lie",
 ];
 
 fn tool_descriptors() -> Vec<Value> {
@@ -172,23 +176,26 @@ fn tool_descriptors() -> Vec<Value> {
 
 fn tool_description(name: &str) -> &'static str {
     match name {
-        "create_game" => "Create a Trouble Brewing lobby (5–15 players); returns game_id, host_token, player tokens",
+        "create_game" => "Create a Trouble Brewing lobby (5–15 players); optional seed/secret_salt (omit = CSPRNG); returns game_id, host_token, player tokens",
         "start_game" => "Host: lock lobby, assign bag (or fixed assignments), enter first night",
         "get_public_state" => "Public phase/seats/winner snapshot (no roles, no pending night seat)",
         "get_public_log" => "Public event log since cursor",
         "get_private_state" => "Player private view: face identity, inbox, awaiting action",
         "get_character_rules" => "Public character sheet markdown for one TB character",
-        "get_host_state" => "Host-only grimoire (true roles, markers, pending wake)",
+        "get_host_state" => "Host-only grimoire (true roles, markers, pending wake, seed, secret_salt)",
         "say" => "Player public table talk (no whispers)",
         "st_announce" => "Host public storyteller announcement",
         "night_action" => "Player night choice for current pending wake",
         "day_action" => "Player day ability (Slayer slay)",
         "nominate" => "Player nominate a living seat",
         "vote" => "Player cast yes/no on open nomination",
+        "pass_vote" => "Dead player: abstain without spending ghost vote",
         "open_nominations" => "Host: Discussion → Nominations",
-        "close_vote" => "Host: close current vote window",
+        "close_vote" => "Host: close current vote window (may auto-end day when no noms remain)",
         "end_nominations" => "Host: execute vote leader (if any), begin next night",
-        "skip_night_action" => "Host: default pending wake and continue night",
+        "skip_night_action" => "Host: default pending wake or host decision and continue night",
+        "host_decide" => "Host: resolve Mayor redirect or starpass pick",
+        "host_queue_lie" => "Host: enqueue free-text false info for next disabled info result",
         _ => "botc-mcp tool",
     }
 }
@@ -233,10 +240,13 @@ fn invoke_tool(store: &SharedStore, name: &str, args: Value) -> Result<Value, Rp
         "day_action" => tool_day_action(store, args),
         "nominate" => tool_nominate(store, args),
         "vote" => tool_vote(store, args),
+        "pass_vote" => tool_pass_vote(store, args),
         "open_nominations" => tool_open_nominations(store, args),
         "close_vote" => tool_close_vote(store, args),
         "end_nominations" => tool_end_nominations(store, args),
         "skip_night_action" => tool_skip_night_action(store, args),
+        "host_decide" => tool_host_decide(store, args),
+        "host_queue_lie" => tool_host_queue_lie(store, args),
         other => Err(RpcError {
             code: -32601,
             message: format!("unknown tool: {other}"),
@@ -371,10 +381,16 @@ fn tool_create_game(store: &SharedStore, args: Value) -> Result<Value, RpcError>
                 .ok_or_else(|| invalid_params("names entries must be strings"))
         })
         .collect::<Result<_, _>>()?;
-    let seed = args.get("seed").and_then(|v| v.as_u64()).unwrap_or(0);
+    // Never default to seed 0: omit → CSPRNG secret so bag/draws are not offline-reproducible.
+    let seed = args
+        .get("seed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(rand::random);
+    // Optional salt: omit → CSPRNG (production); provide with seed for full deterministic replay.
+    let secret_salt = args.get("secret_salt").and_then(|v| v.as_u64());
 
     with_store_mut(store, |st| {
-        let resp = tools::create_game(st, names, seed).map_err(tool_err)?;
+        let resp = tools::create_game(st, names, seed, secret_salt).map_err(tool_err)?;
         Ok(json!({
             "game_id": resp.game_id.0,
             "host_token": resp.host_token.as_str(),
@@ -424,7 +440,68 @@ fn tool_start_game(store: &SharedStore, args: Value) -> Result<Value, RpcError> 
     } else {
         None
     };
-    let opts = StartOpts { assignments };
+    let registration_mode = match args
+        .get("registration_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("random")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "random" | "" => RegistrationMode::Random,
+        "alwaystrue" | "always_true" | "true" => RegistrationMode::AlwaysTrue,
+        "alwaysmisreg" | "always_misreg" | "misreg" => RegistrationMode::AlwaysMisreg,
+        other => {
+            return Err(invalid_params(format!(
+                "unknown registration_mode: {other}"
+            )))
+        }
+    };
+
+    let drunk_faces = if let Some(arr) = args.get("drunk_faces").and_then(|v| v.as_array()) {
+        let mut out = Vec::new();
+        for item in arr {
+            let seat = seat_id(
+                item.get("seat")
+                    .or_else(|| item.get("seat_id"))
+                    .ok_or_else(|| invalid_params("drunk_faces.seat required"))?,
+            )?;
+            let face_name = item
+                .get("face")
+                .or_else(|| item.get("character"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| invalid_params("drunk_faces.face required"))?;
+            out.push((seat, parse_character(face_name)?));
+        }
+        Some(out)
+    } else {
+        None
+    };
+
+    let red_herring = args
+        .get("red_herring")
+        .map(seat_id)
+        .transpose()?;
+
+    let demon_bluffs = if let Some(arr) = args.get("demon_bluffs").and_then(|v| v.as_array()) {
+        let mut out = Vec::new();
+        for item in arr {
+            let name = item
+                .as_str()
+                .ok_or_else(|| invalid_params("demon_bluffs entries must be character names"))?;
+            out.push(parse_character(name)?);
+        }
+        Some(out)
+    } else {
+        None
+    };
+
+    let opts = StartOpts {
+        assignments,
+        drunk_faces,
+        red_herring,
+        demon_bluffs,
+        registration_mode,
+    };
 
     with_store_mut(store, |st| {
         let game = st
@@ -533,6 +610,7 @@ fn tool_get_host_state(store: &SharedStore, args: Value) -> Result<Value, RpcErr
         let view = tools::get_host_state(game, &token).map_err(tool_err)?;
         Ok(json!({
             "seed": view.seed,
+            "secret_salt": view.secret_salt,
             "phase": view.phase,
             "seats": view.seats.iter().map(|s| json!({
                 "seat_id": s.seat_id.0,
@@ -554,6 +632,13 @@ fn tool_get_host_state(store: &SharedStore, args: Value) -> Result<Value, RpcErr
                 "schema": choice_schema_json(&p.schema),
                 "step_debug": p.step_debug,
             })),
+            "pending_host": view.pending_host.as_ref().map(|p| json!({
+                "kind": p.kind,
+                "detail": p.detail,
+                "seats": p.seats.iter().map(|s| s.0).collect::<Vec<_>>(),
+            })),
+            "registration_mode": view.registration_mode,
+            "host_lie_queue_len": view.host_lie_queue_len,
             "red_herring": view.red_herring.map(|s| s.0),
             "demon_bluffs": view.demon_bluffs,
             "winner": view.winner.map(winner_json),
@@ -762,6 +847,18 @@ fn tool_vote(store: &SharedStore, args: Value) -> Result<Value, RpcError> {
     })
 }
 
+fn tool_pass_vote(store: &SharedStore, args: Value) -> Result<Value, RpcError> {
+    let game_id = require_game_id(&args)?;
+    let token = any_token(&args)?;
+    with_store_mut(store, |st| {
+        let game = st
+            .get_mut(game_id)
+            .ok_or_else(|| tool_err(ToolError::BadRequest("unknown game_id")))?;
+        tools::pass_vote(game, &token).map_err(tool_err)?;
+        Ok(json!({ "ok": true }))
+    })
+}
+
 fn tool_open_nominations(store: &SharedStore, args: Value) -> Result<Value, RpcError> {
     host_phase_tool(store, args, tools::open_nominations)
 }
@@ -776,6 +873,89 @@ fn tool_end_nominations(store: &SharedStore, args: Value) -> Result<Value, RpcEr
 
 fn tool_skip_night_action(store: &SharedStore, args: Value) -> Result<Value, RpcError> {
     host_phase_tool(store, args, tools::skip_night_action)
+}
+
+fn tool_host_queue_lie(store: &SharedStore, args: Value) -> Result<Value, RpcError> {
+    let game_id = require_game_id(&args)?;
+    let host = require_token(&args, "host_token").or_else(|_| any_token(&args))?;
+    let text = args
+        .get("text")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| invalid_params("host_queue_lie requires text"))?
+        .to_string();
+    with_store_mut(store, |st| {
+        let game = st
+            .get_mut(game_id)
+            .ok_or_else(|| tool_err(ToolError::BadRequest("unknown game_id")))?;
+        tools::host_queue_lie(game, &host, text).map_err(tool_err)?;
+        Ok(json!({
+            "ok": true,
+            "host_lie_queue_len": game.host_lie_queue.len()
+        }))
+    })
+}
+
+fn tool_host_decide(store: &SharedStore, args: Value) -> Result<Value, RpcError> {
+    let game_id = require_game_id(&args)?;
+    let host = require_token(&args, "host_token").or_else(|_| any_token(&args))?;
+    let ty = args
+        .get("type")
+        .or_else(|| args.get("decision"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| invalid_params("host_decide requires type"))?;
+    let decision = match ty {
+        "mayor_redirect" => {
+            let choice_s = args
+                .get("choice")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| invalid_params("mayor_redirect requires choice"))?;
+            let choice = match choice_s {
+                "kill_mayor" => MayorRedirectChoice::KillMayor,
+                "nobody" => MayorRedirectChoice::Nobody,
+                "kill_other" => {
+                    let target = args
+                        .get("target")
+                        .ok_or_else(|| invalid_params("kill_other requires target seat"))?;
+                    // Allow string "nobody" as alias.
+                    if target.as_str() == Some("nobody") {
+                        MayorRedirectChoice::Nobody
+                    } else {
+                        MayorRedirectChoice::KillOther {
+                            target: seat_id(target)?,
+                        }
+                    }
+                }
+                other => {
+                    return Err(invalid_params(format!(
+                        "unknown mayor choice: {other}"
+                    )))
+                }
+            };
+            HostDecision::MayorRedirect { choice }
+        }
+        "starpass_pick" => {
+            let minion = args
+                .get("target")
+                .or_else(|| args.get("minion"))
+                .or_else(|| args.get("seat"))
+                .ok_or_else(|| invalid_params("starpass_pick requires target/minion seat"))?;
+            HostDecision::StarpassPick {
+                minion: seat_id(minion)?,
+            }
+        }
+        other => {
+            return Err(invalid_params(format!(
+                "unknown host_decide type: {other}"
+            )))
+        }
+    };
+    with_store_mut(store, |st| {
+        let game = st
+            .get_mut(game_id)
+            .ok_or_else(|| tool_err(ToolError::BadRequest("unknown game_id")))?;
+        tools::host_decide(game, &host, decision).map_err(tool_err)?;
+        Ok(json!({ "ok": true, "phase": format!("{:?}", game.phase) }))
+    })
 }
 
 fn host_phase_tool<F>(store: &SharedStore, args: Value, f: F) -> Result<Value, RpcError>
@@ -913,6 +1093,38 @@ mod tests {
         assert_eq!(sc["game_id"], 1);
         assert!(sc["host_token"].as_str().unwrap().len() == 36);
         assert_eq!(sc["players"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn create_game_omitted_seed_is_not_zero() {
+        let store = new_shared_store();
+        let resp = call(
+            &store,
+            "create_game",
+            json!({
+                "names": ["A", "B", "C", "D", "E"]
+            }),
+        );
+        assert!(resp.get("error").is_none(), "{resp}");
+        let sc = &resp["result"]["structuredContent"];
+        let host = sc["host_token"].as_str().unwrap();
+        let game_id = sc["game_id"].as_u64().unwrap();
+        let host_resp = call(
+            &store,
+            "get_host_state",
+            json!({ "game_id": game_id, "host_token": host }),
+        );
+        assert!(host_resp.get("error").is_none(), "{host_resp}");
+        let seed = host_resp["result"]["structuredContent"]["seed"]
+            .as_u64()
+            .expect("seed");
+        let salt = host_resp["result"]["structuredContent"]["secret_salt"]
+            .as_u64()
+            .expect("secret_salt");
+        // CSPRNG seed: must not silently default to 0 (issue #1 #4).
+        assert_ne!(seed, 0, "omitted seed must not default to 0");
+        // secret_salt is present for host (player views never get it).
+        let _ = salt;
     }
 
     #[test]
