@@ -109,15 +109,14 @@ fn open_nominations_inner(game: &mut Game) -> Result<(), GameError> {
 /// Player: open a nomination and start the vote window (or Virgin bounce).
 ///
 /// Allowed from Day Nominations, or from Discussion (auto-opens nominations first).
+///
+/// All legality checks run **before** auto-opening Nominations from Discussion so a
+/// rejected nominate never mutates phase or the public log (#32).
 pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameError> {
     require_not_ended(game)?;
     let (_day, stage) = day_stage(game)?;
     match stage {
-        DayStage::Nominations => {}
-        DayStage::Discussion => {
-            // First living nomination auto-opens the nominations stage.
-            open_nominations_inner(game)?;
-        }
+        DayStage::Nominations | DayStage::Discussion => {}
     }
     if game.executed_today.is_some() {
         return Err(GameError::IllegalAction("already executed today"));
@@ -136,19 +135,29 @@ pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameE
     if game.day_nominators.contains(&by) {
         return Err(GameError::IllegalAction("already nominated today"));
     }
-    let nominee = seat_ref(game, target)?;
-    if !nominee.alive {
+    // Snapshot nominee fields before any mut borrow (auto-open / Virgin).
+    let (nominee_alive, is_virgin_first_nom, virgin_disabled) = {
+        let nominee = seat_ref(game, target)?;
+        (
+            nominee.alive,
+            nominee.true_character == Some(Character::Virgin) && !nominee.virgin_ability_used,
+            nominee.ability_disabled(),
+        )
+    };
+    if !nominee_alive {
         return Err(GameError::IllegalAction("cannot nominate the dead"));
     }
     if game.day_nominees.contains(&target) {
         return Err(GameError::IllegalAction("target already nominated today"));
     }
 
+    // Auto-open only after the nomination is known-legal (Discussion → Nominations).
+    if stage == DayStage::Discussion {
+        open_nominations_inner(game)?;
+    }
+
     // Virgin: first nomination always spends the once-per-game ability, even if poisoned/drunk.
     // Execution only if ability is active AND nominator registers as Townsfolk (Spy may).
-    let is_virgin_first_nom = nominee.true_character == Some(Character::Virgin)
-        && !nominee.virgin_ability_used;
-    let virgin_disabled = nominee.ability_disabled();
     let virgin_label = format!("virgin_reg:day:nom:{}", by.0);
     let nominator_registers_townsfolk =
         crate::game::ability::register::registers_as_townsfolk(game, by, &virgin_label);
@@ -324,7 +333,10 @@ fn nomination_ready_to_auto_close(game: &Game) -> bool {
         .all(|s| dead_responded(open, s.id))
 }
 
-/// Host: finalize the current nomination's tally without executing.
+/// Host: finalize the current nomination's tally.
+///
+/// When no further legal nomination remains after the tally, this also runs
+/// day end (execution leader / enter night) via [`try_auto_end_day`] (#28 / #34).
 pub fn close_vote(game: &mut Game, host: &Token) -> Result<(), GameError> {
     match game.tokens.resolve(host) {
         Some(Actor::Host) => {}

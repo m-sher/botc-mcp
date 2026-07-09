@@ -191,7 +191,7 @@ fn tool_description(name: &str) -> &'static str {
         "vote" => "Player cast yes/no on open nomination",
         "pass_vote" => "Dead player: abstain without spending ghost vote",
         "open_nominations" => "Host: Discussion → Nominations",
-        "close_vote" => "Host: close current vote window",
+        "close_vote" => "Host: close current vote window (may auto-end day when no noms remain)",
         "end_nominations" => "Host: execute vote leader (if any), begin next night",
         "skip_night_action" => "Host: default pending wake or host decision and continue night",
         "host_decide" => "Host: resolve Mayor redirect or starpass pick",

@@ -589,6 +589,9 @@ fn validate_demon_bluffs_override(
 }
 
 /// Drop bluffs that match any Drunk face; fill back to 3 from not-in-play good chars.
+///
+/// Empty input is left empty: 5–6 player games have no bluff trio (`n >= 7` only),
+/// so a `drunk_faces` override must not fabricate bluffs (#33).
 fn refilter_demon_bluffs_for_faces(
     rng: &crate::rng::SeededRng,
     bag_set: &[Character],
@@ -597,6 +600,11 @@ fn refilter_demon_bluffs_for_faces(
 ) -> Vec<Character> {
     use crate::roles::{all_outsiders, all_townsfolk};
     use rand::seq::SliceRandom;
+
+    // Only re-filter a previously populated set (7+). Never invent bluffs from empty.
+    if bluffs.is_empty() {
+        return bluffs;
+    }
 
     let drunk_faces: std::collections::HashSet<Character> = assignments
         .iter()

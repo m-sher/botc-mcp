@@ -119,7 +119,7 @@ fn starpass_pause_imp_still_public_alive() {
 /// #28: day ends without host end_nominations once nominations are exhausted.
 #[test]
 fn day_auto_ends_when_nominations_exhausted() {
-    // 5 living: each nominates once (chain). After last vote closes → night 2.
+    // 5 living: each nominates once (chain). All votes no → NoExecution → night 2.
     let (mut g, host, tokens) = start_scripted(
         2801,
         vec![
@@ -173,12 +173,20 @@ fn day_auto_ends_when_nominations_exhausted() {
         }
     }
 
+    // All five closed noms had 0 yes → no execution; everyone still alive; enter night 2.
     assert!(
-        matches!(g.phase, Phase::Night { night: 2, .. })
-            || matches!(g.phase, Phase::Day { day: 2, .. })
-            || matches!(g.phase, Phase::Ended { .. }),
-        "day must auto-end without host end_nominations; got {:?}",
+        matches!(g.phase, Phase::Night { night: 2, .. }),
+        "day must auto-end into Night 2 with no execution; got {:?}",
         g.phase
+    );
+    assert!(g.executed_today.is_none());
+    assert!(g.seats.iter().all(|s| s.alive), "no one should have died");
+    assert!(
+        g.public_log
+            .since(0)
+            .iter()
+            .any(|(_, e)| matches!(e, botc_mcp::comms::PublicEvent::NoExecution)),
+        "expected NoExecution in public log"
     );
 }
 

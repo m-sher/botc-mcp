@@ -481,12 +481,13 @@ impl Game {
     }
 
     /// Enter other-night `night` (must be ≥ 2): build queue and tick to first pending.
+    ///
+    /// Does **not** clear `host_lie_queue`: lies queued during the day apply to this
+    /// night. Unused lies are cleared at dawn (#30 / #34).
     pub fn enter_night(&mut self, night: u32) {
         self.deaths_tonight.clear();
         self.pending_night = None;
         self.pending_host = None;
-        // Host-authored lies are scoped to a single night.
-        self.host_lie_queue.clear();
         self.night_queue = build_other_night_queue(self);
         self.night_cursor = 0;
         self.phase = Phase::Night { night, cursor: 0 };
