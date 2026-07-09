@@ -29,6 +29,7 @@ prompting players.
 | └ Demons | [roles/demons/](roles/demons/) |
 | Glossary | [glossary.md](glossary.md) |
 | Sources | [sources.md](sources.md) |
+| **Engine architecture sketch** | [architecture.md](architecture.md) |
 
 ## Retrieval tips
 

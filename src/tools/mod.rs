@@ -1,0 +1,169 @@
+//! MCP tool handlers (sketch).
+//!
+//! Transport (JSON-RPC / rmcp / etc.) is not wired yet. These functions are the
+//! semantic API the MCP layer should call after deserializing arguments.
+
+use crate::auth::{Actor, Token};
+use crate::comms::{EventId, PrivateMessage, PublicEvent};
+use crate::game::Phase;
+use crate::game::SeatId;
+use crate::game::{Game, GameError, PublicSeatView, Winner};
+use crate::roles::Character;
+
+/// Errors returned to the MCP client (safe strings; no other seats' secrets).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolError {
+    Unauthorized,
+    Game(GameError),
+    BadRequest(&'static str),
+}
+
+pub struct PublicStateView {
+    pub phase: String,
+    pub seats: Vec<PublicSeatView>,
+    pub winner: Option<Winner>,
+}
+
+pub struct PrivateStateView {
+    pub seat: SeatId,
+    pub name: String,
+    pub alive: bool,
+    /// Character the player should play as (Drunk face when implemented).
+    pub character_label: Option<String>,
+    pub team_label: Option<String>,
+    pub rules_path: Option<String>,
+    pub private_messages_since: Vec<(EventId, PrivateMessage)>,
+    pub awaiting_action: bool,
+}
+
+/// Host or player: public snapshot (no roles).
+pub fn get_public_state(game: &Game, token: &Token) -> Result<PublicStateView, ToolError> {
+    game.tokens.resolve(token).ok_or(ToolError::Unauthorized)?;
+    Ok(PublicStateView {
+        phase: format!("{:?}", game.phase),
+        seats: game.public_seats(),
+        winner: game.winner,
+    })
+}
+
+/// Host or player: public log after cursor.
+pub fn get_public_log(
+    game: &Game,
+    token: &Token,
+    cursor: EventId,
+) -> Result<Vec<(EventId, PublicEvent)>, ToolError> {
+    game.tokens.resolve(token).ok_or(ToolError::Unauthorized)?;
+    Ok(game
+        .public_log
+        .since(cursor)
+        .into_iter()
+        .map(|(id, e)| (id, e.clone()))
+        .collect())
+}
+
+/// Player only: identity + private ST inbox.
+pub fn get_private_state(
+    game: &Game,
+    token: &Token,
+    private_cursor: EventId,
+) -> Result<PrivateStateView, ToolError> {
+    let actor = game.tokens.resolve(token).ok_or(ToolError::Unauthorized)?;
+    let seat_id = match actor {
+        Actor::Player { seat } => seat,
+        Actor::Host => return Err(ToolError::BadRequest("host has no private player state")),
+    };
+    let seat = game
+        .seats
+        .iter()
+        .find(|s| s.id == seat_id)
+        .ok_or(ToolError::Game(GameError::NoSuchSeat))?;
+
+    let visible = seat.visible_character();
+    Ok(PrivateStateView {
+        seat: seat_id,
+        name: seat.display_name.clone(),
+        alive: seat.alive,
+        character_label: visible.map(|c| c.display_name().to_string()),
+        team_label: seat.true_character.map(|c| format!("{:?}", c.team())),
+        rules_path: visible.map(|c| c.rules_doc_path().to_string()),
+        private_messages_since: game
+            .private_inboxes
+            .since(seat_id, private_cursor)
+            .into_iter()
+            .map(|(id, m)| (id, m.clone()))
+            .collect(),
+        awaiting_action: matches!(
+            game.phase,
+            Phase::FirstNight { .. } | Phase::Night { .. } | Phase::Day { .. }
+        ),
+    })
+}
+
+/// Player speech → public log only. No `to` / whisper args.
+pub fn say(game: &mut Game, token: &Token, text: String) -> Result<EventId, ToolError> {
+    let actor = game.tokens.resolve(token).ok_or(ToolError::Unauthorized)?;
+    let seat = match actor {
+        Actor::Player { seat } => seat,
+        Actor::Host => {
+            return Err(ToolError::BadRequest(
+                "players use say; host uses storyteller announce",
+            ));
+        }
+    };
+    game.say(seat, text).map_err(ToolError::Game)?;
+    Ok(game.public_log.since(0).last().map(|(id, _)| *id).unwrap_or(0))
+}
+
+/// Public character sheet entry (ability text path). Not secret.
+pub fn get_character_rules(character: Character) -> CharacterRulesView {
+    CharacterRulesView {
+        name: character.display_name(),
+        path: character.rules_doc_path(),
+        team: format!("{:?}", character.team()),
+        character_type: format!("{:?}", character.character_type()),
+    }
+}
+
+pub struct CharacterRulesView {
+    pub name: &'static str,
+    pub path: &'static str,
+    pub team: String,
+    pub character_type: String,
+}
+
+/// Night choice payload — role inferred server-side from seat.
+#[derive(Debug, Clone)]
+pub enum NightActionPayload {
+    /// No choice (info-only wake acknowledgment).
+    Ack,
+    PickOne { target: SeatId },
+    PickTwo { a: SeatId, b: SeatId },
+    PickCharacter { name: String },
+}
+
+pub fn night_action(
+    game: &mut Game,
+    token: &Token,
+    _payload: NightActionPayload,
+) -> Result<(), ToolError> {
+    let actor = game.tokens.resolve(token).ok_or(ToolError::Unauthorized)?;
+    let _seat = match actor {
+        Actor::Player { seat } => seat,
+        Actor::Host => return Err(ToolError::BadRequest("host cannot night_action")),
+    };
+    Err(ToolError::BadRequest(
+        "night_action resolution not implemented yet",
+    ))
+}
+
+pub fn nominate(game: &mut Game, token: &Token, target: SeatId) -> Result<(), ToolError> {
+    let actor = game.tokens.resolve(token).ok_or(ToolError::Unauthorized)?;
+    let by = match actor {
+        Actor::Player { seat } => seat,
+        Actor::Host => return Err(ToolError::BadRequest("host cannot nominate")),
+    };
+    // TODO: living, once/day, phase Nominations, Virgin, etc.
+    game.public_log
+        .push(PublicEvent::Nominated { by, target });
+    Ok(())
+}

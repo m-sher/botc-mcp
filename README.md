@@ -5,7 +5,9 @@ character set only): one fixed gameplay loop under a Storyteller moderator.
 
 ## Status
 
-**Scaffold + rules documentation.** Engine and MCP tools not implemented yet.
+**Rules docs + engine/MCP architecture sketch.** Core loop not fully implemented yet.
+
+Design: [`docs/architecture.md`](docs/architecture.md). Rust modules under `src/` (`auth`, `comms`, `game`, `roles`, `tools`).
 
 ## Rules
 
