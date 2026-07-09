@@ -372,7 +372,8 @@ fn empath_counts_living_evil_neighbors() {
 
 #[test]
 fn drunk_empath_gets_wrong_info() {
-    // Truth neighbors: Imp + Good => 1; disabled always lies => 0 or 2
+    // Truth neighbors: Imp + Good => 1; disabled always lies => 0 or 2.
+    // Host-first pauses for false info; skip applies the seeded-random lie.
     let lobby = Game::create(five_names(), 42).unwrap();
     let host = lobby.host_token.clone();
     let mut g = lobby.game;
@@ -386,10 +387,13 @@ fn drunk_empath_gets_wrong_info() {
                 RoleAssignment::normal(SeatId(3), Character::Chef),
                 RoleAssignment::normal(SeatId(4), Character::Soldier),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
+    while g.pending_night.is_some() || g.pending_host.is_some() {
+        botc_mcp::tools::skip_night_action(&mut g, &host).unwrap();
+    }
     let results = night_results_for(&g, SeatId(0));
     assert!(
         results

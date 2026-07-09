@@ -26,7 +26,8 @@ pub use phase::{DayStage, EndReason, NightStep, Phase, Winner};
 pub use seat::Seat;
 pub use setup::{BagResult, Composition, StartOpts};
 pub use st_policy::{
-    HostDecision, MayorRedirectChoice, PendingHostDecision, RegistrationMode,
+    HostDecision, MayorRedirectChoice, NightInfoPayload, PendingHostDecision, RegistrationMode,
+    StChoiceMode,
 };
 pub use state::{
     CreateGameResult, Game, Lobby, PublicSeatView, RoleAssignment, MAX_PLAYERS, MIN_PLAYERS,

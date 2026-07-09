@@ -6,7 +6,7 @@ use rand::Rng;
 use crate::error::GameError;
 use crate::game::ids::SeatId;
 use crate::game::state::RoleAssignment;
-use crate::game::st_policy::RegistrationMode;
+use crate::game::st_policy::{RegistrationMode, StChoiceMode};
 use crate::rng::SeededRng;
 use crate::roles::{
     all_minions, all_outsiders, all_townsfolk, Character, CharacterType, Team,
@@ -33,8 +33,10 @@ pub struct StartOpts {
     pub red_herring: Option<SeatId>,
     /// Override Imp bluffs (exactly 3 good characters not in the bag when provided).
     pub demon_bluffs: Option<Vec<Character>>,
-    /// Spy/Recluse registration policy (default: random).
+    /// Spy/Recluse registration policy for the random/skip path (default: random p=0.5).
     pub registration_mode: RegistrationMode,
+    /// Storyteller discretion: host-first (default) or immediate seeded-random.
+    pub st_choice_mode: StChoiceMode,
 }
 
 /// Result of sampling a bag and assigning seats.

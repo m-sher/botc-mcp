@@ -62,7 +62,7 @@ pub struct HostPendingView {
     pub step_debug: String,
 }
 
-/// Host-only pending Storyteller night decision (Mayor / starpass).
+/// Host-only pending Storyteller decision (Mayor / starpass / night info / day reg).
 #[derive(Debug, Clone)]
 pub struct HostDecisionView {
     pub kind: String,
@@ -79,9 +79,10 @@ pub struct HostStateView {
     pub phase: String,
     pub seats: Vec<HostSeatView>,
     pub pending: Option<HostPendingView>,
-    /// Mayor bounce / starpass host choice (not shown on player views).
+    /// Host Storyteller choice (not shown on player views).
     pub pending_host: Option<HostDecisionView>,
     pub registration_mode: String,
+    pub st_choice_mode: String,
     pub host_lie_queue_len: usize,
     pub red_herring: Option<SeatId>,
     pub demon_bluffs: Vec<&'static str>,
@@ -106,6 +107,32 @@ impl HostDecisionView {
                 kind: "starpass_pick".into(),
                 detail: format!("dead_imp seat {}", dead_imp.0),
                 seats: minions.clone(),
+            },
+            PendingHostDecision::NightInfo {
+                seat,
+                ability,
+                reason,
+                ..
+            } => Self {
+                kind: "night_info".into(),
+                detail: format!("{ability} for seat {} ({reason})", seat.0),
+                seats: vec![*seat],
+            },
+            PendingHostDecision::VirginSpyReg { nominator, virgin } => Self {
+                kind: "virgin_spy_reg".into(),
+                detail: format!(
+                    "does Spy seat {} register as Townsfolk for Virgin seat {}?",
+                    nominator.0, virgin.0
+                ),
+                seats: vec![*nominator, *virgin],
+            },
+            PendingHostDecision::SlayerRecluseReg { slayer, target } => Self {
+                kind: "slayer_recluse_reg".into(),
+                detail: format!(
+                    "does Recluse seat {} register as Demon for Slayer seat {}?",
+                    target.0, slayer.0
+                ),
+                seats: vec![*slayer, *target],
             },
         }
     }

@@ -249,10 +249,9 @@ fn mayor_bounce_can_kill_minion() {
     assert!(g.seats[0].alive, "Mayor survives bounce");
 }
 
-/// #8 Slayer kills Recluse when register_demon_for_ft is true.
+/// #8 Slayer kills Recluse when Storyteller registers them as Demon.
 #[test]
 fn slayer_can_kill_recluse_registering_as_demon() {
-    // Probe labels until we find a seed/label where Recluse registers as demon, then slay.
     let (mut g, host, tokens) = start_scripted(
         104,
         0,
@@ -266,46 +265,25 @@ fn slayer_can_kill_recluse_registering_as_demon() {
     );
     to_day1(&mut g, &host);
     g.seats[0].poisoned = false;
-
-    // Force many day_action attempts by resetting slayer_used and probing — but each
-    // uses fixed label slayer_reg:day:1. Instead check registration flip then apply hit path
-    // by trying many game instances with different seeds.
-    let mut killed = false;
-    for seed in 200..400u64 {
-        let (mut g2, host2, tokens2) = start_scripted(
-            seed,
-            seed.wrapping_mul(3),
-            vec![
-                RoleAssignment::normal(SeatId(0), Character::Slayer),
-                RoleAssignment::normal(SeatId(1), Character::Recluse),
-                RoleAssignment::normal(SeatId(2), Character::Soldier),
-                RoleAssignment::normal(SeatId(3), Character::Poisoner),
-                RoleAssignment::normal(SeatId(4), Character::Imp),
-            ],
-        );
-        to_day1(&mut g2, &host2);
-        g2.seats[0].poisoned = false;
-        // Peek whether this seed's slayer label would register Recluse as demon.
-        let lab = "slayer_reg:day:1";
-        if !register::register_demon_for_ft(&g2, SeatId(1), lab) {
-            continue;
-        }
-        // Note: day_action will re-draw the same label substream from the start → same result.
-        day_action(
-            &mut g2,
-            &tokens2[0],
-            DayActionPayload::Slay { target: SeatId(1) },
-        )
-        .unwrap();
-        if !g2.seats[1].alive {
-            killed = true;
-            // Imp still alive; game should not end from Recluse death alone.
-            assert!(g2.seats[4].alive);
-            break;
-        }
-    }
-    assert!(killed, "expected some seed where Slayer kills Recluse-as-demon");
-    let _ = (g, host, tokens);
+    // Host-first: Recluse-as-Demon is ST discretion.
+    day_action(
+        &mut g,
+        &tokens[0],
+        DayActionPayload::Slay { target: SeatId(1) },
+    )
+    .unwrap();
+    assert!(matches!(
+        g.pending_host,
+        Some(botc_mcp::game::PendingHostDecision::SlayerRecluseReg { .. })
+    ));
+    botc_mcp::tools::host_decide(
+        &mut g,
+        &host,
+        botc_mcp::game::HostDecision::Registration { register: true },
+    )
+    .unwrap();
+    assert!(!g.seats[1].alive, "Recluse dies when ST registers as Demon");
+    assert!(g.seats[4].alive, "Imp still alive; no SW path from Recluse");
 }
 
 /// #12 spent ghost rejects all votes (also day_tests).

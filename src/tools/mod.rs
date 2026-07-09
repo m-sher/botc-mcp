@@ -3,9 +3,14 @@
 //! Transport (JSON-RPC / rmcp / etc.) is not wired yet. These functions are the
 //! semantic API the MCP layer should call after deserializing arguments.
 
+mod rules_docs;
 mod rules_text;
 mod views;
 
+pub use rules_docs::{
+    list_characters as list_character_pool, list_rules_topics, load_rules_topic, CharacterListEntry,
+    RulesTopic,
+};
 pub use rules_text::{load_character_rules_text, rules_markdown_path};
 pub use views::{
     AwaitingView, CharacterRulesView, HostDecisionView, HostPendingView, HostSeatView,
@@ -223,6 +228,7 @@ pub fn get_host_state(game: &Game, token: &Token) -> Result<HostStateView, ToolE
         pending,
         pending_host,
         registration_mode: format!("{:?}", game.registration_mode),
+        st_choice_mode: format!("{:?}", game.st_choice_mode),
         host_lie_queue_len: game.host_lie_queue.len(),
         red_herring: game.red_herring,
         demon_bluffs: game
@@ -269,6 +275,21 @@ pub fn get_character_rules(character: Character) -> Result<CharacterRulesView, T
         character_type: format!("{:?}", character.character_type()),
         text,
     })
+}
+
+/// Public list of rules topics (ids + titles). No game secrets.
+pub fn get_rules_topics() -> Vec<&'static RulesTopic> {
+    list_rules_topics()
+}
+
+/// Load one public rules topic by id (e.g. `gameplay_loop`).
+pub fn get_rules_topic(topic_id: &str) -> Result<(&'static RulesTopic, String), ToolError> {
+    load_rules_topic(topic_id)
+}
+
+/// Full TB character pool (names, types, paths). No in-play secrets.
+pub fn get_character_list() -> Vec<CharacterListEntry> {
+    list_character_pool()
 }
 
 pub fn night_action(

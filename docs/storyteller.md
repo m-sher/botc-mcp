@@ -26,15 +26,24 @@ hard-coding a winner.
 
 ### Engine host knobs (v1)
 
+**Default policy:** Storyteller discretion is **host-first**. Whenever the rules require a
+Storyteller choice, the engine pauses for `host_decide`. `skip_night_action` applies the
+documented **random/default fallback** for that decision. Set
+`start_game.st_choice_mode` to `random` to force immediate seeded-random policy (eval harness).
+
 | Knob | Default | Tool / start option |
 | --- | --- | --- |
-| Spy/Recluse registration | random p=0.5 | `start_game.registration_mode`: `random` / `always_true` / `always_misreg` |
-| Drunk face, red herring, demon bluffs | seeded-random | `start_game.drunk_faces`, `red_herring`, `demon_bluffs` |
-| Mayor night bounce | host pending | `host_decide` type `mayor_redirect`; `skip_night_action` → **nobody dies** (always). Host may still choose `kill_mayor` / `kill_other`. |
-| Imp starpass minion | host pending | `host_decide` type `starpass_pick`; skip → random living minion. Imp stays publicly alive until the host resolves. |
-| Disabled-role false info text | seeded-random | `host_queue_lie` FIFO free-text consumed by next disabled info result; may be queued during the day for the upcoming night; **cleared at dawn** (unused lies do not carry into the next day) |
-
-Structured host-authored lies (e.g. pick exact Empath count) beyond the free-text queue are deferred.
+| ST choice policy | **host-first** | `start_game.st_choice_mode`: `host_first` (default) / `random` |
+| Pair info (Washerwoman / Librarian / Investigator) | host pending | `host_decide` type `night_info` with `text`; skip → seeded pair |
+| False info (drunk/poisoned) | host pending | `host_decide` `night_info` **or** pre-queue via `host_queue_lie`; skip → seeded lie |
+| Spy/Recluse affecting Chef / Empath / FT / UT / RK | host pending | `host_decide` `night_info` with the private result text; skip → registration draws |
+| Spy/Recluse registration (random path) | p=0.5 when skip/`random` mode | `start_game.registration_mode`: `random` / `always_true` / `always_misreg` |
+| Drunk face, red herring, demon bluffs | seeded-random | `start_game.drunk_faces`, `red_herring`, `demon_bluffs` (host overrides at setup) |
+| Mayor night bounce | host pending | `host_decide` type `mayor_redirect`; skip → **nobody dies** |
+| Imp starpass minion | host pending | `host_decide` type `starpass_pick`; skip → random living minion |
+| Virgin: Spy nominator as Townsfolk? | host pending | `host_decide` type `registration` with `register: bool`; skip → random |
+| Slayer: Recluse as Demon? | host pending | `host_decide` type `registration` with `register: bool`; skip → random |
+| Disabled-role free-text queue | optional | `host_queue_lie` FIFO; consumed by next disabled info; **cleared at dawn** |
 
 ## Private channels
 

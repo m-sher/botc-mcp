@@ -158,10 +158,6 @@ pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameE
 
     // Virgin: first nomination always spends the once-per-game ability, even if poisoned/drunk.
     // Execution only if ability is active AND nominator registers as Townsfolk (Spy may).
-    let virgin_label = format!("virgin_reg:day:nom:{}", by.0);
-    let nominator_registers_townsfolk =
-        crate::game::ability::register::registers_as_townsfolk(game, by, &virgin_label);
-
     game.day_nominators.push(by);
     game.day_nominees.push(target);
     game.public_log
@@ -171,13 +167,29 @@ pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameE
         if let Ok(s) = seat_mut(game, target) {
             s.virgin_ability_used = true;
         }
-        if !virgin_disabled && nominator_registers_townsfolk {
-            // Immediate execution of nominator — day's execution, no vote.
-            game.st_announce("The Virgin's power triggers. The nominator is executed.");
-            resolve_execution(game, by);
-            // Day's execution done — auto-end day (no further noms/executions).
-            try_auto_end_day(game)?;
-            return Ok(());
+        if !virgin_disabled {
+            let nominator_true = seat_ref(game, by)?.true_character;
+            let nominator_disabled = seat_ref(game, by)?.ability_disabled();
+            // Host-first: Spy nominator registration is Storyteller discretion.
+            if game.st_choice_mode.is_host_first()
+                && nominator_true == Some(Character::Spy)
+                && !nominator_disabled
+            {
+                game.pending_host = Some(crate::game::st_policy::PendingHostDecision::VirginSpyReg {
+                    nominator: by,
+                    virgin: target,
+                });
+                return Ok(());
+            }
+            let virgin_label = format!("virgin_reg:day:nom:{}", by.0);
+            let nominator_registers_townsfolk =
+                crate::game::ability::register::registers_as_townsfolk(game, by, &virgin_label);
+            if nominator_registers_townsfolk {
+                game.st_announce("The Virgin's power triggers. The nominator is executed.");
+                resolve_execution(game, by);
+                try_auto_end_day(game)?;
+                return Ok(());
+            }
         }
         // Disabled, or nominator does not register as Townsfolk: ability spent, vote proceeds.
     }
@@ -188,6 +200,30 @@ pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameE
         votes: Vec::new(),
         passes: Vec::new(),
     });
+    Ok(())
+}
+
+/// Finish Virgin after host (or skip) decides whether a Spy nominator registers as Townsfolk.
+pub(crate) fn complete_virgin_spy_reg(
+    game: &mut Game,
+    nominator: SeatId,
+    virgin: SeatId,
+    register_as_townsfolk: bool,
+) -> Result<(), GameError> {
+    let _ = virgin;
+    if register_as_townsfolk {
+        game.st_announce("The Virgin's power triggers. The nominator is executed.");
+        resolve_execution(game, nominator);
+        try_auto_end_day(game)?;
+    } else {
+        // Ability spent; open the vote window.
+        game.current_nomination = Some(OpenNomination {
+            by: nominator,
+            target: virgin,
+            votes: Vec::new(),
+            passes: Vec::new(),
+        });
+    }
     Ok(())
 }
 
@@ -599,24 +635,56 @@ pub fn day_action_slay(game: &mut Game, slayer: SeatId, target: SeatId) -> Resul
 
     seat_mut(game, slayer)?.slayer_used = true;
 
-    // Hit: true Imp, or Recluse registering as Demon (same p=0.5 as Fortune Teller).
-    let target_seat = seat_ref(game, target)?;
-    let demon_label = format!("slayer_reg:day:{}", target.0);
-    let target_registers_demon = target_seat.true_character == Some(Character::Imp)
-        || crate::game::ability::register::register_demon_for_ft(game, target, &demon_label);
-    let hit = true_is_slayer
-        && !disabled
-        && target_seat.alive
-        && target_registers_demon;
-
-    if !hit {
-        // Silent miss (no public confirmation).
+    if !true_is_slayer || disabled {
+        // Silent miss (Drunk face / poisoned / drunk).
         return Ok(());
     }
 
-    let was_true_imp = seat_ref(game, target)?
-        .true_character
-        == Some(Character::Imp);
+    let target_seat = seat_ref(game, target)?;
+    if !target_seat.alive {
+        return Ok(());
+    }
+
+    // True Imp: always a hit (no ST discretion).
+    if target_seat.true_character == Some(Character::Imp) {
+        return apply_slayer_kill(game, target, true);
+    }
+
+    // Recluse-as-Demon is Storyteller discretion (host-first default; skip → random).
+    if target_seat.true_character == Some(Character::Recluse) && !target_seat.ability_disabled() {
+        if game.st_choice_mode.is_host_first() {
+            game.pending_host =
+                Some(crate::game::st_policy::PendingHostDecision::SlayerRecluseReg {
+                    slayer,
+                    target,
+                });
+            return Ok(());
+        }
+        let demon_label = format!("slayer_reg:day:{}", target.0);
+        if crate::game::ability::register::register_demon_for_ft(game, target, &demon_label) {
+            return apply_slayer_kill(game, target, false);
+        }
+        return Ok(());
+    }
+
+    // Silent miss.
+    Ok(())
+}
+
+/// Finish Slayer after host decides Recluse demon registration.
+pub(crate) fn complete_slayer_recluse_reg(
+    game: &mut Game,
+    _slayer: SeatId,
+    target: SeatId,
+    register_as_demon: bool,
+) -> Result<(), GameError> {
+    if register_as_demon {
+        apply_slayer_kill(game, target, false)?;
+    }
+    Ok(())
+}
+
+fn apply_slayer_kill(game: &mut Game, target: SeatId, was_true_imp: bool) -> Result<(), GameError> {
     let alive_before = living_count(game);
     if let Some(s) = game.seats.iter_mut().find(|s| s.id == target) {
         s.alive = false;
@@ -624,7 +692,6 @@ pub fn day_action_slay(game: &mut Game, slayer: SeatId, target: SeatId) -> Resul
     }
     game.public_log.push(PublicEvent::PlayerDied { seat: target });
     game.st_announce(format!("Seat {} dies.", target.0));
-    // Scarlet Woman conversion only when the true Imp dies.
     if was_true_imp {
         apply_demon_death(game, target, alive_before);
     }
