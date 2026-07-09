@@ -31,6 +31,14 @@ Storyteller choice, the engine pauses for `host_decide`. `skip_night_action` app
 documented **random/default fallback** for that decision. Set
 `start_game.st_choice_mode` to `random` to force immediate seeded-random policy (eval harness).
 
+**Isolation:** While `pending_host` is set, all other gameplay mutations are rejected
+(`nominate`, `vote`, `day_action`, `open_nominations`, `end_nominations`, player
+`night_action`, etc.). Only `host_decide` / `skip_night_action` may proceed. Day-phase
+decisions are never dropped on the night transition. Night info pauses are **uniform** in
+host-first (always pause FT/RK/Empath/…, not only when Spy/Recluse is involved) so result
+timing does not leak identities. Virgin+Spy registration delays the public `Nominated`
+event until the host rules, so the table never sees a distinctive limbo.
+
 | Knob | Default | Tool / start option |
 | --- | --- | --- |
 | ST choice policy | **host-first** | `start_game.st_choice_mode`: `host_first` (default) / `random` |

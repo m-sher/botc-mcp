@@ -420,6 +420,18 @@ impl Game {
         self.host_lie_queue.pop_front()
     }
 
+    /// Reject gameplay mutations while a Storyteller decision is outstanding (#36–#38).
+    ///
+    /// Only `host_decide` / `skip_night_action` may proceed while `pending_host` is set.
+    pub fn require_no_pending_host(&self) -> Result<(), GameError> {
+        if self.pending_host.is_some() {
+            return Err(GameError::IllegalAction(
+                "storyteller decision pending; resolve with host_decide or skip_night_action",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn apply_host_decision(
         &mut self,
         decision: HostDecision,

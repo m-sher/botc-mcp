@@ -165,6 +165,11 @@ fn starpass_pending_host_pick() {
     botc_mcp::tools::end_nominations(&mut g, &host).unwrap();
 
     loop {
+        if g.pending_host.is_some() {
+            // Night-info host pauses before DemonKill under host-first default.
+            skip_night_action(&mut g, &host).unwrap();
+            continue;
+        }
         let Some(p) = g.pending_night.clone() else {
             panic!("no pending {:?}", g.phase);
         };

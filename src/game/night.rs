@@ -237,6 +237,8 @@ impl Game {
         seat: SeatId,
         payload: NightActionPayload,
     ) -> Result<(), GameError> {
+        // While a host ST decision is outstanding, players cannot advance the night (#36–#38).
+        self.require_no_pending_host()?;
         let pending = self
             .pending_night
             .clone()
@@ -490,15 +492,18 @@ impl Game {
     ///
     /// Does **not** clear `host_lie_queue`: lies queued during the day apply to this
     /// night. Unused lies are cleared at dawn (#30 / #34).
-    pub fn enter_night(&mut self, night: u32) {
+    ///
+    /// Fails if a Storyteller decision is still pending (#36) — never silently drops it.
+    pub fn enter_night(&mut self, night: u32) -> Result<(), GameError> {
+        self.require_no_pending_host()?;
         self.deaths_tonight.clear();
         self.pending_night = None;
-        self.pending_host = None;
         self.night_queue = build_other_night_queue(self);
         self.night_cursor = 0;
         self.phase = Phase::Night { night, cursor: 0 };
         self.st_announce(format!("Night falls. Night {night} begins."));
         self.night_tick();
+        Ok(())
     }
 
     fn validate_payload(
@@ -619,11 +624,15 @@ impl Game {
     }
 
     /// Whether host-first mode requires the Storyteller to author this info result.
+    ///
+    /// In host-first, **all** Storyteller-delivered night info pauses uniformly (#40).
+    /// Conditional pauses (only when Spy/Recluse is in the pick) would leak hidden
+    /// identity via result delay. `skip_night_action` still applies the engine path.
     fn should_host_compose_night_info(
         &self,
         step: NightStep,
         seat: SeatId,
-        payload: Option<&NightInfoPayload>,
+        _payload: Option<&NightInfoPayload>,
     ) -> bool {
         if !matches!(self.st_choice_mode, StChoiceMode::HostFirst) {
             return false;
@@ -638,105 +647,18 @@ impl Game {
         if disabled && !self.host_lie_queue.is_empty() {
             return false;
         }
-        if disabled {
-            // Drunk/poisoned info is Storyteller discretion.
-            return matches!(
-                step,
-                NightStep::Spy { .. }
-                    | NightStep::Washerwoman { .. }
-                    | NightStep::Librarian { .. }
-                    | NightStep::Investigator { .. }
-                    | NightStep::Chef { .. }
-                    | NightStep::Empath { .. }
-                    | NightStep::Undertaker { .. }
-                    | NightStep::FortuneTeller { .. }
-                    | NightStep::Ravenkeeper { .. }
-            );
-        }
-        match step {
-            // Pair info: Storyteller always chooses token + seats.
-            NightStep::Washerwoman { .. }
-            | NightStep::Librarian { .. }
-            | NightStep::Investigator { .. } => true,
-            // Spy grimoire is determined when healthy (true grimoire).
-            NightStep::Spy { .. } => false,
-            NightStep::Chef { .. } => self.any_living_spy_or_recluse(),
-            NightStep::Empath { seat: emp } => self.empath_neighbors_need_reg(emp),
-            NightStep::Undertaker { .. } => self
-                .executed_today
-                .and_then(|ex| self.seats.iter().find(|s| s.id == ex))
-                .and_then(|s| s.true_character)
-                .is_some_and(|c| matches!(c, Character::Spy | Character::Recluse)),
-            NightStep::FortuneTeller { .. } => match payload {
-                Some(NightInfoPayload::PickTwo { a, b }) => {
-                    self.seat_is_active_recluse(*a) || self.seat_is_active_recluse(*b)
-                }
-                _ => false,
-            },
-            NightStep::Ravenkeeper { .. } => match payload {
-                Some(NightInfoPayload::PickOne { target }) => {
-                    self.seat_is_active_spy_or_recluse(*target)
-                }
-                _ => false,
-            },
-            _ => false,
-        }
-    }
-
-    fn any_living_spy_or_recluse(&self) -> bool {
-        self.seats.iter().any(|s| {
-            s.alive
-                && !s.ability_disabled()
-                && matches!(
-                    s.true_character,
-                    Some(Character::Spy) | Some(Character::Recluse)
-                )
-        })
-    }
-
-    fn seat_is_active_recluse(&self, seat: SeatId) -> bool {
-        self.seats.iter().any(|s| {
-            s.id == seat
-                && !s.ability_disabled()
-                && s.true_character == Some(Character::Recluse)
-        })
-    }
-
-    fn seat_is_active_spy_or_recluse(&self, seat: SeatId) -> bool {
-        self.seats.iter().any(|s| {
-            s.id == seat
-                && !s.ability_disabled()
-                && matches!(
-                    s.true_character,
-                    Some(Character::Spy) | Some(Character::Recluse)
-                )
-        })
-    }
-
-    fn empath_neighbors_need_reg(&self, seat: SeatId) -> bool {
-        let Some(idx) = self.seats.iter().position(|s| s.id == seat) else {
-            return false;
-        };
-        let n = self.seats.len();
-        if n == 0 {
-            return false;
-        }
-        // Mirror empath neighbor walk (living only).
-        let mut found = Vec::new();
-        for dir in [1isize, -1] {
-            for step in 1..=n as isize {
-                let i = (idx as isize + dir * step).rem_euclid(n as isize) as usize;
-                if self.seats[i].alive {
-                    if self.seats[i].id != seat {
-                        found.push(self.seats[i].id);
-                    }
-                    break;
-                }
-            }
-        }
-        found
-            .into_iter()
-            .any(|id| self.seat_is_active_spy_or_recluse(id))
+        matches!(
+            step,
+            NightStep::Spy { .. }
+                | NightStep::Washerwoman { .. }
+                | NightStep::Librarian { .. }
+                | NightStep::Investigator { .. }
+                | NightStep::Chef { .. }
+                | NightStep::Empath { .. }
+                | NightStep::Undertaker { .. }
+                | NightStep::FortuneTeller { .. }
+                | NightStep::Ravenkeeper { .. }
+        )
     }
 
     fn request_night_info_host(

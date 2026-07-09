@@ -111,8 +111,12 @@ pub fn advance_to_imp_kill(
     poison_target: SeatId,
     monk_target: Option<SeatId>,
 ) {
-    // Drive until DemonKill, handling Poisoner / Monk if present.
+    // Drive until DemonKill, handling Poisoner / Monk / host-first ST pauses.
     loop {
+        if g.pending_host.is_some() {
+            skip_night_action(g, host).expect("skip host ST decision");
+            continue;
+        }
         let Some(p) = g.pending_night.as_ref() else {
             panic!("no pending night when waiting for Imp kill; phase={:?}", g.phase);
         };

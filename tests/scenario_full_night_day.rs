@@ -49,10 +49,23 @@ fn scenario_full_n1_info_day_vote_n2_kill() {
     )
     .unwrap();
 
-    // Fortune Teller may be next (or after other auto steps).
-    while let Some(p) = g.pending_night.as_ref() {
-        match p.step {
-            NightStep::FortuneTeller { seat: SeatId(0) } => {
+    // Fortune Teller may be next (or after host-first ST info pauses).
+    loop {
+        if let Some(ph) = g.pending_host.as_ref() {
+            // Skip pre-FT ST info pauses. FT host pause only happens after the pick below.
+            let is_ft_result = matches!(
+                ph,
+                botc_mcp::game::PendingHostDecision::NightInfo { ability, .. }
+                    if ability == "Fortune Teller"
+            );
+            if is_ft_result {
+                break;
+            }
+            skip_night_action(&mut g, &host).unwrap();
+            continue;
+        }
+        match g.pending_night.as_ref().map(|p| p.step) {
+            Some(NightStep::FortuneTeller { seat: SeatId(0) }) => {
                 night_action(
                     &mut g,
                     &tokens[0],
@@ -62,15 +75,21 @@ fn scenario_full_n1_info_day_vote_n2_kill() {
                     },
                 )
                 .unwrap();
+                // Host-first: FT result is authored by ST; deliver the true yes via host_decide.
+                if g.pending_host.is_some() {
+                    botc_mcp::tools::host_decide(
+                        &mut g,
+                        &host,
+                        botc_mcp::game::HostDecision::NightInfo {
+                            text: "Fortune Teller: YES — at least one of P4 (seat 4) and P2 (seat 2) is a Demon? yes.".into(),
+                        },
+                    )
+                    .unwrap();
+                }
                 break;
             }
-            NightStep::Poisoner { .. } => {
-                skip_night_action(&mut g, &host).unwrap();
-            }
-            _ => {
-                // Host skip any other choice; auto steps run on tick.
-                skip_night_action(&mut g, &host).unwrap();
-            }
+            Some(_) => skip_night_action(&mut g, &host).unwrap(),
+            None => panic!("stuck before FT: {:?}", g.phase),
         }
     }
 

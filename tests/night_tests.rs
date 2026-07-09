@@ -1,6 +1,22 @@
 use botc_mcp::game::night::{build_first_night_queue, build_other_night_queue};
-use botc_mcp::game::{Game, NightStep, RoleAssignment, SeatId, StartOpts};
+use botc_mcp::game::{Game, NightStep, RoleAssignment, SeatId, StChoiceMode, StartOpts};
 use botc_mcp::roles::Character;
+use botc_mcp::tools::skip_night_action;
+
+/// Finish all pending player wakes and host ST decisions (random/default path).
+fn finish_pending(g: &mut Game, host: &botc_mcp::auth::Token) {
+    while g.pending_night.is_some() || g.pending_host.is_some() {
+        skip_night_action(g, host).unwrap();
+    }
+}
+
+/// Engine-resolution tests use Random mode so they assert ability math without host pauses.
+fn random_st() -> StartOpts {
+    StartOpts {
+        st_choice_mode: StChoiceMode::Random,
+        ..Default::default()
+    }
+}
 
 fn five_names() -> Vec<String> {
     vec![
@@ -190,7 +206,7 @@ fn dead_seats_omitted_from_queues() {
 
 use botc_mcp::comms::PrivateMessage;
 use botc_mcp::game::{NightActionPayload, Phase};
-use botc_mcp::tools::{self, get_private_state, night_action, skip_night_action};
+use botc_mcp::tools::{self, get_private_state, night_action};
 
 fn seven_names() -> Vec<String> {
     (0..7).map(|i| format!("P{i}")).collect()
@@ -348,21 +364,16 @@ fn empath_counts_living_evil_neighbors() {
     let lobby = Game::create(five_names(), 42).unwrap();
     let host = lobby.host_token.clone();
     let mut g = lobby.game;
-    g.start_game(
-        &host,
-        StartOpts {
-            assignments: Some(vec![
-                RoleAssignment::normal(SeatId(0), Character::Soldier), // good
-                RoleAssignment::normal(SeatId(1), Character::Imp),     // evil
-                RoleAssignment::normal(SeatId(2), Character::Empath),
-                RoleAssignment::normal(SeatId(3), Character::Chef), // good
-                RoleAssignment::normal(SeatId(4), Character::Soldier), // good
-            ]),
-                ..Default::default()
-            },
-    )
-    .unwrap();
-    // No choice roles → night auto-resolves through Empath to dawn.
+    let mut opts = random_st();
+    opts.assignments = Some(vec![
+        RoleAssignment::normal(SeatId(0), Character::Soldier), // good
+        RoleAssignment::normal(SeatId(1), Character::Imp),     // evil
+        RoleAssignment::normal(SeatId(2), Character::Empath),
+        RoleAssignment::normal(SeatId(3), Character::Chef), // good
+        RoleAssignment::normal(SeatId(4), Character::Soldier), // good
+    ]);
+    g.start_game(&host, opts).unwrap();
+    // Random ST mode: night auto-resolves through Empath to dawn.
     let results = night_results_for(&g, SeatId(2));
     assert!(
         results.iter().any(|t| t.contains("that 1 of")),
@@ -413,22 +424,23 @@ fn fortune_teller_red_herring_pings_yes() {
     let host = lobby.host_token.clone();
     let tokens = lobby.player_tokens.clone();
     let mut g = lobby.game;
-    g.start_game(
-        &host,
-        StartOpts {
-            assignments: Some(vec![
-                RoleAssignment::normal(SeatId(0), Character::FortuneTeller),
-                RoleAssignment::normal(SeatId(1), Character::Imp),
-                RoleAssignment::normal(SeatId(2), Character::Soldier),
-                RoleAssignment::normal(SeatId(3), Character::Chef),
-                RoleAssignment::normal(SeatId(4), Character::Soldier),
-            ]),
-                ..Default::default()
-            },
-    )
-    .unwrap();
+    let mut opts = random_st();
+    opts.assignments = Some(vec![
+        RoleAssignment::normal(SeatId(0), Character::FortuneTeller),
+        RoleAssignment::normal(SeatId(1), Character::Imp),
+        RoleAssignment::normal(SeatId(2), Character::Soldier),
+        RoleAssignment::normal(SeatId(3), Character::Chef),
+        RoleAssignment::normal(SeatId(4), Character::Soldier),
+    ]);
+    g.start_game(&host, opts).unwrap();
     // Force herring to a good non-demon seat and pick herring + good townsfolk.
     g.red_herring = Some(SeatId(2));
+    // Skip auto info (Chef) until FT is pending.
+    while g.pending_night.as_ref().map(|p| &p.step)
+        != Some(&NightStep::FortuneTeller { seat: SeatId(0) })
+    {
+        skip_night_action(&mut g, &host).unwrap();
+    }
     let p = g.pending_night.as_ref().expect("FT pending");
     assert!(matches!(p.step, NightStep::FortuneTeller { seat: SeatId(0) }));
     night_action(
@@ -507,7 +519,7 @@ fn finish_n1_enter_n2(
         "expected Day 1 Discussion, got {:?}",
         g.phase
     );
-    g.enter_night(2);
+    g.enter_night(2).unwrap();
 }
 
 /// 5p other-night: Monk, Imp, Poisoner, Empath, Soldier.
@@ -542,36 +554,44 @@ fn advance_to_imp_kill(
     poison_target: SeatId,
     monk_target: Option<SeatId>,
 ) {
-    // Poisoner
-    let p = g.pending_night.as_ref().expect("pending");
-    assert!(matches!(p.step, NightStep::Poisoner { .. }));
-    night_action(
-        g,
-        &tokens[p.seat.0 as usize],
-        NightActionPayload::PickOne {
-            target: poison_target,
-        },
-    )
-    .unwrap();
-    // Monk
-    let p = g.pending_night.as_ref().expect("monk pending");
-    assert!(matches!(p.step, NightStep::Monk { .. }));
-    if let Some(t) = monk_target {
-        night_action(
-            g,
-            &tokens[p.seat.0 as usize],
-            NightActionPayload::PickOne { target: t },
-        )
-        .unwrap();
-    } else {
-        skip_night_action(g, host).unwrap();
+    loop {
+        if g.pending_host.is_some() {
+            skip_night_action(g, host).unwrap();
+            continue;
+        }
+        let Some(p) = g.pending_night.clone() else {
+            panic!("no pending {:?}", g.phase);
+        };
+        match p.step {
+            NightStep::Poisoner { seat } => {
+                night_action(
+                    g,
+                    &tokens[seat.0 as usize],
+                    NightActionPayload::PickOne {
+                        target: poison_target,
+                    },
+                )
+                .unwrap();
+            }
+            NightStep::Monk { seat } => {
+                if let Some(t) = monk_target {
+                    night_action(
+                        g,
+                        &tokens[seat.0 as usize],
+                        NightActionPayload::PickOne { target: t },
+                    )
+                    .unwrap();
+                } else {
+                    skip_night_action(g, host).unwrap();
+                }
+            }
+            NightStep::DemonKill { seat: SeatId(1) } => break,
+            NightStep::DemonKill { seat } => {
+                panic!("expected Imp seat 1 DemonKill, got {seat:?}");
+            }
+            _ => skip_night_action(g, host).unwrap(),
+        }
     }
-    let p = g.pending_night.as_ref().expect("imp pending");
-    assert!(
-        matches!(p.step, NightStep::DemonKill { seat: SeatId(1) }),
-        "expected Imp kill, got {:?}",
-        p.step
-    );
 }
 
 #[test]
@@ -642,7 +662,9 @@ fn imp_starpass_transfers_to_minion() {
         )),
         "new Imp must receive YouAre Imp: {msgs:?}"
     );
-    // Game continues (living Imp exists). Night may auto-advance past Empath/Dawn.
+    // Finish remaining night info (host-first pauses) through dawn.
+    finish_pending(&mut g, &host);
+    // Game continues (living Imp exists).
     assert!(g.winner.is_none());
     assert!(!matches!(g.phase, Phase::Ended { .. }));
     // Public death list (after dawn) includes old Imp, never roles.
@@ -740,21 +762,16 @@ fn spy_night_returns_true_grimoire_when_not_disabled() {
     let lobby = Game::create(five_names(), 21).unwrap();
     let host = lobby.host_token.clone();
     let mut g = lobby.game;
-    g.start_game(
-        &host,
-        StartOpts {
-            assignments: Some(vec![
-                RoleAssignment::normal(SeatId(0), Character::Spy),
-                RoleAssignment::normal(SeatId(1), Character::Imp),
-                RoleAssignment::normal(SeatId(2), Character::Soldier),
-                RoleAssignment::normal(SeatId(3), Character::Chef),
-                RoleAssignment::normal(SeatId(4), Character::Empath),
-            ]),
-                ..Default::default()
-            },
-    )
-    .unwrap();
-    // No choice roles → Spy auto-resolves on first night.
+    let mut opts = random_st();
+    opts.assignments = Some(vec![
+        RoleAssignment::normal(SeatId(0), Character::Spy),
+        RoleAssignment::normal(SeatId(1), Character::Imp),
+        RoleAssignment::normal(SeatId(2), Character::Soldier),
+        RoleAssignment::normal(SeatId(3), Character::Chef),
+        RoleAssignment::normal(SeatId(4), Character::Empath),
+    ]);
+    g.start_game(&host, opts).unwrap();
+    // Random ST mode: Spy auto-resolves on first night.
     let results = night_results_for(&g, SeatId(0));
     let grimoire = results
         .iter()
@@ -780,20 +797,20 @@ fn fortune_teller_rejects_same_seat_twice() {
     let host = lobby.host_token.clone();
     let tokens = lobby.player_tokens.clone();
     let mut g = lobby.game;
-    g.start_game(
-        &host,
-        StartOpts {
-            assignments: Some(vec![
-                RoleAssignment::normal(SeatId(0), Character::FortuneTeller),
-                RoleAssignment::normal(SeatId(1), Character::Imp),
-                RoleAssignment::normal(SeatId(2), Character::Soldier),
-                RoleAssignment::normal(SeatId(3), Character::Chef),
-                RoleAssignment::normal(SeatId(4), Character::Soldier),
-            ]),
-                ..Default::default()
-            },
-    )
-    .unwrap();
+    let mut opts = random_st();
+    opts.assignments = Some(vec![
+        RoleAssignment::normal(SeatId(0), Character::FortuneTeller),
+        RoleAssignment::normal(SeatId(1), Character::Imp),
+        RoleAssignment::normal(SeatId(2), Character::Soldier),
+        RoleAssignment::normal(SeatId(3), Character::Chef),
+        RoleAssignment::normal(SeatId(4), Character::Soldier),
+    ]);
+    g.start_game(&host, opts).unwrap();
+    while g.pending_night.as_ref().map(|p| &p.step)
+        != Some(&NightStep::FortuneTeller { seat: SeatId(0) })
+    {
+        skip_night_action(&mut g, &host).unwrap();
+    }
     let p = g.pending_night.as_ref().expect("FT pending");
     assert!(matches!(p.step, NightStep::FortuneTeller { seat: SeatId(0) }));
     let err = night_action(
