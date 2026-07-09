@@ -7,7 +7,7 @@ use crate::game::ids::SeatId;
 use crate::game::phase::{DayStage, EndReason, Phase, Winner};
 use crate::game::state::Game;
 use crate::game::win::{apply_demon_death, end_game, living_count as win_living_count, win_check};
-use crate::roles::{Character, CharacterType};
+use crate::roles::Character;
 
 /// In-progress nomination with open vote window.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,32 +131,32 @@ pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameE
         return Err(GameError::IllegalAction("target already nominated today"));
     }
 
-    // Snapshot virgin / type before mutating.
-    let virgin_active = nominee.true_character == Some(Character::Virgin)
-        && !nominee.virgin_ability_used
-        && !nominee.ability_disabled();
-    // Spec §10: Virgin checks true character type of nominator (Drunk is Outsider).
-    let nominator_is_townsfolk = nominator
-        .true_character
-        .is_some_and(|c| c.character_type() == CharacterType::Townsfolk);
+    // Virgin: first nomination always spends the once-per-game ability, even if poisoned/drunk.
+    // Execution only if ability is active AND nominator registers as Townsfolk (Spy may).
+    let is_virgin_first_nom = nominee.true_character == Some(Character::Virgin)
+        && !nominee.virgin_ability_used;
+    let virgin_disabled = nominee.ability_disabled();
+    let virgin_label = format!("virgin_reg:day:nom:{}", by.0);
+    let nominator_registers_townsfolk =
+        crate::game::ability::register::registers_as_townsfolk(game, by, &virgin_label);
 
     game.day_nominators.push(by);
     game.day_nominees.push(target);
     game.public_log
         .push(PublicEvent::Nominated { by, target });
 
-    if virgin_active {
+    if is_virgin_first_nom {
         if let Ok(s) = seat_mut(game, target) {
             s.virgin_ability_used = true;
         }
-        if nominator_is_townsfolk {
+        if !virgin_disabled && nominator_registers_townsfolk {
             // Immediate execution of nominator — day's execution, no vote.
             game.st_announce("The Virgin's power triggers. The nominator is executed.");
             resolve_execution(game, by);
             // Day's execution is done; nominations effectively closed for further executions.
             return Ok(());
         }
-        // Non-Townsfolk nominator: ability spent, vote proceeds.
+        // Disabled, or nominator does not register as Townsfolk: ability spent, vote proceeds.
     }
 
     game.current_nomination = Some(OpenNomination {
@@ -229,8 +229,9 @@ pub fn vote(game: &mut Game, seat: SeatId, nominee: SeatId, support: bool) -> Re
         open.votes.push((seat, support));
     }
 
-    // Auto-close when every living seat has cast a vote.
-    if all_living_have_voted(game) {
+    // Auto-close only when every living seat has voted AND every dead seat that still has
+    // a ghost vote available has also cast a vote (yes or no) on this nomination.
+    if nomination_ready_to_auto_close(game) {
         close_vote_inner(game)?;
     }
     Ok(())
@@ -243,6 +244,21 @@ fn all_living_have_voted(game: &Game) -> bool {
     game.seats
         .iter()
         .filter(|s| s.alive)
+        .all(|s| open.votes.iter().any(|(id, _)| *id == s.id))
+}
+
+/// Living all voted, and every dead seat with remaining ghost vote has cast (yes or no).
+/// Dead without ghost vote remaining are skipped. Host [`close_vote`] may still force-close.
+fn nomination_ready_to_auto_close(game: &Game) -> bool {
+    let Some(open) = game.current_nomination.as_ref() else {
+        return false;
+    };
+    if !all_living_have_voted(game) {
+        return false;
+    }
+    game.seats
+        .iter()
+        .filter(|s| !s.alive && s.ghost_vote_available)
         .all(|s| open.votes.iter().any(|(id, _)| *id == s.id))
 }
 
