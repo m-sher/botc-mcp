@@ -1,5 +1,7 @@
+use botc_mcp::error::{GameError, ToolError};
 use botc_mcp::game::{Game, RoleAssignment, SeatId, StartOpts};
 use botc_mcp::roles::Character;
+use botc_mcp::tools;
 
 fn five_names() -> Vec<String> {
     vec![
@@ -36,7 +38,7 @@ fn fixture_assigned_drunk() -> Game {
 fn drunk_private_state_never_says_drunk() {
     let g = fixture_assigned_drunk();
     let tok = g.tokens.player_token(SeatId(0)).unwrap().clone();
-    let view = botc_mcp::tools::get_private_state(&g, &tok, 0).unwrap();
+    let view = tools::get_private_state(&g, &tok, 0).unwrap();
     assert_eq!(view.character_label.as_deref(), Some("Empath"));
     assert_ne!(view.character_label.as_deref(), Some("Drunk"));
     let dump = format!("{view:?}").to_lowercase();
@@ -46,6 +48,57 @@ fn drunk_private_state_never_says_drunk() {
     );
     assert_eq!(g.seats[0].true_character, Some(Character::Drunk));
     assert_eq!(g.seats[0].believed_character, Some(Character::Empath));
+}
+
+#[test]
+fn player_forbidden_from_host_state() {
+    let g = fixture_assigned_drunk();
+    let player_tok = g.tokens.player_token(SeatId(0)).unwrap().clone();
+    let err = tools::get_host_state(&g, &player_tok).unwrap_err();
+    assert!(matches!(
+        err,
+        ToolError::Unauthorized | ToolError::Game(GameError::Unauthorized)
+    ));
+}
+
+#[test]
+fn host_state_shows_true_roles_including_drunk() {
+    let g = fixture_assigned_drunk();
+    let host = g.tokens.host_token().unwrap().clone();
+    let view = tools::get_host_state(&g, &host).unwrap();
+    assert_eq!(view.seed, 99);
+    let s0 = view.seats.iter().find(|s| s.seat_id == SeatId(0)).unwrap();
+    assert_eq!(s0.true_character, Some("Drunk"));
+    assert_eq!(s0.believed_character, Some("Empath"));
+    assert!(s0.is_drunk_outsider);
+}
+
+#[test]
+fn get_character_rules_loads_markdown() {
+    let rules = tools::get_character_rules(Character::Monk).unwrap();
+    assert_eq!(rules.name, "Monk");
+    assert!(rules.path.contains("monk.md"));
+    assert!(rules.text.contains("Monk"));
+    assert!(rules.text.contains("safe") || rules.text.contains("Demon"));
+}
+
+#[test]
+fn public_state_omits_pending_night_seat() {
+    let g = fixture_assigned_drunk();
+    let player = g.tokens.player_token(SeatId(0)).unwrap().clone();
+    let pub_view = tools::get_public_state(&g, &player).unwrap();
+    let dump = format!("{pub_view:?}");
+    // Must not leak which seat is pending a night action.
+    assert!(
+        !dump.to_lowercase().contains("pending"),
+        "public state must not include pending wake: {dump}"
+    );
+    // Host may still see pending.
+    let host = g.tokens.host_token().unwrap().clone();
+    let host_view = tools::get_host_state(&g, &host).unwrap();
+    // First night should have some pending or at least grimoire seats.
+    assert_eq!(host_view.seats.len(), 5);
+    let _ = host_view.pending; // available field for host only
 }
 
 #[test]

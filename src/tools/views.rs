@@ -1,0 +1,86 @@
+//! Tool-layer view DTOs (public / private / host / character rules).
+
+use crate::comms::{EventId, PrivateMessage};
+use crate::game::{ChoiceSchema, PublicSeatView, SeatId, Winner};
+
+/// Public table snapshot — no roles, no pending night seat identity.
+#[derive(Debug, Clone)]
+pub struct PublicStateView {
+    pub phase: String,
+    pub seats: Vec<PublicSeatView>,
+    pub winner: Option<Winner>,
+}
+
+/// Structured “you must act” info (acting seat only; never leaks other seats’ wakes).
+#[derive(Debug, Clone)]
+pub struct AwaitingView {
+    pub action: &'static str,
+    pub prompt: String,
+    pub schema: ChoiceSchema,
+}
+
+/// Player-facing private snapshot. Must never expose Drunk as `character_label`.
+#[derive(Debug)]
+pub struct PrivateStateView {
+    pub seat: SeatId,
+    pub name: String,
+    pub alive: bool,
+    /// Character the player should play as (Drunk → Townsfolk face only).
+    pub character_label: Option<String>,
+    pub team_label: Option<String>,
+    pub rules_path: Option<String>,
+    pub private_messages_since: Vec<(EventId, PrivateMessage)>,
+    /// True only when this seat has a pending night (or later day) action.
+    pub awaiting_action: bool,
+    /// Details for the pending action; `None` unless this seat must act.
+    pub awaiting: Option<AwaitingView>,
+}
+
+/// One seat in the host grimoire (true roles + markers).
+#[derive(Debug, Clone)]
+pub struct HostSeatView {
+    pub seat_id: SeatId,
+    pub name: String,
+    pub alive: bool,
+    pub ghost_vote_available: bool,
+    pub true_character: Option<&'static str>,
+    pub believed_character: Option<&'static str>,
+    pub poisoned: bool,
+    pub is_drunk_outsider: bool,
+    pub monk_protected_tonight: bool,
+    pub slayer_used: bool,
+    pub virgin_ability_used: bool,
+    pub butler_master: Option<SeatId>,
+}
+
+/// Pending wake as seen by the host (includes acting seat — not public).
+#[derive(Debug, Clone)]
+pub struct HostPendingView {
+    pub seat_id: SeatId,
+    pub prompt: String,
+    pub schema: ChoiceSchema,
+    pub step_debug: String,
+}
+
+/// Host-only full grimoire + pending + seed (eval/debug).
+#[derive(Debug, Clone)]
+pub struct HostStateView {
+    pub seed: u64,
+    pub phase: String,
+    pub seats: Vec<HostSeatView>,
+    pub pending: Option<HostPendingView>,
+    pub red_herring: Option<SeatId>,
+    pub demon_bluffs: Vec<&'static str>,
+    pub winner: Option<Winner>,
+}
+
+/// Public character sheet entry with loaded markdown body.
+#[derive(Debug, Clone)]
+pub struct CharacterRulesView {
+    pub name: &'static str,
+    pub path: &'static str,
+    pub team: String,
+    pub character_type: String,
+    /// Full markdown from `docs/roles/...`.
+    pub text: String,
+}

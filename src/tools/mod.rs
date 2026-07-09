@@ -3,14 +3,19 @@
 //! Transport (JSON-RPC / rmcp / etc.) is not wired yet. These functions are the
 //! semantic API the MCP layer should call after deserializing arguments.
 
-use crate::auth::{Actor, Token};
-use crate::comms::{EventId, PrivateMessage, PublicEvent};
-use crate::error::GameError;
-use crate::game::SeatId;
-use crate::game::{
-    ChoiceSchema, CreateGameResult, Game, GameId, NightActionPayload, PublicSeatView, StartOpts,
-    Winner,
+mod rules_text;
+mod views;
+
+pub use rules_text::{load_character_rules_text, rules_markdown_path};
+pub use views::{
+    AwaitingView, CharacterRulesView, HostPendingView, HostSeatView, HostStateView,
+    PrivateStateView, PublicStateView,
 };
+
+use crate::auth::{Actor, Token};
+use crate::comms::{EventId, PublicEvent};
+use crate::error::GameError;
+use crate::game::{CreateGameResult, Game, GameId, NightActionPayload, SeatId, StartOpts};
 use crate::roles::Character;
 use crate::store::GameStore;
 
@@ -74,44 +79,15 @@ pub fn create_game_in_memory(names: Vec<String>, seed: u64) -> CreateGameRespons
     create_game(&mut store, names, seed).expect("create_game_in_memory: valid player count 5–15")
 }
 
-#[derive(Debug)]
-pub struct PublicStateView {
-    pub phase: String,
-    pub seats: Vec<PublicSeatView>,
-    pub winner: Option<Winner>,
-}
-
-/// Structured “you must act” info (acting seat only; never leaks other seats’ wakes).
-#[derive(Debug, Clone)]
-pub struct AwaitingView {
-    pub action: &'static str,
-    pub prompt: String,
-    pub schema: ChoiceSchema,
-}
-
-/// Player-facing private snapshot. Must never expose Drunk as `character_label`.
-#[derive(Debug)]
-pub struct PrivateStateView {
-    pub seat: SeatId,
-    pub name: String,
-    pub alive: bool,
-    /// Character the player should play as (Drunk → Townsfolk face only).
-    pub character_label: Option<String>,
-    pub team_label: Option<String>,
-    pub rules_path: Option<String>,
-    pub private_messages_since: Vec<(EventId, PrivateMessage)>,
-    /// True only when this seat has a pending night (or later day) action.
-    pub awaiting_action: bool,
-    /// Details for the pending action; `None` unless this seat must act.
-    pub awaiting: Option<AwaitingView>,
-}
-
 /// Host locks lobby, assigns bag, enters First Night (and runs [`Game::night_tick`]).
 pub fn start_game(game: &mut Game, host: &Token, opts: StartOpts) -> Result<(), ToolError> {
     game.start_game(host, opts).map_err(ToolError::from)
 }
 
-/// Host or player: public snapshot (no roles).
+/// Host or player: public snapshot (no roles, **no** pending night seat).
+///
+/// Night order leakage: pending wake seat is **not** returned here. The acting
+/// seat sees it via [`get_private_state`]; the host via [`get_host_state`].
 pub fn get_public_state(game: &Game, token: &Token) -> Result<PublicStateView, ToolError> {
     game.tokens.resolve(token).ok_or(ToolError::Unauthorized)?;
     Ok(PublicStateView {
@@ -183,6 +159,54 @@ pub fn get_private_state(
     })
 }
 
+/// Host only: full grimoire (true roles), pending wake, seed.
+pub fn get_host_state(game: &Game, token: &Token) -> Result<HostStateView, ToolError> {
+    match game.tokens.resolve(token) {
+        Some(Actor::Host) => {}
+        Some(Actor::Player { .. }) | None => return Err(ToolError::Unauthorized),
+    }
+
+    let seats = game
+        .seats
+        .iter()
+        .map(|s| HostSeatView {
+            seat_id: s.id,
+            name: s.display_name.clone(),
+            alive: s.alive,
+            ghost_vote_available: s.ghost_vote_available,
+            true_character: s.true_character.map(|c| c.display_name()),
+            believed_character: s.believed_character.map(|c| c.display_name()),
+            poisoned: s.poisoned,
+            is_drunk_outsider: s.is_drunk_outsider,
+            monk_protected_tonight: s.monk_protected_tonight,
+            slayer_used: s.slayer_used,
+            virgin_ability_used: s.virgin_ability_used,
+            butler_master: s.butler_master,
+        })
+        .collect();
+
+    let pending = game.pending_night.as_ref().map(|p| HostPendingView {
+        seat_id: p.seat,
+        prompt: p.prompt.clone(),
+        schema: p.schema.clone(),
+        step_debug: format!("{:?}", p.step),
+    });
+
+    Ok(HostStateView {
+        seed: game.seed,
+        phase: format!("{:?}", game.phase),
+        seats,
+        pending,
+        red_herring: game.red_herring,
+        demon_bluffs: game
+            .demon_bluffs
+            .iter()
+            .map(|c| c.display_name())
+            .collect(),
+        winner: game.winner,
+    })
+}
+
 /// Player speech → public log only. No `to` / whisper args.
 pub fn say(game: &mut Game, token: &Token, text: String) -> Result<EventId, ToolError> {
     let actor = game.tokens.resolve(token).ok_or(ToolError::Unauthorized)?;
@@ -190,7 +214,7 @@ pub fn say(game: &mut Game, token: &Token, text: String) -> Result<EventId, Tool
         Actor::Player { seat } => seat,
         Actor::Host => {
             return Err(ToolError::BadRequest(
-                "players use say; host uses storyteller announce",
+                "players use say; host uses st_announce",
             ));
         }
     };
@@ -198,21 +222,26 @@ pub fn say(game: &mut Game, token: &Token, text: String) -> Result<EventId, Tool
     Ok(game.public_log.since(0).last().map(|(id, _)| *id).unwrap_or(0))
 }
 
-/// Public character sheet entry (ability text path). Not secret.
-pub fn get_character_rules(character: Character) -> CharacterRulesView {
-    CharacterRulesView {
+/// Host: public storyteller announcement.
+pub fn st_announce(game: &mut Game, host: &Token, text: String) -> Result<EventId, ToolError> {
+    match game.tokens.resolve(host) {
+        Some(Actor::Host) => {}
+        _ => return Err(ToolError::Unauthorized),
+    }
+    game.st_announce(text);
+    Ok(game.public_log.since(0).last().map(|(id, _)| *id).unwrap_or(0))
+}
+
+/// Public character sheet entry (ability text loaded from docs). Not secret.
+pub fn get_character_rules(character: Character) -> Result<CharacterRulesView, ToolError> {
+    let text = load_character_rules_text(character)?;
+    Ok(CharacterRulesView {
         name: character.display_name(),
         path: character.rules_doc_path(),
         team: format!("{:?}", character.team()),
         character_type: format!("{:?}", character.character_type()),
-    }
-}
-
-pub struct CharacterRulesView {
-    pub name: &'static str,
-    pub path: &'static str,
-    pub team: String,
-    pub character_type: String,
+        text,
+    })
 }
 
 pub fn night_action(
