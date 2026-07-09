@@ -152,7 +152,8 @@ impl App {
     }
 
     fn launch(&mut self) {
-        if self.agents.is_some() {
+        // #55: also gate on socket — a failed prior launch may have left socket=Some.
+        if self.agents.is_some() || self.socket.is_some() {
             self.status = "Already launched — restart the TUI for a new table.".into();
             return;
         }
@@ -191,10 +192,10 @@ impl App {
             }
         }
 
-        {
+        let start_err = {
             let mut st = self.store.lock().unwrap();
             let g = st.get_mut(GameId(game_id)).unwrap();
-            if let Err(e) = tools::start_game(
+            tools::start_game(
                 g,
                 &created.host_token,
                 StartOpts {
@@ -205,10 +206,14 @@ impl App {
                     },
                     ..Default::default()
                 },
-            ) {
-                self.status = format!("start_game: {e}");
-                return;
-            }
+            )
+            .err()
+        };
+        if let Some(e) = start_err {
+            self.status = format!("start_game: {e}");
+            // #55/#58: roll back partial launch state (socket + work_root).
+            self.abort_partial_launch();
+            return;
         }
 
         self.game_id = Some(game_id);
@@ -245,11 +250,26 @@ impl App {
                     self.agents = Some(pool);
                 }
                 Err(e) => {
+                    // Partial pool still owns workdirs — keep it so shutdown/stop_all cleans up.
                     self.status = format!("kickoff: {e}");
                     self.agents = Some(pool);
                 }
             },
-            Err(e) => self.status = format!("prepare: {e}"),
+            Err(e) => {
+                self.status = format!("prepare: {e}");
+                // #55/#58: socket + partial work_root without agents.
+                self.abort_partial_launch();
+            }
+        }
+    }
+
+    /// Tear down socket + work_root after a launch that never got a live AgentPool (#55/#58).
+    fn abort_partial_launch(&mut self) {
+        if let Some(s) = self.socket.take() {
+            s.stop();
+        }
+        if self.cfg.work_root.exists() {
+            let _ = std::fs::remove_dir_all(&self.cfg.work_root);
         }
     }
 
@@ -371,9 +391,13 @@ impl App {
         if let Some(mut pool) = self.agents.take() {
             pool.stop_all();
         }
-        // Then stop socket (non-blocking accept survives missing path).
+        // Then stop socket (non-blocking accept; inode-safe remove).
         if let Some(s) = self.socket.take() {
             s.stop();
+        }
+        // #58: even if agents never built (failed launch), remove work_root/tokens.
+        if self.cfg.work_root.exists() {
+            let _ = std::fs::remove_dir_all(&self.cfg.work_root);
         }
     }
 }
@@ -386,7 +410,21 @@ struct TerminalGuard {
 
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
+        // #57: enable raw mode first, then finish setup under a restore-on-err path
+        // so a later failure cannot leave the terminal in raw mode without a guard.
         enable_raw_mode()?;
+        match Self::enter_after_raw() {
+            Ok(g) => Ok(g),
+            Err(e) => {
+                let _ = disable_raw_mode();
+                let mut out = io::stdout();
+                let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen);
+                Err(e)
+            }
+        }
+    }
+
+    fn enter_after_raw() -> io::Result<Self> {
         let mut stdout = io::stdout();
         // Capture mouse so the terminal delivers wheel/trackpad as Event::Mouse
         // (which we ignore) instead of synthesizing Enter/Space/arrow keypresses.

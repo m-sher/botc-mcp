@@ -1,6 +1,7 @@
 //! Unix-socket JSON-line RPC so many MCP proxies share one engine process.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,9 +34,32 @@ pub struct RpcResponse {
     pub error: Option<String>,
 }
 
+/// Identity of the socket file we bound, so cleanup never unlinks a rebound peer's path (#55).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SockId {
+    dev: u64,
+    ino: u64,
+}
+
+fn sock_id_of(path: &Path) -> Option<SockId> {
+    let m = std::fs::metadata(path).ok()?;
+    Some(SockId {
+        dev: m.dev(),
+        ino: m.ino(),
+    })
+}
+
+fn remove_if_ours(path: &Path, id: SockId) {
+    if sock_id_of(path) == Some(id) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Background accept-loop serving tool RPCs on a Unix domain socket.
 pub struct SocketServer {
     path: PathBuf,
+    /// Bound socket inode; only remove path if it still matches (#55).
+    sock_id: SockId,
     stop: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
 }
@@ -50,6 +74,9 @@ impl SocketServer {
             std::fs::create_dir_all(parent)?;
         }
         let listener = UnixListener::bind(&path)?;
+        let sock_id = sock_id_of(&path).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "socket metadata missing after bind")
+        })?;
         // Non-blocking accept so stop()/Drop never deadlocks if the socket file
         // is unlinked or rebound (#48). We poll with a short sleep + stop flag.
         listener.set_nonblocking(true)?;
@@ -68,7 +95,6 @@ impl SocketServer {
                         });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // Idle — check stop flag frequently without blocking forever.
                         thread::sleep(Duration::from_millis(50));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
@@ -83,10 +109,12 @@ impl SocketServer {
                     }
                 }
             }
-            let _ = std::fs::remove_file(path_c);
+            // #55: only unlink if this path is still *our* socket inode.
+            remove_if_ours(&path_c, sock_id);
         });
         Ok(Self {
             path,
+            sock_id,
             stop,
             join: Some(join),
         })
@@ -98,13 +126,12 @@ impl SocketServer {
 
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        // Best-effort nudge (non-blocking loop also wakes via timeout).
         let _ = UnixStream::connect(&self.path);
         if let Some(j) = self.join.take() {
-            // Join with a soft timeout mindset: nonblocking accept will exit
-            // within ~50ms of the stop flag. Still join fully so clients drain.
             let _ = j.join();
         }
+        // Accept thread already tried remove_if_ours; Drop path needs it too if join raced.
+        remove_if_ours(&self.path, self.sock_id);
     }
 }
 
@@ -115,12 +142,11 @@ impl Drop for SocketServer {
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
-        let _ = std::fs::remove_file(&self.path);
+        remove_if_ours(&self.path, self.sock_id);
     }
 }
 
 fn handle_client(store: SharedStore, stream: UnixStream) -> std::io::Result<()> {
-    // Accepted sockets should be blocking for line-oriented RPC.
     stream.set_nonblocking(false)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
@@ -258,7 +284,6 @@ mod tests {
     use crate::mcp_server;
     use std::time::Instant;
 
-    /// #48: stop must not hang if the socket file is unlinked under us.
     #[test]
     fn stop_after_socket_unlinked_does_not_deadlock() {
         let store = mcp_server::new_shared_store();
@@ -268,7 +293,6 @@ mod tests {
         ));
         let server = SocketServer::start(store, &path).expect("bind");
         assert!(path.exists());
-        // Simulate tmp reaper / second instance: remove the path while accept is running.
         std::fs::remove_file(&path).expect("unlink");
         let start = Instant::now();
         server.stop();
@@ -276,5 +300,32 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "stop() hung after socket unlink"
         );
+    }
+
+    /// #55: dropping an older server must not unlink a rebound peer's live socket.
+    #[test]
+    fn drop_old_server_does_not_unlink_rebound_socket() {
+        let store_a = mcp_server::new_shared_store();
+        let store_b = mcp_server::new_shared_store();
+        let path = std::env::temp_dir().join(format!(
+            "botc-sock-rebind-{}.sock",
+            uuid::Uuid::new_v4()
+        ));
+        let a = SocketServer::start(store_a, &path).expect("bind a");
+        let b = SocketServer::start(store_b, &path).expect("bind b (rebind)");
+        assert!(path.exists());
+        // Drop A: must not remove B's live socket path.
+        drop(a);
+        assert!(
+            path.exists(),
+            "rebound socket path was unlinked by old server Drop (#55)"
+        );
+        let client = SocketClient::connect(&path);
+        assert!(
+            client.is_ok(),
+            "connect to rebound socket failed after drop(A): {:?}",
+            client.err()
+        );
+        drop(b);
     }
 }

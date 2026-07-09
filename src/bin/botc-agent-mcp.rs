@@ -138,8 +138,11 @@ fn handle_line(
                 .map_err(|e| (-32000_i64, e))
         }
         other => {
-            // Unknown top-level method (not tools/call) — Method not found.
-            if other.starts_with("tools/") || other.is_empty() {
+            // #54: namespaced MCP methods (resources/list, prompts/list, …) are
+            // not tools — answer Method not found locally. Never forward them as
+            // bogus tool calls (ACL would allow them and the engine would return
+            // a tools/call-shaped success with isError).
+            if other.is_empty() || other.contains('/') {
                 Err((-32601, format!("method not found: {other}")))
             } else if !proxy_acl::tool_allowed(other, is_host) {
                 // Legacy bare-tool dispatch denied by ACL → Invalid params.

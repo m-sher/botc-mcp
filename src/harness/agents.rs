@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -397,15 +398,22 @@ fn spawn_grok_tick(
     let session_started_flag = Arc::clone(&agent.session_started);
     let session_id_slot = Arc::clone(&agent.session_id);
     let child_slot = Arc::clone(&agent.child);
+    // #56: grok exits 1 on normal --max-turns; gate resume on stream evidence of a
+    // real session (end / max_turns_reached), not process exit code.
+    let session_established = Arc::new(AtomicBool::new(false));
     *running_flag.lock().unwrap() = true;
 
     if let Some(stdout) = child.stdout.take() {
         let log = Arc::clone(&log);
+        let established = Arc::clone(&session_established);
         thread::spawn(move || {
             use std::io::BufRead;
             let reader = std::io::BufReader::new(stdout);
             let mut asm = StreamAssembler::default();
             for line in reader.lines().flatten() {
+                if stream_line_establishes_session(&line) {
+                    established.store(true, Ordering::SeqCst);
+                }
                 for piece in asm.push_line(&line) {
                     push_log_line(&log, piece);
                 }
@@ -428,21 +436,46 @@ fn spawn_grok_tick(
 
     child_slot.store(child);
 
-    // Waiter: set session_started only on success; regenerate id on failed first run (#47).
+    // Waiter: session_started from stream evidence (#47/#56), not exit code alone.
     let child_slot_w = Arc::clone(&child_slot);
     thread::spawn(move || {
-        let status = child_slot_w.wait_exit();
-        let ok = status.map(|s| s.success()).unwrap_or(false);
-        if ok {
+        let _status = child_slot_w.wait_exit();
+        // stdout reader may still be finishing; give it a brief moment.
+        for _ in 0..10 {
+            if session_established.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let established = session_established.load(Ordering::SeqCst);
+        if established {
             *session_started_flag.lock().unwrap() = true;
         } else if !*session_started_flag.lock().unwrap() {
-            // First run never succeeded — next tick uses a fresh --session-id.
+            // No session was created (auth/spawn death) — next tick uses a fresh --session-id.
             *session_id_slot.lock().unwrap() = uuid::Uuid::new_v4().to_string();
         }
         *running_flag.lock().unwrap() = false;
     });
 
     Ok(TickOutcome::Spawned)
+}
+
+/// True if a streaming-json line means grok created/used a session (#56).
+///
+/// `max_turns_reached` and `end` both mean the session is on disk and resumable,
+/// even when the process exits non-zero.
+pub fn stream_line_establishes_session(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+    matches!(
+        v.get("type").and_then(|t| t.as_str()),
+        Some("end") | Some("max_turns_reached")
+    )
 }
 
 fn push_log_line(log: &Mutex<Vec<String>>, msg: String) {
@@ -660,6 +693,32 @@ mod tests {
             let c = args.iter().filter(|a| a.as_str() == flag).count();
             assert!(c <= 1, "flag {flag} appears {c} times: {args:?}");
         }
+    }
+
+    #[test]
+    fn max_turns_stream_establishes_session() {
+        // #56: exit 1 on max-turns still means the session exists and is resumable.
+        assert!(stream_line_establishes_session(
+            r#"{"type":"max_turns_reached"}"#
+        ));
+        assert!(stream_line_establishes_session(
+            r#"{"type":"end","stopReason":"Cancelled","sessionId":"x"}"#
+        ));
+        assert!(!stream_line_establishes_session(
+            r#"{"type":"error","message":"auth failed"}"#
+        ));
+        assert!(!stream_line_establishes_session("not json"));
+        // After establish, next tick must use --resume.
+        let cfg = HarnessConfig::default();
+        let args = build_grok_tick_args(
+            &cfg,
+            Path::new("/tmp/wd"),
+            Path::new("/tmp/wd/prompt.txt"),
+            "11111111-1111-1111-1111-111111111111",
+            true, // session_started after max-turns establish
+        );
+        assert!(args.contains(&"--resume".into()));
+        assert!(!args.contains(&"--session-id".into()));
     }
 
     #[test]
