@@ -8,7 +8,7 @@ use crate::comms::{EventId, PrivateMessage, PublicEvent};
 use crate::error::GameError;
 use crate::game::Phase;
 use crate::game::SeatId;
-use crate::game::{CreateGameResult, Game, GameId, PublicSeatView, Winner};
+use crate::game::{CreateGameResult, Game, GameId, PublicSeatView, StartOpts, Winner};
 use crate::roles::Character;
 use crate::store::GameStore;
 
@@ -72,22 +72,30 @@ pub fn create_game_in_memory(names: Vec<String>, seed: u64) -> CreateGameRespons
     create_game(&mut store, names, seed).expect("create_game_in_memory: valid player count 5–15")
 }
 
+#[derive(Debug)]
 pub struct PublicStateView {
     pub phase: String,
     pub seats: Vec<PublicSeatView>,
     pub winner: Option<Winner>,
 }
 
+/// Player-facing private snapshot. Must never expose Drunk as `character_label`.
+#[derive(Debug)]
 pub struct PrivateStateView {
     pub seat: SeatId,
     pub name: String,
     pub alive: bool,
-    /// Character the player should play as (Drunk face when implemented).
+    /// Character the player should play as (Drunk → Townsfolk face only).
     pub character_label: Option<String>,
     pub team_label: Option<String>,
     pub rules_path: Option<String>,
     pub private_messages_since: Vec<(EventId, PrivateMessage)>,
     pub awaiting_action: bool,
+}
+
+/// Host locks lobby, assigns bag, enters First Night.
+pub fn start_game(game: &mut Game, host: &Token, opts: StartOpts) -> Result<(), ToolError> {
+    game.start_game(host, opts).map_err(ToolError::from)
 }
 
 /// Host or player: public snapshot (no roles).

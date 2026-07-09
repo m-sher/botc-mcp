@@ -34,3 +34,40 @@ impl Character {
         data::display_name(self)
     }
 }
+
+/// All 13 Trouble Brewing Townsfolk (script pool).
+pub fn all_townsfolk() -> &'static [Character] {
+    use Character::*;
+    &[
+        Washerwoman,
+        Librarian,
+        Investigator,
+        Chef,
+        Empath,
+        FortuneTeller,
+        Undertaker,
+        Monk,
+        Ravenkeeper,
+        Virgin,
+        Slayer,
+        Soldier,
+        Mayor,
+    ]
+}
+
+/// All 4 Trouble Brewing Outsiders.
+pub fn all_outsiders() -> &'static [Character] {
+    use Character::*;
+    &[Butler, Drunk, Recluse, Saint]
+}
+
+/// All 4 Trouble Brewing Minions.
+pub fn all_minions() -> &'static [Character] {
+    use Character::*;
+    &[Poisoner, Spy, ScarletWoman, Baron]
+}
+
+/// Demon pool (Imp only on TB).
+pub fn all_demons() -> &'static [Character] {
+    &[Character::Imp]
+}

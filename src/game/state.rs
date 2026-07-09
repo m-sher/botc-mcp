@@ -1,11 +1,12 @@
 //! `Game` aggregate: seats, phase, comms handles, win state.
 
-use crate::auth::{Token, TokenBook};
+use crate::auth::{Actor, Token, TokenBook};
 use crate::comms::{PrivateInboxes, PrivateMessage, PublicEvent, PublicLog};
 use crate::error::GameError;
 use crate::game::ids::{GameId, SeatId};
 use crate::game::phase::{NightStep, Phase};
 use crate::game::seat::Seat;
+use crate::game::setup::{build_bag, validate_fixed_assignments, StartOpts};
 use crate::rng::SeededRng;
 use crate::roles::{Character, CharacterType, Team};
 
@@ -184,7 +185,33 @@ impl Game {
             .and_then(|s| s.visible_character())
     }
 
+    /// Host-only start: build bag (or apply fixed assignments), brief seats, enter First Night.
+    pub fn start_game(&mut self, host: &Token, opts: StartOpts) -> Result<(), GameError> {
+        match self.tokens.resolve(host) {
+            Some(Actor::Host) => {}
+            _ => return Err(GameError::Unauthorized),
+        }
+        if !matches!(self.phase, Phase::Lobby) {
+            return Err(GameError::WrongPhase);
+        }
+
+        let n = self.seats.len() as u8;
+        let (assignments, red_herring, demon_bluffs) = if let Some(fixed) = opts.assignments {
+            validate_fixed_assignments(self.seats.len(), &fixed)?;
+            (fixed, None, Vec::new())
+        } else {
+            let bag = build_bag(&self.rng, n)?;
+            (bag.assignments, bag.red_herring, bag.demon_bluffs)
+        };
+
+        self.red_herring = red_herring;
+        self.demon_bluffs = demon_bluffs;
+        self.apply_assignments_and_brief(assignments)
+    }
+
     /// Assign characters and push private `YouAre` using **player-facing** identity only.
+    ///
+    /// Does not require host token (used by tests and as the final step of [`Self::start_game`]).
     pub fn start_game_assign(
         &mut self,
         assignments: Vec<RoleAssignment>,
@@ -205,7 +232,13 @@ impl Game {
                 ));
             }
         }
+        self.apply_assignments_and_brief(assignments)
+    }
 
+    fn apply_assignments_and_brief(
+        &mut self,
+        assignments: Vec<RoleAssignment>,
+    ) -> Result<(), GameError> {
         for a in &assignments {
             let seat = self
                 .seats

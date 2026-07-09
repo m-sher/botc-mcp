@@ -64,3 +64,36 @@ fn create_game_stores_seed_and_lobby_phase() {
     assert_eq!(out.players[0].seat_id, botc_mcp::game::SeatId(0));
     assert_eq!(out.players[5].name, "F");
 }
+
+#[test]
+fn composition_8() {
+    let c = botc_mcp::game::setup::composition(8);
+    assert_eq!((c.townsfolk, c.outsiders, c.minions, c.demons), (5, 1, 1, 1));
+}
+
+#[test]
+fn composition_table_matches_docs() {
+    use botc_mcp::game::setup::composition;
+    let expected = [
+        (5, 3, 0, 1, 1),
+        (6, 3, 1, 1, 1),
+        (7, 5, 0, 1, 1),
+        (8, 5, 1, 1, 1),
+        (9, 5, 2, 1, 1),
+        (10, 7, 0, 2, 1),
+        (11, 7, 1, 2, 1),
+        (12, 7, 2, 2, 1),
+        (13, 9, 0, 3, 1),
+        (14, 9, 1, 3, 1),
+        (15, 9, 2, 3, 1),
+    ];
+    for (n, tf, out, min, dem) in expected {
+        let c = composition(n);
+        assert_eq!(
+            (c.townsfolk, c.outsiders, c.minions, c.demons),
+            (tf, out, min, dem),
+            "n={n}"
+        );
+        assert_eq!(c.townsfolk + c.outsiders + c.minions + c.demons, n);
+    }
+}
