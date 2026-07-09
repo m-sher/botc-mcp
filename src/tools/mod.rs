@@ -228,14 +228,42 @@ pub fn skip_night_action(game: &mut Game, host: &Token) -> Result<(), ToolError>
     game.skip_night_action(host).map_err(ToolError::from)
 }
 
+/// Host: Discussion → Nominations.
+pub fn open_nominations(game: &mut Game, host: &Token) -> Result<(), ToolError> {
+    game.open_nominations(host).map_err(ToolError::from)
+}
+
+/// Player: nominate a living target (once per day each way).
 pub fn nominate(game: &mut Game, token: &Token, target: SeatId) -> Result<(), ToolError> {
     let actor = game.tokens.resolve(token).ok_or(ToolError::Unauthorized)?;
     let by = match actor {
         Actor::Player { seat } => seat,
         Actor::Host => return Err(ToolError::BadRequest("host cannot nominate")),
     };
-    // TODO: living, once/day, phase Nominations, Virgin, etc.
-    game.public_log
-        .push(PublicEvent::Nominated { by, target });
-    Ok(())
+    game.nominate(by, target).map_err(ToolError::from)
+}
+
+/// Player: cast yes/no on the open nomination (`nominee` must match current).
+pub fn vote(
+    game: &mut Game,
+    token: &Token,
+    nominee: SeatId,
+    support: bool,
+) -> Result<(), ToolError> {
+    let actor = game.tokens.resolve(token).ok_or(ToolError::Unauthorized)?;
+    let seat = match actor {
+        Actor::Player { seat } => seat,
+        Actor::Host => return Err(ToolError::BadRequest("host cannot vote")),
+    };
+    game.vote(seat, nominee, support).map_err(ToolError::from)
+}
+
+/// Host: close the current vote window (also auto-runs when all living have voted).
+pub fn close_vote(game: &mut Game, host: &Token) -> Result<(), ToolError> {
+    game.close_vote(host).map_err(ToolError::from)
+}
+
+/// Host: execute the vote leader (if any), then begin the next night if ongoing.
+pub fn end_nominations(game: &mut Game, host: &Token) -> Result<(), ToolError> {
+    game.end_nominations(host).map_err(ToolError::from)
 }

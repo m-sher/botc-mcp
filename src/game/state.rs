@@ -58,6 +58,14 @@ pub struct Game {
     pub deaths_tonight: Vec<SeatId>,
     /// Seat executed during the current day, if any (Undertaker eligibility).
     pub executed_today: Option<SeatId>,
+    /// Living seats that have already nominated today.
+    pub day_nominators: Vec<SeatId>,
+    /// Seats that have already been nominated today.
+    pub day_nominees: Vec<SeatId>,
+    /// Open nomination with in-progress vote window, if any.
+    pub current_nomination: Option<crate::game::day::OpenNomination>,
+    /// Closed nominations today (yes tallies for leader comparison).
+    pub closed_nominations: Vec<crate::game::day::ClosedNomination>,
 }
 
 /// Result of opening a lobby: host token + player tokens in seat order.
@@ -146,6 +154,10 @@ impl Game {
                 pending_night: None,
                 deaths_tonight: Vec::new(),
                 executed_today: None,
+                day_nominators: Vec::new(),
+                day_nominees: Vec::new(),
+                current_nomination: None,
+                closed_nominations: Vec::new(),
             },
             host_token,
             player_tokens,
@@ -292,6 +304,10 @@ impl Game {
 
         self.deaths_tonight.clear();
         self.executed_today = None;
+        self.day_nominators.clear();
+        self.day_nominees.clear();
+        self.current_nomination = None;
+        self.closed_nominations.clear();
         self.pending_night = None;
         self.night_queue = build_first_night_queue(self);
         self.night_cursor = 0;
