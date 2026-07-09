@@ -123,35 +123,29 @@ fn seats_of_type(game: &Game, ty: CharacterType) -> Vec<(SeatId, Character)> {
 
 /// Owners eligible for WW/Lib/Inv "correct" seat.
 ///
-/// True seats of `ty`, plus for Townsfolk: Spy may register as a Townsfolk with p=0.5
-/// (design §11.2 / §11.5) and become a valid correct-seat owner for that character.
+/// True seats of `ty`, plus Spy/Recluse registration via [`super::register`]:
+/// - Spy may register as Townsfolk or Outsider
+/// - Recluse may register as Minion (or Demon for Demon-typed detections)
 fn pair_owners(
     game: &Game,
     ty: CharacterType,
-    pool: &[Character],
+    stream: &str,
     rng: &mut impl Rng,
 ) -> Vec<(SeatId, Character)> {
-    let mut owners = seats_of_type(game, ty);
-    if ty == CharacterType::Townsfolk {
-        if let Some(spy_id) = game
-            .seats
-            .iter()
-            .find(|s| s.true_character == Some(Character::Spy))
-            .map(|s| s.id)
-        {
-            if rng.gen_bool(0.5) {
-                // Prefer an in-play Townsfolk token; else any from the townsfolk pool.
-                let character = if !owners.is_empty() {
-                    owners[rng.gen_range(0..owners.len())].1
-                } else if let Some(&c) = pool.choose(rng) {
-                    c
-                } else {
-                    Character::Soldier
-                };
-                owners.push((spy_id, character));
+    use super::register::register_as_type_owner;
+
+    let mut owners: Vec<(SeatId, Character)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for s in &game.seats {
+        let lab = format!("{stream}:owner:{}", s.id.0);
+        if let Some(character) = register_as_type_owner(game, s.id, ty, &lab) {
+            if seen.insert(s.id) {
+                owners.push((s.id, character));
             }
         }
     }
+    // Keep a stable random order for pick (caller may index randomly).
+    owners.shuffle(rng);
     owners
 }
 
@@ -159,9 +153,11 @@ fn truthful_pair_info(
     game: &Game,
     ty: CharacterType,
     pool: &[Character],
+    stream: &str,
     rng: &mut impl Rng,
 ) -> Option<PairInfo> {
-    let owners = pair_owners(game, ty, pool, rng);
+    let _ = pool;
+    let owners = pair_owners(game, ty, stream, rng);
     if owners.is_empty() {
         return None;
     }
@@ -212,15 +208,17 @@ fn resolve_pair_role(
     let disabled = seat_disabled(game, seat);
 
     if !disabled {
-        // Zero-path uses true bag count only (Spy registration does not invent Outsiders).
+        // Prefer truthful pair including Spy/Recluse registration (Spy-as-Outsider may
+        // produce a pair even when true outsider bag is empty).
+        if let Some(info) = truthful_pair_info(game, ty, pool, stream, &mut rng) {
+            let text = pair_message(game, ability, &info);
+            return Ok(push_result(game, seat, text));
+        }
+        // No owners after registration: optional "0 of type" path when true bag is empty.
         if seats_of_type(game, ty).is_empty() {
             if let Some(z) = zero_message {
                 return Ok(push_result(game, seat, z.to_string()));
             }
-        }
-        if let Some(info) = truthful_pair_info(game, ty, pool, &mut rng) {
-            let text = pair_message(game, ability, &info);
-            return Ok(push_result(game, seat, text));
         }
     }
 
@@ -361,13 +359,19 @@ fn chef_true_count(game: &Game) -> u8 {
     if n < 2 {
         return 0;
     }
+    // Single registration per seat for this whole Chef detection (issue #1 #8).
+    // Evil–Recluse–Evil can only be 0 or 2, never a middle "1" from re-rolling the Recluse.
+    let evil: Vec<bool> = game
+        .seats
+        .iter()
+        .map(|s| {
+            let lab = format!("chef_reg:{}:{}", game.night_cursor, s.id.0);
+            register_evil(game, s.id, &lab)
+        })
+        .collect();
     let mut count = 0u8;
     for i in 0..n {
-        let a = game.seats[i].id;
-        let b = game.seats[(i + 1) % n].id;
-        let lab_a = format!("chef_reg:{}:{}:a", game.night_cursor, a.0);
-        let lab_b = format!("chef_reg:{}:{}:b", game.night_cursor, b.0);
-        if register_evil(game, a, &lab_a) && register_evil(game, b, &lab_b) {
+        if evil[i] && evil[(i + 1) % n] {
             count += 1;
         }
     }
@@ -526,17 +530,16 @@ fn resolve_butler(
 }
 
 fn resolve_undertaker(game: &mut Game, seat: SeatId) -> Result<NightEffect, GameError> {
+    use super::register::register_character;
+
     let executed = game.executed_today;
     let shown = if seat_disabled(game, seat) {
         let label = stream_label(game, "undertaker_lie");
         let mut rng = game.rng.substream(&label);
         random_pool_character(&mut rng)
     } else if let Some(ex) = executed {
-        game.seats
-            .iter()
-            .find(|s| s.id == ex)
-            .and_then(|s| s.true_character)
-            .unwrap_or(Character::Imp)
+        let lab = format!("undertaker_reg:{}:{}", game.night_cursor, ex.0);
+        register_character(game, ex, &lab).unwrap_or(Character::Imp)
     } else {
         // Should not wake without execution; soft fallback.
         return Ok(push_result(
@@ -557,6 +560,8 @@ fn resolve_ravenkeeper(
     seat: SeatId,
     payload: &NightActionPayload,
 ) -> Result<NightEffect, GameError> {
+    use super::register::register_character;
+
     let NightActionPayload::PickOne { target } = payload else {
         return Err(GameError::WrongPayload);
     };
@@ -565,12 +570,9 @@ fn resolve_ravenkeeper(
         let mut rng = game.rng.substream(&label);
         random_pool_character(&mut rng)
     } else {
-        // v1: true character token (Drunk → Drunk; Spy → Spy).
-        game.seats
-            .iter()
-            .find(|s| s.id == *target)
-            .and_then(|s| s.true_character)
-            .unwrap_or(Character::Soldier)
+        // Spy/Recluse may misregister; Drunk still shows as Drunk to true-token viewers.
+        let lab = format!("ravenkeeper_reg:{}:{}", game.night_cursor, target.0);
+        register_character(game, *target, &lab).unwrap_or(Character::Soldier)
     };
     let text = format!(
         "Ravenkeeper: {} is the {}.",
