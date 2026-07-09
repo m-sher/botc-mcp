@@ -16,6 +16,7 @@ fn create_game_rejects_too_few_players() {
         &mut store,
         vec!["A".into(), "B".into(), "C".into(), "D".into()],
         1,
+        None,
     )
     .unwrap_err();
     assert!(matches!(
@@ -29,7 +30,7 @@ fn create_game_rejects_too_few_players() {
 fn create_game_rejects_too_many_players() {
     let names: Vec<String> = (0..16).map(|i| format!("P{i}")).collect();
     let mut store = botc_mcp::store::GameStore::new();
-    let err = botc_mcp::tools::create_game(&mut store, names, 1).unwrap_err();
+    let err = botc_mcp::tools::create_game(&mut store, names, 1, None).unwrap_err();
     assert!(matches!(
         err,
         botc_mcp::ToolError::Game(botc_mcp::GameError::BadRequest(_))
@@ -51,6 +52,7 @@ fn create_game_stores_seed_and_lobby_phase() {
             "F".into(),
         ],
         42,
+        None,
     )
     .unwrap();
     let game = store.get_mut(out.game_id).expect("game inserted");

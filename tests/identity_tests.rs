@@ -148,23 +148,12 @@ fn start_game_random_bag_assigns_all_seats() {
     let host = lobby.host_token.clone();
     let mut g = lobby.game;
     g.start_game(&host, StartOpts::default()).unwrap();
-    // night_tick may already be pending a choice (FirstNight) or have finished to Day
-    // if the bag has no choice-required N1 roles.
-    assert!(
-        matches!(
-            g.phase,
-            botc_mcp::game::Phase::FirstNight { .. } | botc_mcp::game::Phase::Day { day: 1, .. }
-        ),
-        "unexpected phase {:?}",
-        g.phase
-    );
     assert_eq!(g.seats.len(), 5);
     assert!(g.seats.iter().all(|s| s.true_character.is_some()));
     assert!(g
         .seats
         .iter()
         .any(|s| s.true_character == Some(Character::Imp)));
-    // bag size equals seats
     assert_eq!(
         g.seats
             .iter()
@@ -172,4 +161,32 @@ fn start_game_random_bag_assigns_all_seats() {
             .count(),
         5
     );
+}
+
+/// Scripted bag with a first-night choice role always lands in FirstNight with pending wake.
+#[test]
+fn start_game_scripted_choice_role_pending_first_night() {
+    let lobby = Game::create_with_salt(five_names(), 1, 0).unwrap();
+    let host = lobby.host_token.clone();
+    let mut g = lobby.game;
+    g.start_game(
+        &host,
+        StartOpts {
+            assignments: Some(vec![
+                RoleAssignment::normal(SeatId(0), Character::Poisoner), // N1 choice
+                RoleAssignment::normal(SeatId(1), Character::Empath),
+                RoleAssignment::normal(SeatId(2), Character::Soldier),
+                RoleAssignment::normal(SeatId(3), Character::Chef),
+                RoleAssignment::normal(SeatId(4), Character::Imp),
+            ]),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(g.phase, botc_mcp::game::Phase::FirstNight { .. }),
+        "expected FirstNight, got {:?}",
+        g.phase
+    );
+    let pending = g.pending_night.as_ref().expect("pending wake required");
+    assert_eq!(pending.seat, SeatId(0), "Poisoner should be first choice wake");
 }

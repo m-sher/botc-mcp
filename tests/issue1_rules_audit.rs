@@ -221,10 +221,10 @@ fn poisoned_ravenkeeper_still_wakes_on_death() {
     ));
 }
 
-/// 4. Mayor bounce never kills Imp (or minions).
+/// 4. Mayor bounce never kills Imp; Minions are allowed.
 #[test]
 fn mayor_bounce_never_kills_imp() {
-    // 5 seats: Mayor, Soldier, Chef, Poisoner, Imp — only good bounce targets are Soldier/Chef.
+    // 5 seats: Mayor, Soldier, Chef, Poisoner, Imp — bounce may hit good or Minion, never Imp.
     let (mut g, _host, _tokens) = start_scripted(
         53,
         0,
@@ -241,8 +241,8 @@ fn mayor_bounce_never_kills_imp() {
         s.poisoned = false;
     }
     g.night_cursor = 3;
-    for _ in 0..40 {
-        // Re-alive all if needed and re-try bounce.
+    let mut saw_minion = false;
+    for _ in 0..80 {
         for s in &mut g.seats {
             if s.id != SeatId(0) {
                 s.alive = true;
@@ -256,19 +256,20 @@ fn mayor_bounce_never_kills_imp() {
         match r {
             KillResult::Died(victim) => {
                 assert_ne!(victim, SeatId(4), "must never bounce onto Imp");
-                assert_ne!(victim, SeatId(3), "must never bounce onto Minion");
                 assert!(g.seats[4].alive, "Imp must remain alive after bounce");
                 assert!(
-                    victim == SeatId(1) || victim == SeatId(2),
-                    "bounce victim should be good townsfolk, got {victim:?}"
+                    victim == SeatId(1) || victim == SeatId(2) || victim == SeatId(3),
+                    "bounce victim should be Soldier/Chef/Poisoner, got {victim:?}"
                 );
+                if victim == SeatId(3) {
+                    saw_minion = true;
+                }
             }
-            KillResult::Survived => {
-                // Soldier immune / empty candidates ok for some RNG; continue
-            }
+            KillResult::Survived => {}
             other => panic!("unexpected {other:?}"),
         }
     }
+    assert!(saw_minion, "expected at least one bounce onto Minion over trials");
 }
 
 /// 5. Ghost vote: living finish voting first does not auto-close before dead votes.

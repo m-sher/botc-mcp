@@ -1,0 +1,365 @@
+//! Follow-up re-audit fixes (#3–#14).
+
+use botc_mcp::game::ability::{register, try_demon_kill, KillResult};
+use botc_mcp::game::night::build_other_night_queue;
+use botc_mcp::game::{
+    DayStage, Game, NightStep, Phase, RoleAssignment, SeatId, StartOpts,
+};
+use botc_mcp::roles::{Character, CharacterType};
+use botc_mcp::tools::{
+    day_action, nominate, open_nominations, pass_vote, skip_night_action, vote, DayActionPayload,
+};
+use rand::Rng;
+
+fn names(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("P{i}")).collect()
+}
+
+fn start_scripted(
+    seed: u64,
+    salt: u64,
+    assignments: Vec<RoleAssignment>,
+) -> (Game, botc_mcp::auth::Token, Vec<botc_mcp::auth::Token>) {
+    let lobby = Game::create_with_salt(names(assignments.len()), seed, salt).unwrap();
+    let host = lobby.host_token.clone();
+    let tokens = lobby.player_tokens.clone();
+    let mut g = lobby.game;
+    g.start_game(
+        &host,
+        StartOpts {
+            assignments: Some(assignments),
+        },
+    )
+    .unwrap();
+    (g, host, tokens)
+}
+
+fn to_day1(g: &mut Game, host: &botc_mcp::auth::Token) {
+    while g.pending_night.is_some() {
+        skip_night_action(g, host).unwrap();
+    }
+    assert!(matches!(
+        g.phase,
+        Phase::Day {
+            day: 1,
+            stage: DayStage::Discussion
+        }
+    ));
+}
+
+/// #3 Acting seat never appears in WW pair seats.
+#[test]
+fn washerwoman_pair_excludes_acting_seat() {
+    let (mut g, host, tokens) = start_scripted(
+        100,
+        0,
+        vec![
+            RoleAssignment::normal(SeatId(0), Character::Washerwoman),
+            RoleAssignment::normal(SeatId(1), Character::Soldier),
+            RoleAssignment::normal(SeatId(2), Character::Chef),
+            RoleAssignment::normal(SeatId(3), Character::Poisoner),
+            RoleAssignment::normal(SeatId(4), Character::Imp),
+        ],
+    );
+    // Drive until day so Washerwoman has resolved (skip N1).
+    // Capture WW night result by draining night carefully.
+    // First pending is Poisoner; skip until Washerwoman result is in inbox.
+    while g.pending_night.is_some() {
+        skip_night_action(&mut g, &host).unwrap();
+    }
+    let msgs = g.private_inboxes.since(SeatId(0), 0);
+    let text = msgs
+        .iter()
+        .find_map(|(_, m)| match m {
+            botc_mcp::comms::PrivateMessage::NightResult { text } if text.contains("Washerwoman") => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .expect("Washerwoman night result");
+    // Must mention two seats that are not seat 0.
+    assert!(
+        !text.contains("seat 0"),
+        "acting WW seat must not appear in pair: {text}"
+    );
+    let _ = tokens;
+}
+
+/// #4 same seed+salt → same bag / same substream.
+#[test]
+fn same_seed_and_salt_same_bag_and_substream() {
+    use botc_mcp::game::setup::build_bag;
+    use botc_mcp::rng::SeededRng;
+
+    let seed = 4242u64;
+    let salt = 777u64;
+    let a = SeededRng::from_seed_and_salt(seed, salt);
+    let b = SeededRng::from_seed_and_salt(seed, salt);
+    let bag_a = build_bag(&a, 7).unwrap();
+    let bag_b = build_bag(&b, 7).unwrap();
+    assert_eq!(bag_a.bag_set, bag_b.bag_set);
+    assert_eq!(
+        bag_a
+            .assignments
+            .iter()
+            .map(|x| (x.seat, x.true_character, x.believed_character))
+            .collect::<Vec<_>>(),
+        bag_b
+            .assignments
+            .iter()
+            .map(|x| (x.seat, x.true_character, x.believed_character))
+            .collect::<Vec<_>>()
+    );
+    let x: u64 = a.substream("washerwoman").gen();
+    let y: u64 = b.substream("washerwoman").gen();
+    assert_eq!(x, y);
+
+    // tools path with explicit salt
+    let mut store1 = botc_mcp::store::GameStore::new();
+    let mut store2 = botc_mcp::store::GameStore::new();
+    let r1 = botc_mcp::tools::create_game(&mut store1, names(5), seed, Some(salt)).unwrap();
+    let r2 = botc_mcp::tools::create_game(&mut store2, names(5), seed, Some(salt)).unwrap();
+    let g1 = store1.get_mut(r1.game_id).unwrap();
+    let g2 = store2.get_mut(r2.game_id).unwrap();
+    assert_eq!(g1.secret_salt, salt);
+    assert_eq!(g2.secret_salt, salt);
+    assert_eq!(
+        g1.rng.substream("setup").gen::<u64>(),
+        g2.rng.substream("setup").gen::<u64>()
+    );
+}
+
+/// #5 Spy misreg as Townsfolk prefers in-play TF tokens (not WW face when excluded).
+#[test]
+fn spy_type_owner_prefers_in_play_and_excludes_actor_face() {
+    let (g, _, _) = start_scripted(
+        101,
+        0,
+        vec![
+            RoleAssignment::normal(SeatId(0), Character::Washerwoman),
+            RoleAssignment::normal(SeatId(1), Character::Spy),
+            RoleAssignment::normal(SeatId(2), Character::Soldier),
+            RoleAssignment::normal(SeatId(3), Character::Chef),
+            RoleAssignment::normal(SeatId(4), Character::Imp),
+        ],
+    );
+    let opts = register::TypeOwnerOpts {
+        acting_seat: Some(SeatId(0)),
+    };
+    let in_play_tf = [Character::Washerwoman, Character::Soldier, Character::Chef];
+    let mut named = std::collections::HashSet::new();
+    for i in 0..128u32 {
+        let lab = format!("spy_tf:{i}");
+        if let Some(c) = register::register_as_type_owner_with(
+            &g,
+            SeatId(1),
+            CharacterType::Townsfolk,
+            &lab,
+            opts,
+        ) {
+            assert_ne!(c, Character::Washerwoman, "must not name acting WW");
+            named.insert(c);
+            // Prefer in-play: when we name something, it should often be Soldier/Chef.
+            assert!(
+                in_play_tf.contains(&c) || all_tf_contains(c),
+                "unexpected token {c:?}"
+            );
+        }
+    }
+    // Should have named at least one in-play non-WW townsfolk across trials.
+    assert!(
+        named.contains(&Character::Soldier) || named.contains(&Character::Chef),
+        "expected in-play TF tokens, got {named:?}"
+    );
+}
+
+fn all_tf_contains(c: Character) -> bool {
+    botc_mcp::roles::all_townsfolk().contains(&c)
+}
+
+/// #6 pass_vote auto-close path covered in day_tests; ensure ghost retained after pass + later yes.
+#[test]
+fn pass_then_ghost_yes_on_later_nomination() {
+    let (mut g, host, tokens) = start_scripted(
+        102,
+        0,
+        vec![
+            RoleAssignment::normal(SeatId(0), Character::Soldier),
+            RoleAssignment::normal(SeatId(1), Character::Chef),
+            RoleAssignment::normal(SeatId(2), Character::Empath),
+            RoleAssignment::normal(SeatId(3), Character::Poisoner),
+            RoleAssignment::normal(SeatId(4), Character::Imp),
+        ],
+    );
+    to_day1(&mut g, &host);
+    g.seats[2].alive = false;
+    g.seats[2].ghost_vote_available = true;
+
+    open_nominations(&mut g, &host).unwrap();
+    nominate(&mut g, &tokens[0], SeatId(4)).unwrap();
+    for i in [0usize, 1, 3, 4] {
+        vote(&mut g, &tokens[i], SeatId(4), false).unwrap();
+    }
+    pass_vote(&mut g, &tokens[2]).unwrap();
+    assert!(g.seats[2].ghost_vote_available);
+    assert!(g.current_nomination.is_none());
+
+    nominate(&mut g, &tokens[1], SeatId(3)).unwrap();
+    vote(&mut g, &tokens[2], SeatId(3), true).unwrap();
+    assert!(!g.seats[2].ghost_vote_available);
+}
+
+/// #7 Mayor bounce can kill Minion.
+#[test]
+fn mayor_bounce_can_kill_minion() {
+    let (mut g, _, _) = start_scripted(
+        103,
+        0,
+        vec![
+            RoleAssignment::normal(SeatId(0), Character::Mayor),
+            RoleAssignment::normal(SeatId(1), Character::Soldier), // immune
+            RoleAssignment::normal(SeatId(2), Character::Poisoner), // only soft target often
+            RoleAssignment::normal(SeatId(3), Character::Spy),
+            RoleAssignment::normal(SeatId(4), Character::Imp),
+        ],
+    );
+    for s in &mut g.seats {
+        s.poisoned = false;
+    }
+    g.night_cursor = 1;
+    let mut hit_minion = false;
+    for _ in 0..100 {
+        for s in &mut g.seats {
+            s.alive = true;
+        }
+        g.deaths_tonight.clear();
+        g.winner = None;
+        g.phase = Phase::Night { night: 2, cursor: 1 };
+        match try_demon_kill(&mut g, SeatId(4), SeatId(0)) {
+            KillResult::Died(v) if v == SeatId(2) || v == SeatId(3) => {
+                hit_minion = true;
+                break;
+            }
+            KillResult::Died(v) => assert_ne!(v, SeatId(4)),
+            KillResult::Survived => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(hit_minion, "bounce should hit a minion sometime");
+}
+
+/// #8 Slayer kills Recluse when register_demon_for_ft is true.
+#[test]
+fn slayer_can_kill_recluse_registering_as_demon() {
+    // Probe labels until we find a seed/label where Recluse registers as demon, then slay.
+    let (mut g, host, tokens) = start_scripted(
+        104,
+        0,
+        vec![
+            RoleAssignment::normal(SeatId(0), Character::Slayer),
+            RoleAssignment::normal(SeatId(1), Character::Recluse),
+            RoleAssignment::normal(SeatId(2), Character::Soldier),
+            RoleAssignment::normal(SeatId(3), Character::Poisoner),
+            RoleAssignment::normal(SeatId(4), Character::Imp),
+        ],
+    );
+    to_day1(&mut g, &host);
+    g.seats[0].poisoned = false;
+
+    // Force many day_action attempts by resetting slayer_used and probing — but each
+    // uses fixed label slayer_reg:day:1. Instead check registration flip then apply hit path
+    // by trying many game instances with different seeds.
+    let mut killed = false;
+    for seed in 200..400u64 {
+        let (mut g2, host2, tokens2) = start_scripted(
+            seed,
+            seed.wrapping_mul(3),
+            vec![
+                RoleAssignment::normal(SeatId(0), Character::Slayer),
+                RoleAssignment::normal(SeatId(1), Character::Recluse),
+                RoleAssignment::normal(SeatId(2), Character::Soldier),
+                RoleAssignment::normal(SeatId(3), Character::Poisoner),
+                RoleAssignment::normal(SeatId(4), Character::Imp),
+            ],
+        );
+        to_day1(&mut g2, &host2);
+        g2.seats[0].poisoned = false;
+        // Peek whether this seed's slayer label would register Recluse as demon.
+        let lab = "slayer_reg:day:1";
+        if !register::register_demon_for_ft(&g2, SeatId(1), lab) {
+            continue;
+        }
+        // Note: day_action will re-draw the same label substream from the start → same result.
+        day_action(
+            &mut g2,
+            &tokens2[0],
+            DayActionPayload::Slay { target: SeatId(1) },
+        )
+        .unwrap();
+        if !g2.seats[1].alive {
+            killed = true;
+            // Imp still alive; game should not end from Recluse death alone.
+            assert!(g2.seats[4].alive);
+            break;
+        }
+    }
+    assert!(killed, "expected some seed where Slayer kills Recluse-as-demon");
+    let _ = (g, host, tokens);
+}
+
+/// #12 spent ghost rejects all votes (also day_tests).
+#[test]
+fn spent_ghost_rejects_all_votes() {
+    let (mut g, host, tokens) = start_scripted(
+        105,
+        0,
+        vec![
+            RoleAssignment::normal(SeatId(0), Character::Soldier),
+            RoleAssignment::normal(SeatId(1), Character::Chef),
+            RoleAssignment::normal(SeatId(2), Character::Empath),
+            RoleAssignment::normal(SeatId(3), Character::Poisoner),
+            RoleAssignment::normal(SeatId(4), Character::Imp),
+        ],
+    );
+    to_day1(&mut g, &host);
+    g.seats[2].alive = false;
+    g.seats[2].ghost_vote_available = false; // already spent
+    open_nominations(&mut g, &host).unwrap();
+    nominate(&mut g, &tokens[0], SeatId(4)).unwrap();
+    assert!(vote(&mut g, &tokens[2], SeatId(4), true).is_err());
+    assert!(vote(&mut g, &tokens[2], SeatId(4), false).is_err());
+    assert!(pass_vote(&mut g, &tokens[2]).is_err());
+}
+
+/// #13 other-night queue does not pre-list Ravenkeeper from deaths_tonight.
+#[test]
+fn other_night_queue_omits_prelisted_ravenkeeper() {
+    let (mut g, _, _) = start_scripted(
+        106,
+        0,
+        vec![
+            RoleAssignment::normal(SeatId(0), Character::Ravenkeeper),
+            RoleAssignment::normal(SeatId(1), Character::Soldier),
+            RoleAssignment::normal(SeatId(2), Character::Chef),
+            RoleAssignment::normal(SeatId(3), Character::Poisoner),
+            RoleAssignment::normal(SeatId(4), Character::Imp),
+        ],
+    );
+    g.seats[0].alive = false;
+    g.deaths_tonight = vec![SeatId(0)];
+    let q = build_other_night_queue(&g);
+    assert!(
+        !q.iter()
+            .any(|s| matches!(s, NightStep::Ravenkeeper { .. })),
+        "RK must not be pre-queued from deaths_tonight: {q:?}"
+    );
+}
+
+/// #11 stable mix differs by salt/label.
+#[test]
+fn mix_stable_and_salt_sensitive() {
+    use botc_mcp::rng::mix;
+    assert_eq!(mix(9, 8, "a"), mix(9, 8, "a"));
+    assert_ne!(mix(9, 8, "a"), mix(9, 9, "a"));
+    assert_ne!(mix(9, 8, "a"), mix(9, 8, "b"));
+}
