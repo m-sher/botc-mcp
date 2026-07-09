@@ -1,10 +1,13 @@
 //! Ratatui monitoring UI for the multi-agent harness.
 
+use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -18,7 +21,8 @@ use ratatui::{Frame, Terminal};
 
 use crate::game::{Game, GameId, SeatId, StartOpts, StChoiceMode};
 use crate::harness::agents::{
-    find_agent_mcp_bin, find_grok, AgentConfig, AgentPool, AgentRole, HarnessConfig,
+    agent_mcp_bin_ok, find_agent_mcp_bin, find_grok, resolve_agent_mcp_bin_for_display,
+    AgentConfig, AgentPool, AgentRole, HarnessConfig,
 };
 use crate::harness::socket::SocketServer;
 use crate::mcp_server::{self, SharedStore};
@@ -46,7 +50,8 @@ struct App {
     tick_interval: Duration,
     cfg: HarnessConfig,
     should_quit: bool,
-    scroll_log: usize,
+    /// Lines scrolled up from the live tail (0 = stick to newest output) (#45).
+    scroll_from_bottom: usize,
 }
 
 impl App {
@@ -57,12 +62,25 @@ impl App {
         let id = uuid::Uuid::new_v4();
         cfg.work_root = PathBuf::from(format!("/tmp/botc-harness-{id}"));
         cfg.socket_path = cfg.work_root.join("engine.sock");
+        let mcp_ok = agent_mcp_bin_ok(&cfg);
+        let mcp_path = resolve_agent_mcp_bin_for_display(&cfg);
+        let status = if mcp_ok {
+            format!(
+                "↑/↓ players · Enter launch · q quit | grok={} mcp={}",
+                cfg.grok_bin.display(),
+                mcp_path.display()
+            )
+        } else {
+            format!(
+                "MISSING botc-agent-mcp at {} — run: cargo build --bins",
+                mcp_path.display()
+            )
+        };
         Self {
             focus: Focus::Setup,
             player_count: 5,
             selected_agent: 0,
-            status: "↑/↓ players · Enter launch · q quit | needs `grok` + `cargo build --bins`"
-                .into(),
+            status,
             store: mcp_server::new_shared_store(),
             game_id: None,
             host_token: None,
@@ -74,11 +92,13 @@ impl App {
             tick_interval: Duration::from_secs(45),
             cfg,
             should_quit: false,
-            scroll_log: 0,
+            scroll_from_bottom: 0,
         }
     }
 
     fn on_key(&mut self, code: KeyCode) {
+        // Only explicit keyboard actions. Mouse wheel / trackpad scroll is ignored
+        // in the event loop (EnableMouseCapture + drop Event::Mouse).
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Up | KeyCode::Char('k') if self.focus == Focus::Setup => {
@@ -89,14 +109,24 @@ impl App {
             }
             KeyCode::Enter if self.focus == Focus::Setup => self.launch(),
             KeyCode::Tab if self.agents.is_some() => {
-                let n = self.agents.as_ref().map(|a| a.agents.len()).unwrap_or(1).max(1);
+                let n = self
+                    .agents
+                    .as_ref()
+                    .map(|a| a.agents.len())
+                    .unwrap_or(1)
+                    .max(1);
                 self.selected_agent = (self.selected_agent + 1) % n;
-                self.scroll_log = 0;
+                self.scroll_from_bottom = 0;
             }
             KeyCode::BackTab if self.agents.is_some() => {
-                let n = self.agents.as_ref().map(|a| a.agents.len()).unwrap_or(1).max(1);
+                let n = self
+                    .agents
+                    .as_ref()
+                    .map(|a| a.agents.len())
+                    .unwrap_or(1)
+                    .max(1);
                 self.selected_agent = (self.selected_agent + n - 1) % n;
-                self.scroll_log = 0;
+                self.scroll_from_bottom = 0;
             }
             KeyCode::Char('t') if self.agents.is_some() => {
                 self.auto_tick = !self.auto_tick;
@@ -106,17 +136,39 @@ impl App {
                 self.do_tick();
                 self.last_tick = Instant::now();
             }
-            KeyCode::PageUp => self.scroll_log = self.scroll_log.saturating_add(5),
-            KeyCode::PageDown => self.scroll_log = self.scroll_log.saturating_sub(5),
+            // Keyboard-only log navigation (not mouse scroll). 0 = live tail.
+            KeyCode::PageUp if self.focus == Focus::Monitor => {
+                self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(5);
+            }
+            KeyCode::PageDown if self.focus == Focus::Monitor => {
+                self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(5);
+            }
+            KeyCode::Home if self.focus == Focus::Monitor => {
+                // Jump to live tail.
+                self.scroll_from_bottom = 0;
+            }
             _ => {}
         }
     }
 
     fn launch(&mut self) {
-        if self.agents.is_some() {
+        // #55: also gate on socket — a failed prior launch may have left socket=Some.
+        if self.agents.is_some() || self.socket.is_some() {
             self.status = "Already launched — restart the TUI for a new table.".into();
             return;
         }
+        // #50: refuse to launch without a real botc-agent-mcp binary.
+        if !agent_mcp_bin_ok(&self.cfg) {
+            let p = resolve_agent_mcp_bin_for_display(&self.cfg);
+            self.status = format!(
+                "botc-agent-mcp not found (looked for {}). Run: cargo build --bins",
+                p.display()
+            );
+            return;
+        }
+        // Refresh resolved path so workdir config gets an absolute sibling if possible.
+        self.cfg.agent_mcp_bin = find_agent_mcp_bin();
+
         self.player_names = (0..self.player_count).map(|i| format!("P{i}")).collect();
         let seed = self.cfg.seed.unwrap_or(42);
         let created = match Game::create(self.player_names.clone(), seed) {
@@ -140,10 +192,10 @@ impl App {
             }
         }
 
-        {
+        let start_err = {
             let mut st = self.store.lock().unwrap();
             let g = st.get_mut(GameId(game_id)).unwrap();
-            if let Err(e) = tools::start_game(
+            tools::start_game(
                 g,
                 &created.host_token,
                 StartOpts {
@@ -154,10 +206,14 @@ impl App {
                     },
                     ..Default::default()
                 },
-            ) {
-                self.status = format!("start_game: {e}");
-                return;
-            }
+            )
+            .err()
+        };
+        if let Some(e) = start_err {
+            self.status = format!("start_game: {e}");
+            // #55/#58: roll back partial launch state (socket + work_root).
+            self.abort_partial_launch();
+            return;
         }
 
         self.game_id = Some(game_id);
@@ -182,22 +238,38 @@ impl App {
 
         match AgentPool::prepare(&self.cfg, configs) {
             Ok(mut pool) => match pool.kickoff_all(self.player_count) {
-                Ok(()) => {
+                Ok(spawned) => {
                     self.status = format!(
-                        "Game {game_id} · {} agents · Space=tick t=auto Tab=agent q=quit",
+                        "Game {game_id} · kicked {spawned}/{} · Space=tick t=auto Tab=agent q=quit",
                         self.player_count + 1
                     );
                     self.auto_tick = true;
                     self.last_tick = Instant::now();
                     self.focus = Focus::Monitor;
+                    self.scroll_from_bottom = 0;
                     self.agents = Some(pool);
                 }
                 Err(e) => {
+                    // Partial pool still owns workdirs — keep it so shutdown/stop_all cleans up.
                     self.status = format!("kickoff: {e}");
                     self.agents = Some(pool);
                 }
             },
-            Err(e) => self.status = format!("prepare: {e}"),
+            Err(e) => {
+                self.status = format!("prepare: {e}");
+                // #55/#58: socket + partial work_root without agents.
+                self.abort_partial_launch();
+            }
+        }
+    }
+
+    /// Tear down socket + work_root after a launch that never got a live AgentPool (#55/#58).
+    fn abort_partial_launch(&mut self) {
+        if let Some(s) = self.socket.take() {
+            s.stop();
+        }
+        if self.cfg.work_root.exists() {
+            let _ = std::fs::remove_dir_all(&self.cfg.work_root);
         }
     }
 
@@ -207,8 +279,18 @@ impl App {
         };
         let (summary, hint) = self.public_summary_and_hint(gid);
         if let Some(pool) = self.agents.as_mut() {
+            let total = pool.agents.len();
             match pool.tick_all(&summary, &hint) {
-                Ok(()) => self.status = "Ticked all agents.".into(),
+                Ok(spawned) => {
+                    let skipped = total.saturating_sub(spawned);
+                    self.status = if skipped == 0 {
+                        format!("Ticked {spawned}/{total} agents.")
+                    } else {
+                        format!(
+                            "Ticked {spawned}/{total} agents ({skipped} still running previous tick)."
+                        )
+                    };
+                }
                 Err(e) => self.status = format!("tick error: {e}"),
             }
         }
@@ -288,6 +370,7 @@ impl App {
         }
     }
 
+    /// Full agent log as joined text (newest at end). Caller applies tail-anchor scroll (#45).
     fn agent_log_text(&self) -> String {
         let Some(pool) = self.agents.as_ref() else {
             return String::new();
@@ -298,22 +381,105 @@ impl App {
         let idx = self.selected_agent.min(pool.agents.len() - 1);
         let agent = &pool.agents[idx];
         let log = agent.log.lock().unwrap();
-        let skip = self.scroll_log.min(log.len().saturating_sub(1));
-        let start = log.len().saturating_sub(100 + skip);
-        log[start..].join("")
+        // Cap retained lines for the pane (keep a generous buffer for PgUp).
+        let start = log.len().saturating_sub(400);
+        log[start..].join("\n")
+    }
+
+    fn shutdown(&mut self) {
+        // Stop agents first (kills children + removes work root with tokens).
+        if let Some(mut pool) = self.agents.take() {
+            pool.stop_all();
+        }
+        // Then stop socket (non-blocking accept; inode-safe remove).
+        if let Some(s) = self.socket.take() {
+            s.stop();
+        }
+        // #58: even if agents never built (failed launch), remove work_root/tokens.
+        if self.cfg.work_root.exists() {
+            let _ = std::fs::remove_dir_all(&self.cfg.work_root);
+        }
     }
 }
 
-pub fn run_tui() -> std::io::Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+/// RAII guard: restores terminal raw-mode / alternate screen on Drop or panic (#49).
+struct TerminalGuard {
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+    restored: bool,
+}
 
+impl TerminalGuard {
+    fn enter() -> io::Result<Self> {
+        // #57: enable raw mode first, then finish setup under a restore-on-err path
+        // so a later failure cannot leave the terminal in raw mode without a guard.
+        enable_raw_mode()?;
+        match Self::enter_after_raw() {
+            Ok(g) => Ok(g),
+            Err(e) => {
+                let _ = disable_raw_mode();
+                let mut out = io::stdout();
+                let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen);
+                Err(e)
+            }
+        }
+    }
+
+    fn enter_after_raw() -> io::Result<Self> {
+        let mut stdout = io::stdout();
+        // Capture mouse so the terminal delivers wheel/trackpad as Event::Mouse
+        // (which we ignore) instead of synthesizing Enter/Space/arrow keypresses.
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend)?;
+        Ok(Self {
+            terminal,
+            restored: false,
+        })
+    }
+
+    fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
+        &mut self.terminal
+    }
+
+    fn restore(&mut self) {
+        if self.restored {
+            return;
+        }
+        self.restored = true;
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
+        let _ = self.terminal.show_cursor();
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Best-effort restore before printing the panic (stdout may be alt screen).
+        let _ = disable_raw_mode();
+        let mut out = io::stdout();
+        let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen);
+        prev(info);
+    }));
+}
+
+pub fn run_tui() -> io::Result<()> {
+    install_panic_hook();
+    let mut guard = TerminalGuard::enter()?;
     let mut app = App::new();
+
     let result = loop {
-        terminal.draw(|f| draw(f, &app))?;
+        guard.terminal_mut().draw(|f| draw(f, &app))?;
         if app.should_quit {
             break Ok(());
         }
@@ -321,21 +487,29 @@ pub fn run_tui() -> std::io::Result<()> {
             app.do_tick();
             app.last_tick = Instant::now();
         }
-        if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    app.on_key(key.code);
+        // Drain the whole queue so scroll floods don't lag behind real keys.
+        while event::poll(Duration::from_millis(0))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    // Press only — ignore Release/Repeat (and anything scroll-related).
+                    if key.kind == KeyEventKind::Press {
+                        app.on_key(key.code);
+                    }
                 }
+                // Explicit no-op: wheel, trackpad, clicks, resize, paste, focus.
+                Event::Mouse(_)
+                | Event::Resize(_, _)
+                | Event::FocusGained
+                | Event::FocusLost
+                | Event::Paste(_) => {}
             }
         }
+        // Idle wait so we don't busy-spin when the queue is empty.
+        let _ = event::poll(Duration::from_millis(200));
     };
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    if let Some(mut pool) = app.agents.take() {
-        pool.stop_all();
-    }
+    app.shutdown();
+    guard.restore();
     result
 }
 
@@ -386,22 +560,29 @@ fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
+    let mcp = resolve_agent_mcp_bin_for_display(&app.cfg);
+    let mcp_note = if agent_mcp_bin_ok(&app.cfg) {
+        "ok"
+    } else {
+        "MISSING — cargo build --bins"
+    };
     let text = format!(
         "Player count: {pc}   →  {tot} headless Grok sessions (host + players)\n\n\
          Model:       {model}\n\
          Grok binary: {grok}\n\
-         Agent MCP:   {mcp}\n\
+         Agent MCP:   {mcp}  ({mcp_note})\n\
          Work root:   {work}\n\n\
          Controls:  ↑/↓  change player count\n\
                     Enter  create game + spawn agents\n\
-                    q      quit\n\n\
+                    q      quit (kills agents, removes workdirs)\n\n\
          Each agent workdir gets .grok/config.toml → botc-agent-mcp\n\
-         (token-scoped) → Unix socket → shared in-process engine.",
+         (token-scoped) → Unix socket → shared in-process engine.\n\
+         Build first: cargo build --bins && cargo run --bin botc-tui",
         pc = app.player_count,
         tot = app.player_count + 1,
         model = app.cfg.model,
         grok = app.cfg.grok_bin.display(),
-        mcp = app.cfg.agent_mcp_bin.display(),
+        mcp = mcp.display(),
         work = app.cfg.work_root.display(),
     );
     let p = Paragraph::new(text)
@@ -468,8 +649,162 @@ fn draw_monitor(f: &mut Frame, area: Rect, app: &App) {
             AgentRole::Player { seat } => format!("stream: seat{}", seat.0),
         })
         .unwrap_or_else(|| "stream".into());
-    let log_p = Paragraph::new(app.agent_log_text())
-        .block(Block::default().borders(Borders::ALL).title(agent_title))
-        .wrap(Wrap { trim: false });
+
+    // #45/#53: tail-anchor in *wrapped visual rows* (Paragraph::scroll unit), not
+    // logical lines — long Grok prose wraps in the ~40% stream column constantly.
+    let log_text = app.agent_log_text();
+    let inner_w = cols[2].width.saturating_sub(2);
+    let view_h = cols[2].height.saturating_sub(2) as usize;
+    let row_count = stream_wrapped_row_count(&log_text, inner_w);
+    // scroll_from_bottom=0 → show the end; larger → look further up (row units).
+    let scroll_y = stream_scroll_y(row_count, view_h, app.scroll_from_bottom);
+    let scroll_y_u16 = u16::try_from(scroll_y).unwrap_or(u16::MAX);
+    let tail_mark = if app.scroll_from_bottom == 0 {
+        "·live"
+    } else {
+        "·scroll"
+    };
+    let log_p = Paragraph::new(log_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("{agent_title} {tail_mark}")),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_y_u16, 0));
     f.render_widget(log_p, cols[2]);
+}
+
+/// Wrapped visual row count at `inner_w` — same unit as `Paragraph::scroll` (#53).
+///
+/// Uses ratatui's wrap math (no Block) so the count matches what the renderer
+/// produces inside a bordered pane of that inner width.
+pub fn stream_wrapped_row_count(text: &str, inner_w: u16) -> usize {
+    if text.is_empty() || inner_w == 0 {
+        return 0;
+    }
+    Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .line_count(inner_w)
+}
+
+/// Vertical scroll offset that keeps the live tail (or an offset from it) in view.
+/// `row_count` / `scroll_from_bottom` are in **wrapped visual rows** (#45/#53).
+pub fn stream_scroll_y(row_count: usize, view_h: usize, scroll_from_bottom: usize) -> usize {
+    let max_scroll_top = row_count.saturating_sub(view_h);
+    max_scroll_top.saturating_sub(scroll_from_bottom.min(max_scroll_top))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn stream_scroll_defaults_to_tail() {
+        // 50 rows, 10-row pane, scroll_from_bottom=0 → scroll so last 10 show.
+        assert_eq!(stream_scroll_y(50, 10, 0), 40);
+        assert_eq!(stream_scroll_y(5, 10, 0), 0); // fits entirely
+        assert_eq!(stream_scroll_y(50, 10, 5), 35); // look 5 rows up from tail
+        assert_eq!(stream_scroll_y(50, 10, 999), 0); // clamped to top
+    }
+
+    #[test]
+    fn wrapped_row_count_exceeds_logical_when_lines_wrap() {
+        // 11 logical lines that each wrap to >1 row at width 10.
+        let mut lines: Vec<String> = (0..10)
+            .map(|i| format!("LINE{i}-ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+            .collect();
+        lines.push("MARKER-LAST-LINE".into());
+        let text = lines.join("\n");
+        let logical = text.lines().count();
+        let wrapped = stream_wrapped_row_count(&text, 18); // inner_w of a w=20 bordered pane
+        assert_eq!(logical, 11);
+        assert!(
+            wrapped > logical,
+            "expected wrap to inflate row count: logical={logical} wrapped={wrapped}"
+        );
+        // Issue repro numbers: logical scroll under-shoots; wrap-aware is larger.
+        assert!(
+            stream_scroll_y(wrapped, 6, 0) > stream_scroll_y(logical, 6, 0),
+            "wrap-aware tail scroll must be deeper than logical-only"
+        );
+    }
+
+    /// #53: with wrapping lines, live-tail scroll must keep MARKER on screen.
+    #[test]
+    fn wrap_aware_tail_anchor_shows_last_line_on_test_backend() {
+        // Pane w=20 / h=8 → inner 18×6 (borders). Matches issue repro shape.
+        let backend = TestBackend::new(20, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        let mut lines: Vec<String> = (0..10)
+            .map(|i| format!("LINE{i}-ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+            .collect();
+        lines.push("MARKER-LAST-LINE".into());
+        let log_text = lines.join("\n");
+
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                let inner_w = area.width.saturating_sub(2);
+                let view_h = area.height.saturating_sub(2) as usize;
+                let rows = stream_wrapped_row_count(&log_text, inner_w);
+                let scroll_y = stream_scroll_y(rows, view_h, 0);
+                // Sanity: logical-only would under-scroll (issue repro).
+                let logical = log_text.lines().count();
+                assert!(
+                    scroll_y > stream_scroll_y(logical, view_h, 0),
+                    "wrap-aware scroll_y={scroll_y} should exceed logical"
+                );
+                let p = Paragraph::new(log_text.as_str())
+                    .block(Block::default().borders(Borders::ALL).title("stream ·live"))
+                    .wrap(Wrap { trim: false })
+                    .scroll((u16::try_from(scroll_y).unwrap_or(u16::MAX), 0));
+                f.render_widget(p, area);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(
+            screen.contains("MARKER"),
+            "last line MARKER must be visible with wrap-aware tail scroll; screen:\n{screen}"
+        );
+
+        // Control: logical-only scroll must leave MARKER off-screen (documents the bug).
+        let backend2 = TestBackend::new(20, 8);
+        let mut terminal2 = Terminal::new(backend2).expect("terminal2");
+        terminal2
+            .draw(|f| {
+                let area = f.area();
+                let view_h = area.height.saturating_sub(2) as usize;
+                let logical = log_text.lines().count();
+                let bad_y = stream_scroll_y(logical, view_h, 0);
+                let p = Paragraph::new(log_text.as_str())
+                    .block(Block::default().borders(Borders::ALL).title("bad"))
+                    .wrap(Wrap { trim: false })
+                    .scroll((u16::try_from(bad_y).unwrap_or(u16::MAX), 0));
+                f.render_widget(p, area);
+            })
+            .expect("draw2");
+        let buf2 = terminal2.backend().buffer();
+        let mut screen2 = String::new();
+        for y in 0..buf2.area.height {
+            for x in 0..buf2.area.width {
+                screen2.push_str(buf2[(x, y)].symbol());
+            }
+            screen2.push('\n');
+        }
+        assert!(
+            !screen2.contains("MARKER"),
+            "logical-only scroll should still clip MARKER (proves wrap matters); screen:\n{screen2}"
+        );
+    }
 }

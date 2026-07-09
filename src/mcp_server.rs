@@ -134,7 +134,8 @@ fn dispatch_method(store: &SharedStore, method: &str, params: Value) -> Result<V
     }
 }
 
-fn is_known_tool(name: &str) -> bool {
+/// Whether `name` is a real botc tool (used by stdio server + agent proxy bare-dispatch) (#59).
+pub fn is_known_tool(name: &str) -> bool {
     TOOL_NAMES.contains(&name)
 }
 

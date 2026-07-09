@@ -275,8 +275,9 @@ fn resolve_pair_role(
             let text = pair_message(game, ability, &info);
             return Ok(push_result(game, seat, text));
         }
-        // 2. Owners empty after registration (e.g. sole Recluse who hid for Librarian):
-        //    optional "0 of type" zero_message. Do not require seats_of_type empty.
+        // 2. Owners empty after registration (zero registering outsiders/minions of the
+        //    requested type — sole Recluse/Spy can no longer hide from Lib/Inv):
+        //    optional "0 of type" zero_message.
         if let Some(z) = zero_message {
             return Ok(push_result(game, seat, z.to_string()));
         }
