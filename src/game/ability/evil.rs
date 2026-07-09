@@ -155,22 +155,28 @@ fn kill_chain(game: &mut Game, target: SeatId) -> KillResult {
 }
 
 fn mayor_bounce(game: &mut Game, mayor: SeatId) -> KillResult {
+    // Official ST policy: bounce onto a *good* living player, never Demon/Minion.
     let mut candidates: Vec<SeatId> = game
         .seats
         .iter()
-        .filter(|s| s.id != mayor && is_demon_killable(game, s.id))
+        .filter(|s| {
+            if s.id == mayor || !is_demon_killable(game, s.id) {
+                return false;
+            }
+            let Some(c) = s.true_character else {
+                return false;
+            };
+            // Good only (Townsfolk / Outsider); exclude Imp, Minions, other active Mayors.
+            if c.team() != Team::Good {
+                return false;
+            }
+            if c == Character::Mayor && !s.ability_disabled() {
+                return false;
+            }
+            true
+        })
         .map(|s| s.id)
         .collect();
-    // Exclude other living Mayors with active ability? Spec: redirect to living
-    // non-soldier/monk-protected. A second Mayor would bounce again in theory;
-    // v1: treat active Mayor as unkillable for bounce candidates.
-    candidates.retain(|id| {
-        game.seats
-            .iter()
-            .find(|s| s.id == *id)
-            .map(|s| !(s.true_character == Some(Character::Mayor) && !s.ability_disabled()))
-            .unwrap_or(false)
-    });
     candidates.sort_by_key(|id| id.0);
 
     if candidates.is_empty() {
@@ -186,20 +192,21 @@ fn mayor_bounce(game: &mut Game, mayor: SeatId) -> KillResult {
 
 /// Mark dead, track night death, maybe insert Ravenkeeper wake / SW conversion.
 fn die_from_demon(game: &mut Game, seat: SeatId) {
-    // Snapshot ability/character before death mutations.
-    let (is_rk, was_disabled, is_poisoner, is_imp) = game
+    // Snapshot before death mutations. RK wake follows *player-facing* character so a
+    // Drunk-face-Ravenkeeper still wakes; disabled real RK also wakes (false info).
+    let (faces_as_rk, is_poisoner, is_imp) = game
         .seats
         .iter()
         .find(|s| s.id == seat)
         .map(|s| {
+            let face = s.visible_character();
             (
-                s.true_character == Some(Character::Ravenkeeper),
-                s.ability_disabled(),
+                face == Some(Character::Ravenkeeper),
                 s.true_character == Some(Character::Poisoner),
                 s.true_character == Some(Character::Imp),
             )
         })
-        .unwrap_or((false, true, false, false));
+        .unwrap_or((false, false, false));
 
     let alive_before = win::living_count(game);
     mark_dead(game, seat);
@@ -208,8 +215,8 @@ fn die_from_demon(game: &mut Game, seat: SeatId) {
         on_poisoner_left_play(game);
     }
 
-    // Ravenkeeper: true character, ability not disabled at death → insert wake.
-    if is_rk && !was_disabled {
+    // Ravenkeeper death-wake: face role (true or Drunk face), even when ability_disabled.
+    if faces_as_rk {
         insert_ravenkeeper_wake(game, seat);
     }
 
