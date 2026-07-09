@@ -79,9 +79,19 @@ Each agent gets `/tmp/botc-harness-<uuid>/{host,seat0,…}/`:
 ## Limitations (v1)
 
 - Agents are driven by **periodic headless ticks** (`grok --prompt-file … --resume`), not a single eternal ACP connection.
+- Auto-approve uses a **single** flag (`--yolo`). Do not also pass `--always-approve` (same clap option → CLI error).
+- A tick is skipped per agent if the previous Grok process for that seat is still running.
 - Host-first Storyteller pauses require the **host** Grok agent (or skip defaults via host tools) to resolve night info.
 - Cost: N+1 model sessions. Start with 5 players.
-- Concurrent ticks can race; the engine is mutex-serialized, but agents may issue conflicting day actions.
+- Concurrent agents may issue conflicting day actions; the engine is mutex-serialized but not turn-locked.
+
+## Tests
+
+| Suite | Command |
+| --- | --- |
+| Default (no live Grok) | `cargo test` |
+| Socket / arg construction | included in default suite |
+| Live Grok smoke (network + auth) | `cargo test --test harness_grok_live -- --ignored --nocapture` |
 
 ## Related
 

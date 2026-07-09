@@ -1,6 +1,4 @@
 //! Stdio MCP proxy: binds a single host/player token and forwards tools to the harness socket.
-//!
-//! Grok sessions point project MCP config at this binary so every agent shares one game.
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -8,21 +6,22 @@ use std::path::PathBuf;
 use clap::Parser;
 use serde_json::{json, Value};
 
+use botc_mcp::harness::proxy_acl;
 use botc_mcp::harness::socket::SocketClient;
 use botc_mcp::mcp_server;
 
 #[derive(Parser, Debug)]
 #[command(name = "botc-agent-mcp", about = "Token-scoped MCP proxy for botc-tui harness")]
 struct Args {
-    /// Unix socket path of the harness engine RPC.
     #[arg(long)]
     socket: PathBuf,
-    /// File containing the opaque host/player token for this agent.
     #[arg(long)]
     token_file: PathBuf,
-    /// Fixed game_id (optional; usually injected into tool args from the token context).
     #[arg(long)]
     game_id: Option<u64>,
+    /// `host` or `player` (default player).
+    #[arg(long, default_value = "player")]
+    role: String,
 }
 
 fn main() {
@@ -38,6 +37,7 @@ fn main() {
         eprintln!("botc-agent-mcp: empty token");
         std::process::exit(2);
     }
+    let is_host = args.role.eq_ignore_ascii_case("host");
 
     let mut client = SocketClient::connect(&args.socket).unwrap_or_else(|e| {
         eprintln!("botc-agent-mcp: connect {}: {e}", args.socket.display());
@@ -55,7 +55,7 @@ fn main() {
         if line.is_empty() {
             continue;
         }
-        if let Some(resp) = handle_line(&mut client, &token, args.game_id, line) {
+        if let Some(resp) = handle_line(&mut client, &token, args.game_id, is_host, line) {
             let _ = writeln!(stdout, "{resp}");
             let _ = stdout.flush();
         }
@@ -66,6 +66,7 @@ fn handle_line(
     client: &mut SocketClient,
     token: &str,
     fixed_game_id: Option<u64>,
+    is_host: bool,
     line: &str,
 ) -> Option<String> {
     let req: Value = match serde_json::from_str(line) {
@@ -97,7 +98,16 @@ fn handle_line(
         })),
         "notifications/initialized" | "initialized" => Ok(Value::Null),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": mcp_server::list_tool_descriptors() })),
+        "tools/list" => {
+            let tools: Vec<Value> = mcp_server::list_tool_descriptors()
+                .into_iter()
+                .filter(|t| {
+                    let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    proxy_acl::tool_allowed(name, is_host)
+                })
+                .collect();
+            Ok(json!({ "tools": tools }))
+        }
         "tools/call" => {
             let Some(name) = params.get("name").and_then(|n| n.as_str()) else {
                 return Some(json!({
@@ -106,21 +116,38 @@ fn handle_line(
                     "error": { "code": -32602, "message": "tools/call requires name" }
                 }).to_string());
             };
+            if !proxy_acl::tool_allowed(name, is_host) {
+                return Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32601,
+                        "message": format!("tool not available for this agent role: {name}")
+                    }
+                }).to_string());
+            }
             let mut arguments = params
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            inject_auth(&mut arguments, token, fixed_game_id);
+            inject_auth(&mut arguments, token, fixed_game_id, is_host);
             client
                 .call_tool(name, arguments)
                 .map_err(|e| (-32000_i64, e))
         }
         other => {
-            let mut arguments = params;
-            inject_auth(&mut arguments, token, fixed_game_id);
-            client
-                .call_tool(other, arguments)
-                .map_err(|e| (-32000_i64, e))
+            if !proxy_acl::tool_allowed(other, is_host) {
+                Err((
+                    -32601,
+                    format!("method/tool not available for this agent role: {other}"),
+                ))
+            } else {
+                let mut arguments = params;
+                inject_auth(&mut arguments, token, fixed_game_id, is_host);
+                client
+                    .call_tool(other, arguments)
+                    .map_err(|e| (-32000_i64, e))
+            }
         }
     };
 
@@ -135,7 +162,7 @@ fn handle_line(
     })
 }
 
-fn inject_auth(args: &mut Value, token: &str, game_id: Option<u64>) {
+fn inject_auth(args: &mut Value, token: &str, game_id: Option<u64>, is_host: bool) {
     let obj = match args.as_object_mut() {
         Some(o) => o,
         None => {
@@ -143,14 +170,15 @@ fn inject_auth(args: &mut Value, token: &str, game_id: Option<u64>) {
             args.as_object_mut().unwrap()
         }
     };
-    // Always bind this proxy's token (player or host).
     obj.insert("token".into(), json!(token));
-    obj.insert("player_token".into(), json!(token));
-    obj.insert("host_token".into(), json!(token));
+    if is_host {
+        obj.insert("host_token".into(), json!(token));
+        obj.remove("player_token");
+    } else {
+        obj.insert("player_token".into(), json!(token));
+        obj.remove("host_token");
+    }
     if let Some(gid) = game_id {
-        // Always pin game_id so agents cannot target another table.
         obj.insert("game_id".into(), json!(gid));
     }
 }
-
-

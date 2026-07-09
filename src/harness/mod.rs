@@ -9,6 +9,7 @@
 
 pub mod agents;
 pub mod prompts;
+pub mod proxy_acl;
 pub mod socket;
 pub mod tui;
 

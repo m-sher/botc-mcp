@@ -182,9 +182,9 @@ impl App {
 
         match AgentPool::prepare(&self.cfg, configs) {
             Ok(mut pool) => match pool.kickoff_all(self.player_count) {
-                Ok(()) => {
+                Ok(spawned) => {
                     self.status = format!(
-                        "Game {game_id} · {} agents · Space=tick t=auto Tab=agent q=quit",
+                        "Game {game_id} · kicked {spawned}/{} · Space=tick t=auto Tab=agent q=quit",
                         self.player_count + 1
                     );
                     self.auto_tick = true;
@@ -207,8 +207,18 @@ impl App {
         };
         let (summary, hint) = self.public_summary_and_hint(gid);
         if let Some(pool) = self.agents.as_mut() {
+            let total = pool.agents.len();
             match pool.tick_all(&summary, &hint) {
-                Ok(()) => self.status = "Ticked all agents.".into(),
+                Ok(spawned) => {
+                    let skipped = total.saturating_sub(spawned);
+                    self.status = if skipped == 0 {
+                        format!("Ticked {spawned}/{total} agents.")
+                    } else {
+                        format!(
+                            "Ticked {spawned}/{total} agents ({skipped} still running previous tick)."
+                        )
+                    };
+                }
                 Err(e) => self.status = format!("tick error: {e}"),
             }
         }
