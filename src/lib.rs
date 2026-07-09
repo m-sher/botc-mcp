@@ -6,6 +6,7 @@ pub mod auth;
 pub mod comms;
 pub mod error;
 pub mod game;
+pub mod harness;
 pub mod rng;
 pub mod roles;
 pub mod store;

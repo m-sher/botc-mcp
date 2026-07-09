@@ -26,17 +26,20 @@ spec linked below.
 Requires a recent stable Rust toolchain.
 
 ```bash
-# Build library + binary
-cargo build
+# Build library + binaries
+cargo build --bins
 
 # Unit + integration tests (scenarios under tests/)
 cargo test
 
 # MCP server on stdin/stdout (line-delimited JSON-RPC 2.0)
-cargo run
-# same as:
-# cargo run --bin botc-mcp
+cargo run --bin botc-mcp
+
+# Multi-agent monitoring TUI (spawns headless Grok sessions)
+cargo run --bin botc-tui
 ```
+
+See [`docs/harness.md`](docs/harness.md) for the multi-agent harness architecture.
 
 Protocol and tool arguments: [`docs/mcp.md`](docs/mcp.md).
 
