@@ -15,6 +15,8 @@ pub enum GameError {
     IllegalAction(&'static str),
     #[error("not your wake")]
     NotYourWake,
+    #[error("wrong payload")]
+    WrongPayload,
     #[error("bad request: {0}")]
     BadRequest(&'static str),
 }

@@ -9,7 +9,10 @@ mod state;
 
 pub use crate::error::GameError;
 pub use ids::{GameId, SeatId};
-pub use night::{build_first_night_queue, build_other_night_queue};
+pub use night::{
+    build_first_night_queue, build_other_night_queue, ChoiceSchema, NightActionPayload,
+    PendingWake,
+};
 pub use phase::{DayStage, EndReason, NightStep, Phase, Winner};
 pub use seat::Seat;
 pub use setup::{BagResult, Composition, StartOpts};

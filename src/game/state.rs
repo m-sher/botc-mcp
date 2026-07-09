@@ -4,7 +4,7 @@ use crate::auth::{Actor, Token, TokenBook};
 use crate::comms::{PrivateInboxes, PrivateMessage, PublicEvent, PublicLog};
 use crate::error::GameError;
 use crate::game::ids::{GameId, SeatId};
-use crate::game::night::build_first_night_queue;
+use crate::game::night::{build_first_night_queue, PendingWake};
 use crate::game::phase::{NightStep, Phase, Winner};
 use crate::game::seat::Seat;
 use crate::game::setup::{build_bag, setup_markers, validate_fixed_assignments, StartOpts};
@@ -52,6 +52,8 @@ pub struct Game {
     pub night_queue: Vec<NightStep>,
     /// Index into `night_queue` (mirrors phase cursor while in night).
     pub night_cursor: usize,
+    /// Active player wake, if the night machine is waiting on a choice.
+    pub pending_night: Option<PendingWake>,
     /// Seats that died during the current night (demon kill, etc.).
     pub deaths_tonight: Vec<SeatId>,
     /// Seat executed during the current day, if any (Undertaker eligibility).
@@ -141,6 +143,7 @@ impl Game {
                 demon_bluffs: Vec::new(),
                 night_queue: Vec::new(),
                 night_cursor: 0,
+                pending_night: None,
                 deaths_tonight: Vec::new(),
                 executed_today: None,
             },
@@ -289,10 +292,13 @@ impl Game {
 
         self.deaths_tonight.clear();
         self.executed_today = None;
+        self.pending_night = None;
         self.night_queue = build_first_night_queue(self);
         self.night_cursor = 0;
         self.phase = Phase::FirstNight { cursor: 0 };
         self.st_announce("Night falls. Eyes closed. The first night begins.");
+        // Auto ST steps (setup, evil briefings, info stubs) until a choice or dawn.
+        self.night_tick();
         Ok(())
     }
 

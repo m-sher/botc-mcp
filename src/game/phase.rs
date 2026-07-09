@@ -13,6 +13,16 @@ pub enum Phase {
     Ended { winner: Winner, reason: EndReason },
 }
 
+impl Phase {
+    /// Night queue cursor when in FirstNight / Night; otherwise `None`.
+    pub fn cursor_if_night(&self) -> Option<usize> {
+        match self {
+            Phase::FirstNight { cursor } | Phase::Night { cursor, .. } => Some(*cursor),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DayStage {
     Discussion,

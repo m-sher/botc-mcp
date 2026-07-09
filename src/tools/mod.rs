@@ -6,9 +6,11 @@
 use crate::auth::{Actor, Token};
 use crate::comms::{EventId, PrivateMessage, PublicEvent};
 use crate::error::GameError;
-use crate::game::Phase;
 use crate::game::SeatId;
-use crate::game::{CreateGameResult, Game, GameId, PublicSeatView, StartOpts, Winner};
+use crate::game::{
+    ChoiceSchema, CreateGameResult, Game, GameId, NightActionPayload, PublicSeatView, StartOpts,
+    Winner,
+};
 use crate::roles::Character;
 use crate::store::GameStore;
 
@@ -79,6 +81,14 @@ pub struct PublicStateView {
     pub winner: Option<Winner>,
 }
 
+/// Structured “you must act” info (acting seat only; never leaks other seats’ wakes).
+#[derive(Debug, Clone)]
+pub struct AwaitingView {
+    pub action: &'static str,
+    pub prompt: String,
+    pub schema: ChoiceSchema,
+}
+
 /// Player-facing private snapshot. Must never expose Drunk as `character_label`.
 #[derive(Debug)]
 pub struct PrivateStateView {
@@ -90,10 +100,13 @@ pub struct PrivateStateView {
     pub team_label: Option<String>,
     pub rules_path: Option<String>,
     pub private_messages_since: Vec<(EventId, PrivateMessage)>,
+    /// True only when this seat has a pending night (or later day) action.
     pub awaiting_action: bool,
+    /// Details for the pending action; `None` unless this seat must act.
+    pub awaiting: Option<AwaitingView>,
 }
 
-/// Host locks lobby, assigns bag, enters First Night.
+/// Host locks lobby, assigns bag, enters First Night (and runs [`Game::night_tick`]).
 pub fn start_game(game: &mut Game, host: &Token, opts: StartOpts) -> Result<(), ToolError> {
     game.start_game(host, opts).map_err(ToolError::from)
 }
@@ -141,6 +154,17 @@ pub fn get_private_state(
         .ok_or(ToolError::Game(GameError::NoSuchSeat))?;
 
     let visible = seat.visible_character();
+    let awaiting = game.pending_night.as_ref().and_then(|p| {
+        if p.seat == seat_id {
+            Some(AwaitingView {
+                action: "night",
+                prompt: p.prompt.clone(),
+                schema: p.schema.clone(),
+            })
+        } else {
+            None
+        }
+    });
     Ok(PrivateStateView {
         seat: seat_id,
         name: seat.display_name.clone(),
@@ -154,10 +178,8 @@ pub fn get_private_state(
             .into_iter()
             .map(|(id, m)| (id, m.clone()))
             .collect(),
-        awaiting_action: matches!(
-            game.phase,
-            Phase::FirstNight { .. } | Phase::Night { .. } | Phase::Day { .. }
-        ),
+        awaiting_action: awaiting.is_some(),
+        awaiting,
     })
 }
 
@@ -193,29 +215,17 @@ pub struct CharacterRulesView {
     pub character_type: String,
 }
 
-/// Night choice payload — role inferred server-side from seat.
-#[derive(Debug, Clone)]
-pub enum NightActionPayload {
-    /// No choice (info-only wake acknowledgment).
-    Ack,
-    PickOne { target: SeatId },
-    PickTwo { a: SeatId, b: SeatId },
-    PickCharacter { name: String },
-}
-
 pub fn night_action(
     game: &mut Game,
     token: &Token,
-    _payload: NightActionPayload,
+    payload: NightActionPayload,
 ) -> Result<(), ToolError> {
-    let actor = game.tokens.resolve(token).ok_or(ToolError::Unauthorized)?;
-    let _seat = match actor {
-        Actor::Player { seat } => seat,
-        Actor::Host => return Err(ToolError::BadRequest("host cannot night_action")),
-    };
-    Err(ToolError::BadRequest(
-        "night_action resolution not implemented yet",
-    ))
+    game.night_action(token, payload).map_err(ToolError::from)
+}
+
+/// Host only: apply default for pending wake and continue night_tick.
+pub fn skip_night_action(game: &mut Game, host: &Token) -> Result<(), ToolError> {
+    game.skip_night_action(host).map_err(ToolError::from)
 }
 
 pub fn nominate(game: &mut Game, token: &Token, target: SeatId) -> Result<(), ToolError> {

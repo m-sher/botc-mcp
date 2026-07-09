@@ -77,15 +77,18 @@ fn first_night_queue_order_and_minion_by_true_character() {
 }
 
 #[test]
-fn start_game_stores_first_night_queue_and_cursor() {
+fn start_game_stores_first_night_queue_and_ticks_to_pending() {
     let game = fixture_drunk_empath_face();
     assert!(matches!(
         game.phase,
-        botc_mcp::game::Phase::FirstNight { cursor: 0 }
+        botc_mcp::game::Phase::FirstNight { .. }
     ));
     assert!(!game.night_queue.is_empty());
-    assert_eq!(game.night_queue, build_first_night_queue(&game));
-    assert_eq!(game.night_cursor, 0);
+    // night_tick ran: cursor past SetupMarkers, pending on first choice (Poisoner).
+    assert!(game.night_cursor > 0);
+    assert_eq!(game.phase.cursor_if_night(), Some(game.night_cursor));
+    let p = game.pending_night.as_ref().expect("Poisoner pending");
+    assert!(matches!(p.step, NightStep::Poisoner { seat: SeatId(2) }));
 }
 
 #[test]
@@ -176,4 +179,146 @@ fn dead_seats_omitted_from_queues() {
     assert!(q
         .iter()
         .any(|s| matches!(s, NightStep::Empath { seat: SeatId(0) })));
+}
+
+// ---------------------------------------------------------------------------
+// Task 7: night machine — briefings, pending wake, night_action, skip
+// ---------------------------------------------------------------------------
+
+use botc_mcp::comms::PrivateMessage;
+use botc_mcp::game::{NightActionPayload, Phase};
+use botc_mcp::tools::{self, get_private_state, night_action, skip_night_action};
+
+fn seven_names() -> Vec<String> {
+    (0..7).map(|i| format!("P{i}")).collect()
+}
+
+/// 7p: WW, Lib, Inv, Chef, Poisoner, Imp, Soldier — briefings + Poisoner choice.
+fn fixture_7p_poisoner_imp() -> (Game, botc_mcp::auth::Token, Vec<botc_mcp::auth::Token>) {
+    let lobby = Game::create(seven_names(), 3).unwrap();
+    let host = lobby.host_token.clone();
+    let tokens = lobby.player_tokens.clone();
+    let mut g = lobby.game;
+    g.start_game(
+        &host,
+        StartOpts {
+            assignments: Some(vec![
+                RoleAssignment::normal(SeatId(0), Character::Washerwoman),
+                RoleAssignment::normal(SeatId(1), Character::Librarian),
+                RoleAssignment::normal(SeatId(2), Character::Investigator),
+                RoleAssignment::normal(SeatId(3), Character::Chef),
+                RoleAssignment::normal(SeatId(4), Character::Poisoner),
+                RoleAssignment::normal(SeatId(5), Character::Imp),
+                RoleAssignment::normal(SeatId(6), Character::Soldier),
+            ]),
+        },
+    )
+    .unwrap();
+    (g, host, tokens)
+}
+
+#[test]
+fn seven_player_minion_learns_demon_on_start() {
+    let (g, _host, tokens) = fixture_7p_poisoner_imp();
+    let minion_tok = &tokens[4]; // Poisoner
+    let priv_state = get_private_state(&g, minion_tok, 0).unwrap();
+    assert!(
+        priv_state
+            .private_messages_since
+            .iter()
+            .any(|(_, m)| matches!(m, PrivateMessage::EvilBriefing { .. })),
+        "minion must receive EvilBriefing after auto night_tick: {:?}",
+        priv_state.private_messages_since
+    );
+    // Demon also briefed
+    let demon = get_private_state(&g, &tokens[5], 0).unwrap();
+    assert!(demon
+        .private_messages_since
+        .iter()
+        .any(|(_, m)| matches!(m, PrivateMessage::EvilBriefing { .. })));
+}
+
+#[test]
+fn start_game_stops_at_poisoner_pending() {
+    let (g, _host, tokens) = fixture_7p_poisoner_imp();
+    let p = g.pending_night.as_ref().expect("pending Poisoner");
+    assert!(matches!(p.step, NightStep::Poisoner { seat: SeatId(4) }));
+    assert_eq!(p.seat, SeatId(4));
+    assert!(matches!(g.phase, Phase::FirstNight { .. }));
+
+    let poisoner = get_private_state(&g, &tokens[4], 0).unwrap();
+    assert!(poisoner.awaiting_action);
+    assert!(poisoner.awaiting.is_some());
+    assert!(poisoner
+        .private_messages_since
+        .iter()
+        .any(|(_, m)| matches!(m, PrivateMessage::NightPrompt { .. })));
+
+    // Other seats must not see awaiting
+    let good = get_private_state(&g, &tokens[0], 0).unwrap();
+    assert!(!good.awaiting_action);
+    assert!(good.awaiting.is_none());
+}
+
+#[test]
+fn poisoner_night_action_applies_poison_and_advances() {
+    let (mut g, _host, tokens) = fixture_7p_poisoner_imp();
+    night_action(
+        &mut g,
+        &tokens[4],
+        NightActionPayload::PickOne { target: SeatId(0) },
+    )
+    .unwrap();
+    assert!(g.seats[0].poisoned);
+    assert!(!g.seats[4].poisoned);
+    // Pending cleared from Poisoner; next choice or info stubs may run
+    if let Some(p) = &g.pending_night {
+        assert_ne!(p.seat, SeatId(4), "Poisoner step should be done");
+    }
+}
+
+#[test]
+fn wrong_seat_night_action_rejected() {
+    let (mut g, _host, tokens) = fixture_7p_poisoner_imp();
+    let err = night_action(
+        &mut g,
+        &tokens[0],
+        NightActionPayload::PickOne { target: SeatId(1) },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        tools::ToolError::Game(botc_mcp::GameError::NotYourWake)
+    ));
+}
+
+#[test]
+fn host_skip_night_action_advances() {
+    let (mut g, host, tokens) = fixture_7p_poisoner_imp();
+    assert!(g.pending_night.is_some());
+    skip_night_action(&mut g, &host).unwrap();
+    // Default target is first legal seat (0); poison applied
+    assert!(g.seats.iter().any(|s| s.poisoned));
+    if let Some(p) = &g.pending_night {
+        assert_ne!(p.seat, SeatId(4));
+    }
+    // Player cannot skip
+    let err = skip_night_action(&mut g, &tokens[0]).unwrap_err();
+    assert!(matches!(
+        err,
+        tools::ToolError::Game(botc_mcp::GameError::Unauthorized) | tools::ToolError::Unauthorized
+    ));
+}
+
+#[test]
+fn five_player_no_evil_briefing() {
+    let g = fixture_drunk_empath_face();
+    let tok = g.tokens.player_token(SeatId(2)).unwrap().clone(); // Poisoner
+    let priv_state = get_private_state(&g, &tok, 0).unwrap();
+    assert!(!priv_state
+        .private_messages_since
+        .iter()
+        .any(|(_, m)| matches!(m, PrivateMessage::EvilBriefing { .. })));
+    assert!(g.pending_night.is_some());
+    assert_eq!(g.pending_night.as_ref().unwrap().seat, SeatId(2));
 }
