@@ -477,22 +477,6 @@ impl Game {
                 self.advance_after_host_decision();
                 Ok(())
             }
-            (
-                PendingHostDecision::VirginSpyReg { nominator, virgin },
-                HostDecision::Registration { register },
-            ) => {
-                self.pending_host = None;
-                crate::game::day::complete_virgin_spy_reg(self, nominator, virgin, register)?;
-                Ok(())
-            }
-            (
-                PendingHostDecision::SlayerRecluseReg { slayer, target },
-                HostDecision::Registration { register },
-            ) => {
-                self.pending_host = None;
-                crate::game::day::complete_slayer_recluse_reg(self, slayer, target, register)?;
-                Ok(())
-            }
             _ => Err(GameError::IllegalAction(
                 "host decision does not match pending decision type",
             )),
@@ -546,23 +530,6 @@ impl Game {
                     night_payload.as_ref(),
                 )?;
                 self.advance_after_host_decision();
-                Ok(())
-            }
-            PendingHostDecision::VirginSpyReg { nominator, virgin } => {
-                let lab = format!("virgin_reg:day:nom:{}", nominator.0);
-                let register =
-                    crate::game::ability::register::registers_as_townsfolk(self, nominator, &lab);
-                self.apply_host_decision(HostDecision::Registration { register })
-                    .map(|_| ())?;
-                let _ = virgin;
-                Ok(())
-            }
-            PendingHostDecision::SlayerRecluseReg { slayer, target } => {
-                let lab = format!("slayer_reg:day:{}", target.0);
-                let register =
-                    crate::game::ability::register::register_demon_for_ft(self, target, &lab);
-                self.apply_host_decision(HostDecision::Registration { register })?;
-                let _ = slayer;
                 Ok(())
             }
         }

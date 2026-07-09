@@ -118,22 +118,6 @@ impl HostDecisionView {
                 detail: format!("{ability} for seat {} ({reason})", seat.0),
                 seats: vec![*seat],
             },
-            PendingHostDecision::VirginSpyReg { nominator, virgin } => Self {
-                kind: "virgin_spy_reg".into(),
-                detail: format!(
-                    "does Spy seat {} register as Townsfolk for Virgin seat {}?",
-                    nominator.0, virgin.0
-                ),
-                seats: vec![*nominator, *virgin],
-            },
-            PendingHostDecision::SlayerRecluseReg { slayer, target } => Self {
-                kind: "slayer_recluse_reg".into(),
-                detail: format!(
-                    "does Recluse seat {} register as Demon for Slayer seat {}?",
-                    target.0, slayer.0
-                ),
-                seats: vec![*slayer, *target],
-            },
         }
     }
 }

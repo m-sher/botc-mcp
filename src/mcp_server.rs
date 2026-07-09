@@ -200,7 +200,7 @@ fn tool_description(name: &str) -> &'static str {
         "close_vote" => "Host: close current vote window (may auto-end day when no noms remain)",
         "end_nominations" => "Host: execute vote leader (if any), begin next night",
         "skip_night_action" => "Host: default pending wake OR pending host decision (random/default fallback)",
-        "host_decide" => "Host: resolve ST decision (mayor, starpass, night_info text, registration)",
+        "host_decide" => "Host: resolve ST decision (mayor_redirect, starpass_pick, night_info)",
         "host_queue_lie" => "Host: enqueue free-text false info for next disabled info result",
         _ => "botc-mcp tool",
     }
@@ -1018,16 +1018,6 @@ fn tool_host_decide(store: &SharedStore, args: Value) -> Result<Value, RpcError>
                 .ok_or_else(|| invalid_params("night_info requires text"))?
                 .to_string();
             HostDecision::NightInfo { text }
-        }
-        "virgin_spy_reg" | "slayer_recluse_reg" | "registration" => {
-            let register = args
-                .get("register")
-                .or_else(|| args.get("value"))
-                .and_then(|v| v.as_bool())
-                .ok_or_else(|| {
-                    invalid_params("registration decision requires register: bool")
-                })?;
-            HostDecision::Registration { register }
         }
         other => {
             return Err(invalid_params(format!(

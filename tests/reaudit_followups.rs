@@ -249,40 +249,40 @@ fn mayor_bounce_can_kill_minion() {
     assert!(g.seats[0].alive, "Mayor survives bounce");
 }
 
-/// #8 Slayer kills Recluse when Storyteller registers them as Demon.
+/// #8 Slayer kills Recluse when registration_mode forces misreg as Demon.
 #[test]
 fn slayer_can_kill_recluse_registering_as_demon() {
-    let (mut g, host, tokens) = start_scripted(
-        104,
-        0,
-        vec![
-            RoleAssignment::normal(SeatId(0), Character::Slayer),
-            RoleAssignment::normal(SeatId(1), Character::Recluse),
-            RoleAssignment::normal(SeatId(2), Character::Soldier),
-            RoleAssignment::normal(SeatId(3), Character::Poisoner),
-            RoleAssignment::normal(SeatId(4), Character::Imp),
-        ],
-    );
+    let lobby =
+        botc_mcp::game::Game::create_with_salt(names(5), 104, 0).unwrap();
+    let host = lobby.host_token.clone();
+    let tokens = lobby.player_tokens.clone();
+    let mut g = lobby.game;
+    g.start_game(
+        &host,
+        StartOpts {
+            assignments: Some(vec![
+                RoleAssignment::normal(SeatId(0), Character::Slayer),
+                RoleAssignment::normal(SeatId(1), Character::Recluse),
+                RoleAssignment::normal(SeatId(2), Character::Soldier),
+                RoleAssignment::normal(SeatId(3), Character::Poisoner),
+                RoleAssignment::normal(SeatId(4), Character::Imp),
+            ]),
+            registration_mode: botc_mcp::game::RegistrationMode::AlwaysMisreg,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     to_day1(&mut g, &host);
     g.seats[0].poisoned = false;
-    // Host-first: Recluse-as-Demon is ST discretion.
+    g.seats[1].poisoned = false;
     day_action(
         &mut g,
         &tokens[0],
         DayActionPayload::Slay { target: SeatId(1) },
     )
     .unwrap();
-    assert!(matches!(
-        g.pending_host,
-        Some(botc_mcp::game::PendingHostDecision::SlayerRecluseReg { .. })
-    ));
-    botc_mcp::tools::host_decide(
-        &mut g,
-        &host,
-        botc_mcp::game::HostDecision::Registration { register: true },
-    )
-    .unwrap();
-    assert!(!g.seats[1].alive, "Recluse dies when ST registers as Demon");
+    assert!(g.pending_host.is_none());
+    assert!(!g.seats[1].alive, "Recluse dies when registered as Demon");
     assert!(g.seats[4].alive, "Imp still alive; no SW path from Recluse");
 }
 

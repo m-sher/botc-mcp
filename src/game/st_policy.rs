@@ -60,16 +60,9 @@ pub enum PendingHostDecision {
         /// Optional player payload already collected (Fortune Teller / Ravenkeeper).
         payload: Option<NightInfoPayload>,
     },
-    /// Virgin: does the Spy nominator register as Townsfolk? (skip → random).
-    VirginSpyReg {
-        nominator: SeatId,
-        virgin: SeatId,
-    },
-    /// Slayer: does the Recluse target register as Demon? (skip → random).
-    SlayerRecluseReg {
-        slayer: SeatId,
-        target: SeatId,
-    },
+    // Day-time Spy/Recluse registration (Virgin / Slayer) is **not** a host pause:
+    // it resolves immediately via `registration_mode` so the day is never blocked and
+    // no covert channel is created (#39 residual / #41).
 }
 
 /// Payload needed to finish a night info step after a host pause.
@@ -91,11 +84,6 @@ pub enum HostDecision {
     /// Free-text private result for [`PendingHostDecision::NightInfo`].
     NightInfo {
         text: String,
-    },
-    /// Boolean registration choice for Virgin Spy / Slayer Recluse.
-    Registration {
-        /// `true` = misregister as the relevant type (Townsfolk / Demon).
-        register: bool,
     },
 }
 
@@ -122,8 +110,6 @@ impl PendingHostDecision {
             PendingHostDecision::MayorRedirect { .. } => "mayor_redirect",
             PendingHostDecision::StarpassPick { .. } => "starpass_pick",
             PendingHostDecision::NightInfo { .. } => "night_info",
-            PendingHostDecision::VirginSpyReg { .. } => "virgin_spy_reg",
-            PendingHostDecision::SlayerRecluseReg { .. } => "slayer_recluse_reg",
         }
     }
 }

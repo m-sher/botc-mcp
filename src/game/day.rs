@@ -173,26 +173,16 @@ pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameE
 
     // Virgin: first nomination always spends the once-per-game ability, even if poisoned/drunk.
     // Execution only if ability is active AND nominator registers as Townsfolk (Spy may).
+    //
+    // Spy/Recluse registration for the Virgin is resolved **immediately** via
+    // `registration_mode` (never a day-blocking host pause) so the public path is
+    // identical to a normal nomination — no limbo leak (#39) and no probe channel (#41).
     if is_virgin_first_nom {
         if let Ok(s) = seat_mut(game, target) {
             s.virgin_ability_used = true;
         }
+        commit_nomination_public(game, by, target);
         if !virgin_disabled {
-            let nominator_true = seat_ref(game, by)?.true_character;
-            let nominator_disabled = seat_ref(game, by)?.ability_disabled();
-            // Host-first: Spy nominator registration is Storyteller discretion.
-            // Do **not** publish Nominated yet (#39) — limbo would leak Virgin+Spy.
-            if game.st_choice_mode.is_host_first()
-                && nominator_true == Some(Character::Spy)
-                && !nominator_disabled
-            {
-                game.pending_host = Some(crate::game::st_policy::PendingHostDecision::VirginSpyReg {
-                    nominator: by,
-                    virgin: target,
-                });
-                return Ok(());
-            }
-            commit_nomination_public(game, by, target);
             let virgin_label = format!("virgin_reg:day:nom:{}", by.0);
             let nominator_registers_townsfolk =
                 crate::game::ability::register::registers_as_townsfolk(game, by, &virgin_label);
@@ -202,17 +192,8 @@ pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameE
                 try_auto_end_day(game)?;
                 return Ok(());
             }
-            // Ability spent; vote proceeds.
-            game.current_nomination = Some(OpenNomination {
-                by,
-                target,
-                votes: Vec::new(),
-                passes: Vec::new(),
-            });
-            return Ok(());
         }
-        // Virgin disabled: ability spent, vote proceeds (still publish nom).
-        commit_nomination_public(game, by, target);
+        // Disabled, or nominator does not register as Townsfolk: ability spent, vote proceeds.
         game.current_nomination = Some(OpenNomination {
             by,
             target,
@@ -229,36 +210,6 @@ pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameE
         votes: Vec::new(),
         passes: Vec::new(),
     });
-    Ok(())
-}
-
-/// Finish Virgin after host (or skip) decides whether a Spy nominator registers as Townsfolk.
-pub(crate) fn complete_virgin_spy_reg(
-    game: &mut Game,
-    nominator: SeatId,
-    virgin: SeatId,
-    register_as_townsfolk: bool,
-) -> Result<(), GameError> {
-    if game.current_nomination.is_some() {
-        return Err(GameError::IllegalAction(
-            "cannot resolve Virgin registration while another nomination is open",
-        ));
-    }
-    // Publish Nominated only now so observers never see a Spy/Virgin-only limbo (#39).
-    commit_nomination_public(game, nominator, virgin);
-    if register_as_townsfolk {
-        game.st_announce("The Virgin's power triggers. The nominator is executed.");
-        resolve_execution(game, nominator);
-        try_auto_end_day(game)?;
-    } else {
-        // Ability spent; open the vote window.
-        game.current_nomination = Some(OpenNomination {
-            by: nominator,
-            target: virgin,
-            votes: Vec::new(),
-            passes: Vec::new(),
-        });
-    }
     Ok(())
 }
 
@@ -695,16 +646,8 @@ pub fn day_action_slay(game: &mut Game, slayer: SeatId, target: SeatId) -> Resul
         return apply_slayer_kill(game, target, true);
     }
 
-    // Recluse-as-Demon is Storyteller discretion (host-first default; skip → random).
+    // Recluse-as-Demon via `registration_mode` immediately (no day-blocking host pause — #41).
     if target_seat.true_character == Some(Character::Recluse) && !target_seat.ability_disabled() {
-        if game.st_choice_mode.is_host_first() {
-            game.pending_host =
-                Some(crate::game::st_policy::PendingHostDecision::SlayerRecluseReg {
-                    slayer,
-                    target,
-                });
-            return Ok(());
-        }
         let demon_label = format!("slayer_reg:day:{}", target.0);
         if crate::game::ability::register::register_demon_for_ft(game, target, &demon_label) {
             return apply_slayer_kill(game, target, false);
@@ -713,29 +656,6 @@ pub fn day_action_slay(game: &mut Game, slayer: SeatId, target: SeatId) -> Resul
     }
 
     // Silent miss.
-    Ok(())
-}
-
-/// Finish Slayer after host decides Recluse demon registration.
-pub(crate) fn complete_slayer_recluse_reg(
-    game: &mut Game,
-    _slayer: SeatId,
-    target: SeatId,
-    register_as_demon: bool,
-) -> Result<(), GameError> {
-    // Defensive re-validation even though pending_host guards block concurrent mutation (#38).
-    if !matches!(game.phase, Phase::Day { .. }) {
-        return Ok(());
-    }
-    let Some(t) = game.seats.iter().find(|s| s.id == target) else {
-        return Ok(());
-    };
-    if !t.alive || t.true_character != Some(Character::Recluse) {
-        return Ok(());
-    }
-    if register_as_demon {
-        apply_slayer_kill(game, target, false)?;
-    }
     Ok(())
 }
 

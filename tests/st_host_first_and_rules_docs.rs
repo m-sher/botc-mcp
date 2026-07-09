@@ -153,8 +153,9 @@ fn st_choice_mode_random_auto_resolves_pair_info() {
     )));
 }
 
+/// #39 / #41: day-time Virgin/Spy registration is immediate (no day-blocking pause).
 #[test]
-fn virgin_spy_host_first_pauses_registration() {
+fn virgin_spy_registration_immediate_no_day_pause() {
     let (mut g, host, tokens) = start_scripted(
         14,
         vec![
@@ -164,45 +165,30 @@ fn virgin_spy_host_first_pauses_registration() {
             RoleAssignment::normal(SeatId(3), Character::Chef),
             RoleAssignment::normal(SeatId(4), Character::Imp),
         ],
-        |_| {},
+        |opts| {
+            // Force Spy to register as Townsfolk for Virgin.
+            opts.registration_mode = botc_mcp::game::RegistrationMode::AlwaysMisreg;
+        },
     );
     to_day1(&mut g, &host);
-    open_nominations(&mut g, &host).unwrap();
+    // From Discussion: public path is atomic (open noms + Nominated + outcome).
     nominate(&mut g, &tokens[1], SeatId(0)).unwrap();
-    assert!(matches!(
-        g.pending_host,
-        Some(botc_mcp::game::PendingHostDecision::VirginSpyReg { .. })
-    ));
-    // #39: no public Nominated / vote limbo until host resolves.
-    assert!(g.current_nomination.is_none());
     assert!(
-        !g.public_log
-            .since(0)
-            .iter()
-            .any(|(_, e)| matches!(e, botc_mcp::comms::PublicEvent::Nominated { .. })),
-        "Nominated must wait until host resolves VirginSpyReg"
+        g.pending_host.is_none(),
+        "day registration must not set pending_host"
     );
-    // #37: concurrent nominate blocked while pending.
-    let err = nominate(&mut g, &tokens[2], SeatId(4));
-    assert!(err.is_err(), "nominate blocked during host pause");
-    // Host: Spy registers as Townsfolk → execute Spy.
-    host_decide(
-        &mut g,
-        &host,
-        HostDecision::Registration { register: true },
-    )
-    .unwrap();
-    assert!(!g.seats[1].alive);
     assert!(g
         .public_log
         .since(0)
         .iter()
         .any(|(_, e)| matches!(e, botc_mcp::comms::PublicEvent::Nominated { .. })));
+    // AlwaysMisreg → Spy registers as Townsfolk → executed.
+    assert!(!g.seats[1].alive);
 }
 
-/// #36: end_nominations cannot drop a pending Slayer Recluse decision.
+/// #41: Slayer→Recluse does not block the day; registration_mode controls outcome.
 #[test]
-fn end_nominations_blocked_while_slayer_recluse_pending() {
+fn slayer_recluse_immediate_registration_mode() {
     let (mut g, host, tokens) = start_scripted(
         36,
         vec![
@@ -212,10 +198,11 @@ fn end_nominations_blocked_while_slayer_recluse_pending() {
             RoleAssignment::normal(SeatId(3), Character::Poisoner),
             RoleAssignment::normal(SeatId(4), Character::Imp),
         ],
-        |_| {},
+        |opts| {
+            opts.registration_mode = botc_mcp::game::RegistrationMode::AlwaysMisreg;
+        },
     );
     to_day1(&mut g, &host);
-    // Clear residual N1 poison so Recluse registration is legal.
     for s in &mut g.seats {
         s.poisoned = false;
     }
@@ -225,31 +212,44 @@ fn end_nominations_blocked_while_slayer_recluse_pending() {
         botc_mcp::tools::DayActionPayload::Slay { target: SeatId(1) },
     )
     .unwrap();
-    assert!(
-        matches!(
-            g.pending_host,
-            Some(botc_mcp::game::PendingHostDecision::SlayerRecluseReg { .. })
-        ),
-        "expected SlayerRecluseReg, got {:?}",
-        g.pending_host
-    );
-    open_nominations(&mut g, &host).expect_err("open_noms blocked");
-    botc_mcp::tools::end_nominations(&mut g, &host).expect_err("end_noms blocked");
-    // Still day; decision still pending; Recluse still alive.
-    assert!(matches!(g.phase, Phase::Day { day: 1, .. }));
-    assert!(g.pending_host.is_some());
-    assert!(g.seats[1].alive);
-    // Resolve then day can advance.
-    host_decide(
-        &mut g,
-        &host,
-        HostDecision::Registration { register: false },
-    )
-    .unwrap();
-    assert!(g.seats[1].alive);
+    assert!(g.pending_host.is_none());
+    assert!(!g.seats[1].alive, "AlwaysMisreg → Recluse dies as Demon");
+    // Day remains fully usable.
     open_nominations(&mut g, &host).unwrap();
     botc_mcp::tools::end_nominations(&mut g, &host).unwrap();
     assert!(matches!(g.phase, Phase::Night { night: 2, .. }));
+}
+
+/// Night host pause still blocks day mutations (#36/#37).
+#[test]
+fn night_info_pending_blocks_day_mutations() {
+    let (mut g, host, tokens) = start_scripted(
+        37,
+        vec![
+            RoleAssignment::normal(SeatId(0), Character::Washerwoman),
+            RoleAssignment::normal(SeatId(1), Character::Soldier),
+            RoleAssignment::normal(SeatId(2), Character::Chef),
+            RoleAssignment::normal(SeatId(3), Character::Poisoner),
+            RoleAssignment::normal(SeatId(4), Character::Imp),
+        ],
+        |_| {},
+    );
+    // Reach WW host pause (after poisoner).
+    while g.pending_night.is_some() {
+        skip_night_action(&mut g, &host).unwrap();
+    }
+    assert!(
+        matches!(
+            g.pending_host,
+            Some(botc_mcp::game::PendingHostDecision::NightInfo { .. })
+        ),
+        "expected night_info pause, got {:?}",
+        g.pending_host
+    );
+    // Player nominate must fail while night ST decision pending.
+    let err = nominate(&mut g, &tokens[0], SeatId(1));
+    assert!(err.is_err());
+    let _ = host;
 }
 
 /// #40: Fortune Teller always pauses in host-first (not only when Recluse is picked).

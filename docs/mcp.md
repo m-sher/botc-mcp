@@ -68,7 +68,7 @@ Auth: game tools take `game_id` plus `token` (or `host_token` / `player_token`).
 | `close_vote` | `game_id`, `host_token` | Host |
 | `end_nominations` | `game_id`, `host_token` | Host |
 | `skip_night_action` | `game_id`, `host_token` | Host default for pending **player** wake **or** pending **host** decision (random/default fallback) |
-| `host_decide` | `game_id`, `host_token`, `type`, … | ST decision: `mayor_redirect`, `starpass_pick`, `night_info` (`text`), `registration` (`register`) |
+| `host_decide` | `game_id`, `host_token`, `type`, … | ST decision: `mayor_redirect`, `starpass_pick`, `night_info` (`text`) |
 | `host_queue_lie` | `game_id`, `host_token`, `text` | Pre-queue free-text false info for disabled roles |
 
 ### `night_action` payload
