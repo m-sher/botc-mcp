@@ -66,8 +66,8 @@ Three columns — **left:** agents · **center:** live **action feed** (all agen
 | Key / mouse | Action |
 | --- | --- |
 | `Tab` / `Shift+Tab` / **click agent** | Select agent stream (resets to live tail) |
-| `Space` | Advance **one turn** — ticks only the agent(s) the engine is waiting on |
-| `t` | Toggle auto-tick (~45s), which runs the same turn-routed step |
+| `Space` | Advance **one turn** manually — ticks the agent(s) the engine is waiting on (only when idle; if a turn is still running it waits) |
+| `t` | Toggle **auto-advance** — event-driven: the next turn is ticked the moment all agents go idle (no timer; a running agent is never skipped) |
 | `g` | Center pane: toggle **action feed ↔ host grimoire** |
 | `f` | Feed filter: **all actions ↔ game-only** |
 | `h` / **click stream** | Expand/collapse **thinking** for the selected agent (default: collapsed) |
@@ -128,12 +128,12 @@ Each line is `[HH:MM:SS.mmm +elapsedms] …`. It records the state machine end t
   `pending_host` / `pending_night` / nomination state, and the routed `plan=[…]`.
 - `SPAWN` / `EXIT` — per agent: resume-vs-fresh, session id, first prompt line, full argv;
   and on exit the code, whether the session was `established`, and any id regeneration.
-  `SPAWN … SKIPPED` means the previous tick for that seat was still running.
+  (`SPAWN … SKIPPED` is a defensive no-op that should not appear now that ticks only fire when idle.)
 - `RPC` — every tool call through the socket: `actor tool args=… -> ok/ERR`.
 
-So a stuck host shows up plainly: e.g. repeated `TICK … plan=[Host]` with no following
-`RPC Host …` means the host agent isn't calling tools; `SPAWN Host … SKIPPED` means its
-previous tick never exited.
+So a stuck host shows up plainly: a `SPAWN Host` with no following `EXIT Host` for a long time
+means the tick hung (the game waits for it — it is never skipped); repeated `TICK … plan=[Host]`
+with no `RPC Host …` between them means the host agent isn't calling any tools.
 
 ## Workdirs
 
@@ -154,9 +154,9 @@ On quit (`q`) or process exit, the harness **kills** all Grok children and **rem
 
 ## Limitations (v1)
 
-- Agents are driven by **periodic headless ticks** (`grok --prompt-file … --resume`), not a single eternal ACP connection.
+- Agents are driven by **event-driven headless ticks** (`grok --prompt-file … --resume`), not a single eternal ACP connection: the next turn is ticked when all agents go idle, and a running agent is never skipped (a hung agent will hold the game until it exits — watch the debug log).
 - Auto-approve uses a **single** flag (`--yolo`). Do not also pass `--always-approve` (same clap option → CLI error).
-- A tick is skipped per agent if the previous Grok process for that seat is still running.
+- The next turn is only ticked once **all** agents are idle, so a per-seat tick is never spawned on top of a still-running one.
 - First-run success is required before `--resume` is used; a failed kickoff retries with a fresh `--session-id`.
 - Host-first Storyteller pauses require the **host** Grok agent (or skip defaults via host tools) to resolve night info.
 - Cost: N+1 model sessions, but the turn-router ticks only the 1–2 agents whose turn it is (plus a fan-out during an open vote), not all N+1 each cycle.

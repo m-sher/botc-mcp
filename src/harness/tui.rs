@@ -58,9 +58,11 @@ struct App {
     player_names: Vec<String>,
     socket: Option<SocketServer>,
     agents: Option<AgentPool>,
+    /// Event-driven auto-advance: when on, the next turn is ticked as soon as all
+    /// agents are idle (no fixed timer; a running agent is never skipped).
     auto_tick: bool,
+    /// When the last tick was launched — shown as "last turn Ns ago" (staleness).
     last_tick: Instant,
-    tick_interval: Duration,
     cfg: HarnessConfig,
     should_quit: bool,
     /// Lines scrolled up from the live tail (0 = stick to newest output) (#45).
@@ -123,7 +125,6 @@ impl App {
             agents: None,
             auto_tick: false,
             last_tick: Instant::now(),
-            tick_interval: Duration::from_secs(45),
             cfg,
             should_quit: false,
             scroll_from_bottom: 0,
@@ -274,8 +275,13 @@ impl App {
                 self.toggle_thinking_selected();
             }
             KeyCode::Char(' ') if self.agents.is_some() => {
-                self.do_tick();
-                self.last_tick = Instant::now();
+                // Never skip a running agent: only advance when everything is idle.
+                if self.any_agent_running() {
+                    self.status =
+                        "still running — advances automatically when this turn finishes".into();
+                } else {
+                    self.do_tick();
+                }
             }
             // Stream scroll: keyboard and mouse wheel (over stream). 0 = live tail.
             KeyCode::PageUp if self.focus == Focus::Monitor => {
@@ -518,6 +524,7 @@ impl App {
 
         self.tick_rotation = self.tick_rotation.wrapping_add(1);
         self.last_targets = plan_dbg;
+        self.last_tick = Instant::now();
         if let Some(pool) = self.agents.as_mut() {
             match pool.tick_scheduled(&plan, &summary, &hint) {
                 Ok(spawned) => {
@@ -526,14 +533,21 @@ impl App {
                         self.last_targets.join(", "),
                         plan.len()
                     );
-                    crate::dlog!(
-                        "TICK -> tick_scheduled spawned {spawned}/{}",
-                        plan.len()
-                    );
+                    crate::dlog!("TICK -> tick_scheduled spawned {spawned}/{}", plan.len());
+                    // Event-driven auto would re-fire immediately while idle; if a tick
+                    // spawns nothing (broken grok / all errored), stop auto to avoid a
+                    // hot retry loop. Re-enable with `t` after fixing.
+                    if spawned == 0 {
+                        self.auto_tick = false;
+                        self.status =
+                            "auto-advance stopped: tick spawned no agent (check grok / debug log). t=resume".into();
+                        crate::dlog!("TICK -> 0 spawned, auto_tick disabled");
+                    }
                 }
                 Err(e) => {
-                    self.status = format!("tick error: {e}");
-                    crate::dlog!("TICK -> tick_scheduled ERROR {e}");
+                    self.auto_tick = false;
+                    self.status = format!("tick error (auto stopped): {e}");
+                    crate::dlog!("TICK -> tick_scheduled ERROR {e}, auto_tick disabled");
                 }
             }
         }
@@ -563,6 +577,14 @@ impl App {
         }
     }
 
+    /// True if any agent's Grok child is currently running.
+    fn any_agent_running(&self) -> bool {
+        self.agents
+            .as_ref()
+            .map(|p| p.agents.iter().any(|a| *a.running.lock().unwrap()))
+            .unwrap_or(false)
+    }
+
     /// Labels of agents whose Grok child is currently running.
     fn running_labels(&self) -> Vec<String> {
         let Some(pool) = self.agents.as_ref() else {
@@ -587,12 +609,9 @@ impl App {
         } else {
             self.last_targets.join(",")
         };
+        let ago = self.last_tick.elapsed().as_secs();
         let tick = if self.auto_tick {
-            let rem = self
-                .tick_interval
-                .saturating_sub(self.last_tick.elapsed())
-                .as_secs();
-            format!("auto {rem}s")
+            "auto (on turn end)".to_string()
         } else {
             "manual (Space)".to_string()
         };
@@ -616,7 +635,7 @@ impl App {
         ];
         if running.is_empty() {
             spans.push(Span::styled(
-                "idle (nothing running)",
+                format!("idle · last turn {ago}s ago"),
                 Style::default().fg(Color::DarkGray),
             ));
         } else {
@@ -930,10 +949,10 @@ pub fn run_tui() -> io::Result<()> {
         if app.should_quit {
             break Ok(());
         }
-        if app.auto_tick && app.agents.is_some() && app.last_tick.elapsed() >= app.tick_interval {
-            crate::dlog!("auto-tick fired ({}s elapsed)", app.last_tick.elapsed().as_secs());
+        // Event-driven auto-advance: tick the next turn as soon as every agent is
+        // idle (a running agent is never skipped; there is no fixed timer).
+        if app.auto_tick && app.agents.is_some() && !app.any_agent_running() {
             app.do_tick();
-            app.last_tick = Instant::now();
         }
         // Drain the whole queue so scroll floods don't lag behind real keys.
         while event::poll(Duration::from_millis(0))? {
