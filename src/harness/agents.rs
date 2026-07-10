@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::game::SeatId;
 use crate::harness::prompts;
+use crate::harness::scheduler::SchedTarget;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentRole {
@@ -233,6 +234,61 @@ impl AgentPool {
                 ),
             };
             match spawn_grok_tick(&self.cfg, agent, &prompt) {
+                Ok(TickOutcome::Spawned) => n += 1,
+                Ok(TickOutcome::SkippedStillRunning) => {}
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if n == 0 {
+            if let Some(e) = last_err {
+                return Err(e);
+            }
+        }
+        Ok(n)
+    }
+
+    /// Turn-routed tick (#60): run only the agents the scheduler selected this
+    /// cycle, each with a targeted role/phase prompt. Skips agents whose previous
+    /// tick is still running. Returns how many were spawned.
+    pub fn tick_scheduled(
+        &mut self,
+        targets: &[SchedTarget],
+        public_summary: &str,
+        host_hint: &str,
+    ) -> std::io::Result<usize> {
+        let mut n = 0;
+        let mut last_err: Option<std::io::Error> = None;
+        for target in targets {
+            let idx = match target {
+                SchedTarget::Host(_) => self
+                    .agents
+                    .iter()
+                    .position(|a| matches!(a.config.role, AgentRole::Host)),
+                SchedTarget::Player { seat, .. } => {
+                    let seat = *seat;
+                    self.agents
+                        .iter()
+                        .position(|a| matches!(a.config.role, AgentRole::Player { seat: s } if s == seat))
+                }
+            };
+            let Some(idx) = idx else { continue };
+            let prompt = match target {
+                SchedTarget::Host(task) => {
+                    let a = &self.agents[idx];
+                    prompts::host_task_tick(a.config.game_id, task, public_summary, host_hint)
+                }
+                SchedTarget::Player { seat, task } => {
+                    let a = &self.agents[idx];
+                    prompts::player_task_tick(
+                        &a.config.display_name,
+                        *seat,
+                        a.config.game_id,
+                        task,
+                        public_summary,
+                    )
+                }
+            };
+            match spawn_grok_tick(&self.cfg, &mut self.agents[idx], &prompt) {
                 Ok(TickOutcome::Spawned) => n += 1,
                 Ok(TickOutcome::SkippedStillRunning) => {}
                 Err(e) => last_err = Some(e),

@@ -19,7 +19,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
-use crate::game::{Game, GameId, SeatId, StartOpts, StChoiceMode};
+use crate::game::{Game, GameId, Phase, SeatId, StartOpts, StChoiceMode};
+use crate::harness::scheduler::{plan_ticks, wait_signature};
 use crate::harness::agents::{
     agent_mcp_bin_ok, find_agent_mcp_bin, find_grok, resolve_agent_mcp_bin_for_display,
     AgentConfig, AgentPool, AgentRole, HarnessConfig,
@@ -52,6 +53,12 @@ struct App {
     should_quit: bool,
     /// Lines scrolled up from the live tail (0 = stick to newest output) (#45).
     scroll_from_bottom: usize,
+    /// Round-robin cursor for discussion/nomination turns in the scheduler (#60).
+    tick_rotation: usize,
+    /// Signature of what the engine was waiting on last tick, for stall detection (#60).
+    wait_sig: Option<String>,
+    /// Consecutive cycles the engine has sat on `wait_sig`; drives host escalation (#60).
+    stall: usize,
 }
 
 impl App {
@@ -93,6 +100,9 @@ impl App {
             cfg,
             should_quit: false,
             scroll_from_bottom: 0,
+            tick_rotation: 0,
+            wait_sig: None,
+            stall: 0,
         }
     }
 
@@ -273,61 +283,56 @@ impl App {
         }
     }
 
+    /// One turn-routed tick (#60): plan from engine state, then tick only the
+    /// agent(s) the game is waiting on. Stops (and disarms auto-tick) at `Ended`.
     fn do_tick(&mut self) {
         let Some(gid) = self.game_id else {
             return;
         };
-        let (summary, hint) = self.public_summary_and_hint(gid);
+        // Read all we need under one short lock: the plan, the prompt context,
+        // and whether the game is over. Do NOT hold the lock while spawning grok.
+        let (plan, summary, hint, ended, sig, stall) = {
+            let st = self.store.lock().unwrap();
+            let Some(g) = st.get(GameId(gid)) else {
+                return;
+            };
+            // Stall detection: same wait as last cycle => it's not progressing.
+            let sig = wait_signature(g);
+            let stall = if sig.is_some() && sig == self.wait_sig {
+                self.stall + 1
+            } else {
+                0
+            };
+            let plan = plan_ticks(g, self.tick_rotation, stall);
+            let (summary, hint) = game_summary_and_hint(g);
+            (
+                plan,
+                summary,
+                hint,
+                matches!(g.phase, Phase::Ended { .. }),
+                sig,
+                stall,
+            )
+        };
+        self.wait_sig = sig;
+        self.stall = stall;
+
+        if ended {
+            self.auto_tick = false;
+            self.status = "Game ended — agents idle. Press q to quit or Tab to review streams.".into();
+            return;
+        }
+
+        self.tick_rotation = self.tick_rotation.wrapping_add(1);
         if let Some(pool) = self.agents.as_mut() {
-            let total = pool.agents.len();
-            match pool.tick_all(&summary, &hint) {
+            match pool.tick_scheduled(&plan, &summary, &hint) {
                 Ok(spawned) => {
-                    let skipped = total.saturating_sub(spawned);
-                    self.status = if skipped == 0 {
-                        format!("Ticked {spawned}/{total} agents.")
-                    } else {
-                        format!(
-                            "Ticked {spawned}/{total} agents ({skipped} still running previous tick)."
-                        )
-                    };
+                    self.status =
+                        format!("Turn tick: {spawned} of {} targeted agent(s) spawned.", plan.len());
                 }
                 Err(e) => self.status = format!("tick error: {e}"),
             }
         }
-    }
-
-    fn public_summary_and_hint(&self, game_id: u64) -> (String, String) {
-        let st = self.store.lock().unwrap();
-        let Some(g) = st.get(GameId(game_id)) else {
-            return ("(no game)".into(), String::new());
-        };
-        let phase = format!("{:?}", g.phase);
-        let living: Vec<_> = g
-            .seats
-            .iter()
-            .filter(|s| s.alive)
-            .map(|s| format!("{}#{}", s.display_name, s.id.0))
-            .collect();
-        let chat: Vec<_> = g
-            .public_log
-            .since(0)
-            .into_iter()
-            .rev()
-            .take(12)
-            .map(|(id, e)| format!("#{id} {e:?}"))
-            .collect();
-        let chat: Vec<_> = chat.into_iter().rev().collect();
-        let summary = format!(
-            "phase={phase}\nliving={}\nrecent_log:\n{}",
-            living.join(", "),
-            chat.join("\n")
-        );
-        let hint = format!(
-            "pending_night={} pending_host={:?}",
-            g.pending_night.is_some(),
-            g.pending_host.as_ref().map(|p| p.kind_str())
-        );
-        (summary, hint)
     }
 
     fn snapshot_host(&self) -> String {
@@ -400,6 +405,38 @@ impl App {
             let _ = std::fs::remove_dir_all(&self.cfg.work_root);
         }
     }
+}
+
+/// Public snapshot + host hint string for tick prompts, computed from a locked game.
+/// Free function so the scheduler can build it under the store lock without a second lock.
+fn game_summary_and_hint(g: &Game) -> (String, String) {
+    let phase = format!("{:?}", g.phase);
+    let living: Vec<_> = g
+        .seats
+        .iter()
+        .filter(|s| s.alive)
+        .map(|s| format!("{}#{}", s.display_name, s.id.0))
+        .collect();
+    let chat: Vec<_> = g
+        .public_log
+        .since(0)
+        .into_iter()
+        .rev()
+        .take(12)
+        .map(|(id, e)| format!("#{id} {e:?}"))
+        .collect();
+    let chat: Vec<_> = chat.into_iter().rev().collect();
+    let summary = format!(
+        "phase={phase}\nliving={}\nrecent_log:\n{}",
+        living.join(", "),
+        chat.join("\n")
+    );
+    let hint = format!(
+        "pending_night={} pending_host={:?}",
+        g.pending_night.is_some(),
+        g.pending_host.as_ref().map(|p| p.kind_str())
+    );
+    (summary, hint)
 }
 
 /// RAII guard: restores terminal raw-mode / alternate screen on Drop or panic (#49).

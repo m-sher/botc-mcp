@@ -1,6 +1,7 @@
 //! System / kickoff prompts for headless Grok player and host agents.
 
 use crate::game::SeatId;
+use crate::harness::scheduler::{HostTask, PlayerTask};
 
 pub fn player_kickoff(
     display_name: &str,
@@ -121,5 +122,122 @@ Call get_host_state. Resolve pending_host / stuck wakes / stalled day. Advance t
         game_id = game_id,
         public_summary = public_summary,
         host_hint = host_hint,
+    )
+}
+
+/// Targeted host prompt for a single scheduled turn: says exactly what the engine
+/// is waiting on, so the host acts instead of re-inspecting and idling.
+pub fn host_task_tick(
+    game_id: u64,
+    task: &HostTask,
+    public_summary: &str,
+    host_hint: &str,
+) -> String {
+    let action = match task {
+        HostTask::StartGame => {
+            "The game is in **lobby**. Call `start_game` (prefer a random bag unless scripted), \
+             then begin the first night."
+                .to_string()
+        }
+        HostTask::ResolveDecision { kind } => format!(
+            "A Storyteller decision is pending: **pending_host = {kind}**. It is blocking the night. \
+             Resolve it now with `host_decide` (author coherent, playable info for night_info; \
+             pick a legal target for mayor_redirect / starpass_pick) or `skip_night_action` to take \
+             the engine default. Do not leak the grimoire."
+        ),
+        HostTask::AdvanceNight => {
+            "It is night with no pending player wake and no pending decision. Advance the night \
+             machine: call `get_host_state`, then `skip_night_action` (or the appropriate host tool) \
+             to move the cursor to the next wake. Keep advancing until a player must act or the day opens."
+                .to_string()
+        }
+        HostTask::SkipStuckWake { seat } => format!(
+            "Player **seat {}** was woken but has not submitted a night action for several turns — \
+             it is holding up the night. As Storyteller, resolve it now: call `skip_night_action` to \
+             apply the engine default for that wake and advance the cursor. Do not wait further.",
+            seat.0
+        ),
+        HostTask::PaceDiscussion => {
+            "It is **day (discussion)**. Let players talk. When discussion has run enough (or it is \
+             stalling), call `open_nominations` to move to nominations. Make only legal `st_announce` \
+             statements; never reveal roles."
+                .to_string()
+        }
+        HostTask::ManageNominations => {
+            "It is **day (nominations)** with no open vote. Ensure nominations are open \
+             (`open_nominations` if needed); if nominations are exhausted or the day should end, \
+             `end_nominations`. Move the day forward."
+                .to_string()
+        }
+        HostTask::CloseVoting => {
+            "A nomination's **vote is open**. Once the eligible players have voted (or the window \
+             should close), call `close_vote` to tally it, then continue the day \
+             (`end_nominations` when done)."
+                .to_string()
+        }
+    };
+    format!(
+        r#"You are the Storyteller for game_id={game_id}. It is your turn to act.
+
+## Do this now
+{action}
+
+## Public snapshot
+{public_summary}
+
+## Host hint
+{host_hint}
+
+Always pass game_id={game_id}. Act with your host tools this turn — do not just inspect and stop.
+"#,
+    )
+}
+
+/// Targeted player prompt for a single scheduled turn.
+pub fn player_task_tick(
+    display_name: &str,
+    seat: SeatId,
+    game_id: u64,
+    task: &PlayerTask,
+    public_summary: &str,
+) -> String {
+    let seat = seat.0;
+    let action = match task {
+        PlayerTask::NightWake { prompt } => format!(
+            "**You are being woken for your night action.** The Storyteller asks:\n\n> {prompt}\n\n\
+             Call `get_private_state` to see your role and the exact choice, then submit your \
+             `night_action` now with a legal target. If your ability is passive/info-only, acknowledge \
+             as the prompt requires."
+        ),
+        PlayerTask::Discuss => {
+            "It is **day (discussion)** and it is your turn to speak. Call `get_public_state` \
+             (and `get_private_state`) for context, then use `say` to share a read, a claim, or a \
+             question. If you want someone executed, you may `nominate` them. Say something concrete \
+             this turn — don't just inspect."
+                .to_string()
+        }
+        PlayerTask::Nominate => {
+            "It is **day (nominations)** and it is your turn. If you want a player executed, \
+             `nominate` them now (you may nominate at most once per day); otherwise `say` your \
+             reasoning for holding off. Act this turn."
+                .to_string()
+        }
+        PlayerTask::Vote { nomination } => format!(
+            "**A nomination is open** — {nomination}. It is your turn to vote. Decide and cast it now: \
+             `vote` (yes/no) if you have a vote available, or `pass_vote` to abstain. Dead players \
+             have only one ghost vote for the whole game — spend it deliberately."
+        ),
+    };
+    format!(
+        r#"Continue as {display_name} (seat {seat}) in Trouble Brewing, game_id={game_id}. It is your turn.
+
+## Do this now
+{action}
+
+## Public snapshot (re-fetch with tools for detail)
+{public_summary}
+
+Always pass game_id={game_id}. Never invent private info about other seats or claim tools you lack.
+"#,
     )
 }

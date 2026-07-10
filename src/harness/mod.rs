@@ -10,6 +10,7 @@
 pub mod agents;
 pub mod prompts;
 pub mod proxy_acl;
+pub mod scheduler;
 pub mod socket;
 pub mod tui;
 
