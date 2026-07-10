@@ -68,22 +68,26 @@ Key tools:
 - open_nominations / close_vote / end_nominations — day pacing when needed
 - st_announce — public ST announcements
 
-## Storyteller policy
-- Prefer coherent, playable false info; do not hard-code a winner.
-- When pending_host is set, resolve it (host_decide or skip_night_action).
-- When a player night wake is stuck, skip_night_action after a reasonable wait.
-- Day often auto-opens/ends; intervene if stalled.
-- Night info in host-first: you author private results via host_decide night_info text, or skip for engine default.
-- Never leak grimoire contents in st_announce or public chat.
+## How the engine drives the night (READ THIS)
+The engine runs the night order for you. At any moment `get_host_state` shows **at most one**
+thing waiting on you: either `pending_host` (a Storyteller decision — e.g. what a player learns
+tonight) or a `pending` player wake. **Your entire job each turn is to resolve that one item**, then
+you're done — the engine advances to the next step and the harness calls you again. You do **not**
+run the night order yourself, and you do **not** need to read or search for any game source code /
+files — the MCP tools are the whole interface.
 
-## Loop
-1. get_host_state + get_public_state
-2. If lobby: start_game
-3. Resolve pending_host or pending wakes
-4. Keep the game moving until Ended
-5. Summarize winners privately to yourself; public only legal announcements
+- `pending_host` = night_info → the named player must learn something tonight. Author it with
+  `host_decide`, or `skip_night_action` to let the engine pick valid default info. **If unsure, skip.**
+- `pending_host` = mayor_redirect / starpass_pick → make the choice with `host_decide` (or skip).
+- a `pending` player wake that's stuck → `skip_night_action` after a reasonable wait.
+- Reading rules (`get_rules_topic`, `get_character_rules`) is fine, but **do not spend the turn only
+  reading** — finish by calling a host tool that changes the game.
+- Never leak grimoire contents in `st_announce` or public chat.
 
-Start now: check host state and start the game if needed, then drive the first night.
+## This turn
+1. `start_game` if still in lobby.
+2. `get_host_state`; resolve the single pending item (`host_decide` or `skip_night_action`).
+3. Stop. The harness will call you for the next step.
 "#,
         game_id = game_id,
         n_players = n_players,
@@ -139,16 +143,17 @@ pub fn host_task_tick(
              then begin the first night."
                 .to_string()
         }
-        HostTask::ResolveDecision { kind } => format!(
-            "A Storyteller decision is pending: **pending_host = {kind}**. It is blocking the night. \
-             Resolve it now with `host_decide` (author coherent, playable info for night_info; \
-             pick a legal target for mayor_redirect / starpass_pick) or `skip_night_action` to take \
-             the engine default. Do not leak the grimoire."
+        HostTask::ResolveDecision { detail, .. } => format!(
+            "The night is paused waiting on **one** Storyteller decision from you:\n\n\
+             {detail}\n\n\
+             Call `get_host_state` if you want the exact details, then make that **one** decision \
+             (`host_decide` or `skip_night_action`). If unsure, `skip_night_action` always works and \
+             immediately advances the night. Never reveal the grimoire in public."
         ),
         HostTask::AdvanceNight => {
-            "It is night with no pending player wake and no pending decision. Advance the night \
-             machine: call `get_host_state`, then `skip_night_action` (or the appropriate host tool) \
-             to move the cursor to the next wake. Keep advancing until a player must act or the day opens."
+            "It is night with no pending player wake and no pending decision. Advance the night: \
+             call `get_host_state`, then `skip_night_action` to move to the next wake. Keep advancing \
+             until a player must act or the day opens."
                 .to_string()
         }
         HostTask::SkipStuckWake { seat } => format!(
@@ -188,7 +193,12 @@ pub fn host_task_tick(
 ## Host hint
 {host_hint}
 
-Always pass game_id={game_id}. Act with your host tools this turn — do not just inspect and stop.
+Everything you need is in your **MCP tools** (server `botc`) — you do **not** need to read or search
+for any game source code or files on disk; do not run shell commands to look for game logic. This
+turn resolves exactly one thing and the harness will call you again for the next step. Reading rules
+(`get_rules_topic`, `get_character_rules`) is fine, but **finish this turn by calling a host tool**
+that changes the game (`host_decide`, `skip_night_action`, `open_nominations`, `st_announce`, …).
+Always pass game_id={game_id}.
 "#,
     )
 }

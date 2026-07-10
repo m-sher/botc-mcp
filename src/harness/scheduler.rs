@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 
-use crate::game::{DayStage, Game, OpenNomination, Phase, SeatId};
+use crate::game::{DayStage, Game, OpenNomination, PendingHostDecision, Phase, SeatId};
 
 /// One targeted tick the scheduler wants to run this cycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,8 +23,9 @@ pub enum SchedTarget {
 pub enum HostTask {
     /// Game is in lobby; start it.
     StartGame,
-    /// A `pending_host` Storyteller decision is blocking progress.
-    ResolveDecision { kind: String },
+    /// A `pending_host` Storyteller decision is blocking progress. `detail` is a
+    /// concrete, human description of exactly what to decide (seat/ability/choices).
+    ResolveDecision { kind: String, detail: String },
     /// Night with no pending player/host wait; advance the night machine.
     AdvanceNight,
     /// A player wake has been stuck for several cycles; skip it to the engine
@@ -74,6 +75,7 @@ pub fn plan_ticks(game: &Game, rotation: usize, stall: usize) -> Vec<SchedTarget
             if let Some(ph) = &game.pending_host {
                 vec![SchedTarget::Host(HostTask::ResolveDecision {
                     kind: ph.kind_str().to_string(),
+                    detail: describe_pending_host(ph),
                 })]
             } else if let Some(w) = &game.pending_night {
                 // Tick only the woken seat. If it keeps failing to act, escalate to
@@ -180,6 +182,46 @@ pub fn wait_signature(game: &Game) -> Option<String> {
 /// Human-readable description of an open nomination for the vote prompt.
 fn nom_desc(nom: &OpenNomination) -> String {
     format!("seat {} nominated seat {}", nom.by.0, nom.target.0)
+}
+
+/// Concrete description of the pending Storyteller decision, so the host knows
+/// exactly what it is deciding (rather than just a `kind` string).
+fn describe_pending_host(ph: &PendingHostDecision) -> String {
+    let seats = |v: &[SeatId]| {
+        v.iter()
+            .map(|s| format!("P{}", s.0))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match ph {
+        PendingHostDecision::NightInfo {
+            seat,
+            ability,
+            reason,
+            ..
+        } => format!(
+            "P{} (playing {ability}) must receive their night information now (reason: {reason}). \
+             Provide it with `host_decide` (the private text they learn), or call `skip_night_action` \
+             to have the engine generate valid default info for them. Either one advances the night.",
+            seat.0
+        ),
+        PendingHostDecision::MayorRedirect {
+            mayor,
+            living_others,
+        } => format!(
+            "The Imp attacked the Mayor (P{}). With `host_decide` choose one: bounce the kill onto \
+             another living player ({}), let nobody die, or let the Mayor die. Or `skip_night_action` \
+             for the engine default.",
+            mayor.0,
+            seats(living_others)
+        ),
+        PendingHostDecision::StarpassPick { minions, dead_imp } => format!(
+            "The Imp (P{}) self-killed (starpass). With `host_decide` choose which minion ({}) becomes \
+             the new Imp, or `skip_night_action` for the engine default.",
+            dead_imp.0,
+            seats(minions)
+        ),
+    }
 }
 
 /// The `rotation`-th living seat (round-robin), or `None` if nobody is alive.
