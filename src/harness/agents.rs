@@ -412,7 +412,9 @@ fn spawn_grok_tick(
     agent: &mut LiveAgent,
     prompt: &str,
 ) -> std::io::Result<TickOutcome> {
+    let label = agent_label(&agent.config.role);
     if *agent.running.lock().unwrap() {
+        crate::dlog!("SPAWN {label} SKIPPED (previous tick still running)");
         return Ok(TickOutcome::SkippedStillRunning);
     }
 
@@ -420,10 +422,6 @@ fn spawn_grok_tick(
     fs::write(&prompt_file, prompt)?;
 
     let session_started = *agent.session_started.lock().unwrap();
-    // If a previous first-run failed, mint a fresh session id so --session-id is not a collision (#47).
-    if !session_started {
-        // Keep existing id for first attempt; regenerate only after a failed attempt (see waiter).
-    }
     let session_id = agent.session_id.lock().unwrap().clone();
 
     let args = build_grok_tick_args(
@@ -432,6 +430,13 @@ fn spawn_grok_tick(
         &prompt_file,
         &session_id,
         session_started,
+    );
+    crate::dlog!(
+        "SPAWN {label} mode={} session={} prompt_first_line={:?} argv=[{}]",
+        if session_started { "resume" } else { "fresh" },
+        session_id,
+        prompt.lines().next().unwrap_or(""),
+        args.join(" ")
     );
 
     let mut cmd = Command::new(&cfg.grok_bin);
@@ -493,8 +498,9 @@ fn spawn_grok_tick(
 
     // Waiter: session_started from stream evidence (#47/#56), not exit code alone.
     let child_slot_w = Arc::clone(&child_slot);
+    let exit_label = label.clone();
     thread::spawn(move || {
-        let _status = child_slot_w.wait_exit();
+        let status = child_slot_w.wait_exit();
         // stdout reader may still be finishing; give it a brief moment.
         for _ in 0..10 {
             if session_established.load(Ordering::SeqCst) {
@@ -503,16 +509,32 @@ fn spawn_grok_tick(
             thread::sleep(Duration::from_millis(10));
         }
         let established = session_established.load(Ordering::SeqCst);
+        let was_started = *session_started_flag.lock().unwrap();
+        let mut regenerated = false;
         if established {
             *session_started_flag.lock().unwrap() = true;
-        } else if !*session_started_flag.lock().unwrap() {
+        } else if !was_started {
             // No session was created (auth/spawn death) — next tick uses a fresh --session-id.
             *session_id_slot.lock().unwrap() = uuid::Uuid::new_v4().to_string();
+            regenerated = true;
         }
         *running_flag.lock().unwrap() = false;
+        crate::dlog!(
+            "EXIT {exit_label} status={:?} established={established} session_started(now)={} regenerated_id={regenerated}",
+            status.map(|s| s.code()),
+            established || was_started
+        );
     });
 
     Ok(TickOutcome::Spawned)
+}
+
+/// Short label for an agent role (for logs / feed).
+fn agent_label(role: &AgentRole) -> String {
+    match role {
+        AgentRole::Host => "Host".to_string(),
+        AgentRole::Player { seat } => format!("P{}", seat.0),
+    }
 }
 
 /// True if a streaming-json line means grok created/used a session (#56).

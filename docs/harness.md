@@ -115,6 +115,26 @@ The one-time **kickoff** still fans out to every agent (each introduces itself);
 play is turn-routed. This is why, with the host driving, agents act on their turn instead
 of all polling tools at once.
 
+## Debug log
+
+The TUI writes a **verbose, timestamped** trace to a file (the full-screen UI can't use
+stdout). Default `/tmp/botc-tui-debug.log` (override with `BOTC_TUI_LOG`); the path is shown
+in the status line at launch, and it survives quit (it is **not** under the deleted work root).
+
+Each line is `[HH:MM:SS.mmm +elapsedms] …`. It records the state machine end to end:
+
+- `LAUNCH` — game id, player count, ST mode, token count.
+- `TICK` — every scheduler cycle: `sig` (what the engine waits on), `stall`, live `phase` /
+  `pending_host` / `pending_night` / nomination state, and the routed `plan=[…]`.
+- `SPAWN` / `EXIT` — per agent: resume-vs-fresh, session id, first prompt line, full argv;
+  and on exit the code, whether the session was `established`, and any id regeneration.
+  `SPAWN … SKIPPED` means the previous tick for that seat was still running.
+- `RPC` — every tool call through the socket: `actor tool args=… -> ok/ERR`.
+
+So a stuck host shows up plainly: e.g. repeated `TICK … plan=[Host]` with no following
+`RPC Host …` means the host agent isn't calling tools; `SPAWN Host … SKIPPED` means its
+previous tick never exited.
+
 ## Workdirs
 
 Each agent gets `/tmp/botc-harness-<uuid>/{host,seat0,…}/`:

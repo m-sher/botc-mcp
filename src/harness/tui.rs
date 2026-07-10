@@ -391,6 +391,13 @@ impl App {
             );
         }
         self.action_log.set_labels(labels);
+        crate::dlog!(
+            "LAUNCH game_id={game_id} players={} st_mode={} host_token={}… players_tokens={}",
+            self.player_count,
+            self.cfg.st_choice_mode,
+            &created.host_token.as_str()[..8.min(created.host_token.as_str().len())],
+            created.player_tokens.len()
+        );
 
         let mut configs = vec![AgentConfig {
             role: AgentRole::Host,
@@ -421,11 +428,13 @@ impl App {
                     self.focus = Focus::Monitor;
                     self.scroll_from_bottom = 0;
                     self.agents = Some(pool);
+                    crate::dlog!("LAUNCH kickoff spawned {spawned}/{}", self.player_count + 1);
                 }
                 Err(e) => {
                     // Partial pool still owns workdirs — keep it so shutdown/stop_all cleans up.
                     self.status = format!("kickoff: {e}");
                     self.agents = Some(pool);
+                    crate::dlog!("LAUNCH kickoff ERROR {e}");
                 }
             },
             Err(e) => {
@@ -454,7 +463,7 @@ impl App {
         };
         // Read all we need under one short lock: the plan, the prompt context,
         // and whether the game is over. Do NOT hold the lock while spawning grok.
-        let (plan, summary, hint, ended, sig, stall) = {
+        let (plan, summary, hint, ended, sig, stall, state_dbg) = {
             let st = self.store.lock().unwrap();
             let Some(g) = st.get(GameId(gid)) else {
                 return;
@@ -468,6 +477,15 @@ impl App {
             };
             let plan = plan_ticks(g, self.tick_rotation, stall);
             let (summary, hint) = game_summary_and_hint(g);
+            let state_dbg = format!(
+                "phase={:?} pending_host={:?} pending_night={:?} nom={:?}",
+                g.phase,
+                g.pending_host.as_ref().map(|p| p.kind_str()),
+                g.pending_night.as_ref().map(|w| w.seat.0),
+                g.current_nomination
+                    .as_ref()
+                    .map(|n| (n.by.0, n.target.0, n.votes.len())),
+            );
             (
                 plan,
                 summary,
@@ -475,19 +493,31 @@ impl App {
                 matches!(g.phase, Phase::Ended { .. }),
                 sig,
                 stall,
+                state_dbg,
             )
         };
-        self.wait_sig = sig;
+        self.wait_sig = sig.clone();
         self.stall = stall;
+
+        let plan_dbg: Vec<String> = plan.iter().map(target_label).collect();
+        crate::dlog!(
+            "TICK rotation={} sig={:?} stall={} {} plan=[{}]",
+            self.tick_rotation,
+            sig,
+            stall,
+            state_dbg,
+            plan_dbg.join(", ")
+        );
 
         if ended {
             self.auto_tick = false;
             self.status = "Game ended — agents idle. Press q to quit or Tab to review streams.".into();
+            crate::dlog!("TICK -> game ended, auto_tick off");
             return;
         }
 
         self.tick_rotation = self.tick_rotation.wrapping_add(1);
-        self.last_targets = plan.iter().map(target_label).collect();
+        self.last_targets = plan_dbg;
         if let Some(pool) = self.agents.as_mut() {
             match pool.tick_scheduled(&plan, &summary, &hint) {
                 Ok(spawned) => {
@@ -496,8 +526,15 @@ impl App {
                         self.last_targets.join(", "),
                         plan.len()
                     );
+                    crate::dlog!(
+                        "TICK -> tick_scheduled spawned {spawned}/{}",
+                        plan.len()
+                    );
                 }
-                Err(e) => self.status = format!("tick error: {e}"),
+                Err(e) => {
+                    self.status = format!("tick error: {e}");
+                    crate::dlog!("TICK -> tick_scheduled ERROR {e}");
+                }
             }
         }
     }
@@ -875,9 +912,18 @@ fn install_panic_hook() {
 }
 
 pub fn run_tui() -> io::Result<()> {
+    let log_path = crate::harness::debug_log::log_path();
+    crate::harness::debug_log::init(&log_path);
     install_panic_hook();
     let mut guard = TerminalGuard::enter()?;
     let mut app = App::new();
+    app.status = format!("{}  · debug log: {log_path}", app.status);
+    crate::dlog!(
+        "run_tui: grok={} model={} agent_mcp={}",
+        app.cfg.grok_bin.display(),
+        app.cfg.model,
+        app.cfg.agent_mcp_bin.display()
+    );
 
     let result = loop {
         guard.terminal_mut().draw(|f| draw(f, &mut app))?;
@@ -885,6 +931,7 @@ pub fn run_tui() -> io::Result<()> {
             break Ok(());
         }
         if app.auto_tick && app.agents.is_some() && app.last_tick.elapsed() >= app.tick_interval {
+            crate::dlog!("auto-tick fired ({}s elapsed)", app.last_tick.elapsed().as_secs());
             app.do_tick();
             app.last_tick = Instant::now();
         }

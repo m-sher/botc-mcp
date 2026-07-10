@@ -103,6 +103,23 @@ impl ActionLog {
             });
         g.seq += 1;
         let seq = g.seq;
+        // Verbose trace: actor, tool, full args, and outcome (for post-mortem debugging).
+        let args_str = {
+            let s = args.to_string();
+            if s.len() > 400 {
+                format!("{}…", &s[..400])
+            } else {
+                s
+            }
+        };
+        crate::dlog!(
+            "RPC #{seq} {} {tool} args={args_str} -> {}",
+            actor.name,
+            match &error {
+                Some(e) => format!("ERR {e}"),
+                None => "ok".to_string(),
+            }
+        );
         let entry = ActionEntry {
             seq,
             secs,
