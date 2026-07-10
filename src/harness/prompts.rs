@@ -25,19 +25,21 @@ Typical tools:
 - get_public_state / get_public_log — shared table
 - get_private_state — your secret role and private inbox (Drunk: you only see a Townsfolk face)
 - get_character_rules / list_characters / list_rules_topics / get_rules_topic — public rules
-- say — public chat only (no whispers)
+- say — public chat, **day only** (at night players are asleep and silent; say is rejected at night)
 - night_action / day_action / nominate / vote / pass_vote — when it is legal for you
+- Actions are **state-gated** by the engine: it rejects anything illegal for the current phase.
 
 ## How to play
 1. Call get_private_state and get_public_state.
 2. Read the rules for your face role if needed.
-3. Talk publicly with say when useful.
+3. Talk publicly with `say` **during the day**; at night, only submit your `night_action` when woken.
 4. When you are awaiting a night/day action, submit it.
 5. Bluff freely in chat; never claim tool access you don't have.
 6. Do not try to become host or use host tools.
 7. Keep playing until the game ends (winner in public state) or you are told to stop.
 
-Start now: inspect your private state and introduce yourself in public chat briefly.
+Start now: read your private role and the public state. You'll speak in public chat once the day
+begins — for the first night, just review your role and wait to be woken if your character acts.
 "#,
         display_name = display_name,
         seat = seat.0,
