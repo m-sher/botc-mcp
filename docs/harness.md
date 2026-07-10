@@ -8,7 +8,7 @@ It:
 2. Exposes that game over a **Unix-socket tool RPC**.
 3. Spawns **N player + 1 host** headless [Grok Build](https://grok.x.ai) sessions.
 4. Each session loads a project-scoped MCP config pointing at `botc-agent-mcp`, a stdio MCP proxy that injects that agent’s token and forwards tools to the shared engine.
-5. Shows a **ratatui** board: agent list, host grimoire, and live agent streams (tail-anchored).
+5. Shows a **ratatui** board: agent list (with running/idle glyphs), a live **action feed** (every agent tool call, game actions highlighted) or host grimoire, and the selected agent's stream.
 
 ```
 ┌────────────────────────────────────────────────────────────┐
@@ -61,16 +61,30 @@ cargo run --bin botc-tui
 
 ### Monitor screen
 
-| Key | Action |
+Three columns — **left:** agents · **center:** live **action feed** (all agents) or host grimoire · **right:** the selected agent's raw stream. The **top bar** shows live progress: `phase · turn <who> · auto Ns / manual · running: <who>` — so you can always tell whether anything is actually running.
+
+| Key / mouse | Action |
 | --- | --- |
-| `Tab` / `Shift+Tab` | Select agent stream (resets to live tail) |
+| `Tab` / `Shift+Tab` / **click agent** | Select agent stream (resets to live tail) |
 | `Space` | Advance **one turn** — ticks only the agent(s) the engine is waiting on |
 | `t` | Toggle auto-tick (~45s), which runs the same turn-routed step |
-| `PgUp` / `PgDn` | Scroll selected agent log (away from / toward live tail) |
+| `g` | Center pane: toggle **action feed ↔ host grimoire** |
+| `f` | Feed filter: **all actions ↔ game-only** |
+| `h` / **click stream** | Expand/collapse **thinking** for the selected agent (default: collapsed) |
+| `PgUp`/`PgDn`/`↑`/`↓` / **wheel on stream** | Scroll selected agent log (away from / toward live tail) |
 | `Home` | Jump to live tail |
 | `q` | Kill agents, remove workdirs, stop socket, quit |
 
-Left: agents · Center: **host grimoire** (true roles) · Right: selected agent’s stream (**newest lines visible by default**).
+**Action feed.** Every agent tool call is recorded at the shared socket and shown here, newest at the bottom, labelled by caller (`Host` / `P0`…, colour-coded). **Game-affecting actions** (`say`, `nominate`, `vote`, `night_action`, `host_decide`, `close_vote`, …) are **highlighted** with a `▶` marker + bold tool name + cyan arg summary (e.g. `P3 ▶ vote →P1 YES ✓`); read-only inspection (`get_*_state`, `list_*`) is dimmed; errors are red. Press **`f`** to hide the info-read noise and show only game actions + errors. This is the fastest way to see *what agents are doing* (vs the per-agent stream, which shows their reasoning).
+
+Per-agent **status glyph** in the left list: `●` green = a Grok child is running for that seat, `○` grey = idle.
+
+**Stream pane:** model `[think]` blocks are **collapsed by default** so when you Tab
+agents you see their game-facing output (text, tool results, errors, turn end). A one-line
+summary (`▾ [think] N blocks …`) stands in for hidden thought. **`h`** or **left-click the
+stream** expands that agent’s full thinking (`▸ [think] …`); again collapses. Expansion is
+**per agent**. Title shows `·think▾` / `·think▸`. **Mouse wheel over the stream** scrolls
+history (same as PgUp/PgDn); wheel elsewhere is ignored so it never synthesizes keys.
 
 ## Turn order (scheduling)
 

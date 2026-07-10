@@ -7,6 +7,7 @@
 //!   that launches `botc-agent-mcp` (stdio proxy) bound to that agent's token.
 //! - The TUI polls host/public state and tails agent stdout for monitoring.
 
+pub mod action_log;
 pub mod agents;
 pub mod prompts;
 pub mod proxy_acl;

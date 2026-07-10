@@ -1,12 +1,14 @@
 //! Ratatui monitoring UI for the multi-agent harness.
 
+use std::collections::HashSet;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+    MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -20,7 +22,8 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::game::{Game, GameId, Phase, SeatId, StartOpts, StChoiceMode};
-use crate::harness::scheduler::{plan_ticks, wait_signature};
+use crate::harness::action_log::{ActionKind, ActionLog, ActorLabel};
+use crate::harness::scheduler::{plan_ticks, wait_signature, SchedTarget};
 use crate::harness::agents::{
     agent_mcp_bin_ok, find_agent_mcp_bin, find_grok, resolve_agent_mcp_bin_for_display,
     AgentConfig, AgentPool, AgentRole, HarnessConfig,
@@ -33,6 +36,15 @@ use crate::tools;
 enum Focus {
     Setup,
     Monitor,
+}
+
+/// Which actions the feed shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeedFilter {
+    /// Everything, incl. info reads (dimmed).
+    All,
+    /// Only game-affecting actions and errors.
+    GameOnly,
 }
 
 struct App {
@@ -59,6 +71,21 @@ struct App {
     wait_sig: Option<String>,
     /// Consecutive cycles the engine has sat on `wait_sig`; drives host escalation (#60).
     stall: usize,
+    /// Agent indices whose stream shows full `[think]` blocks (default: collapsed).
+    thinking_expanded: HashSet<usize>,
+    /// Last drawn hit targets for mouse (agents list + stream pane).
+    hit_agents: Rect,
+    hit_stream: Rect,
+    /// Central feed of every agent tool RPC (shared with the socket server) (#UI).
+    action_log: Arc<ActionLog>,
+    /// Center pane shows the grimoire (true) or the action feed (false).
+    show_grimoire: bool,
+    /// Labels of the agents targeted by the most recent scheduled tick (for the status bar).
+    last_targets: Vec<String>,
+    /// Rows scrolled up from the tail of the action feed (0 = live).
+    feed_scroll: usize,
+    /// Which actions the feed shows (all vs game-only).
+    feed_filter: FeedFilter,
 }
 
 impl App {
@@ -103,12 +130,90 @@ impl App {
             tick_rotation: 0,
             wait_sig: None,
             stall: 0,
+            thinking_expanded: HashSet::new(),
+            hit_agents: Rect::default(),
+            hit_stream: Rect::default(),
+            action_log: Arc::new(ActionLog::default()),
+            show_grimoire: false,
+            last_targets: Vec::new(),
+            feed_scroll: 0,
+            feed_filter: FeedFilter::All,
+        }
+    }
+
+    fn selected_thinking_expanded(&self) -> bool {
+        self.thinking_expanded.contains(&self.selected_agent)
+    }
+
+    fn toggle_thinking_selected(&mut self) {
+        if self.agents.is_none() {
+            return;
+        }
+        let idx = self.selected_agent;
+        if self.thinking_expanded.contains(&idx) {
+            self.thinking_expanded.remove(&idx);
+            self.status = format!("agent {idx}: thinking collapsed (h / click stream)");
+        } else {
+            self.thinking_expanded.insert(idx);
+            self.status = format!("agent {idx}: thinking expanded (h / click stream)");
+        }
+        self.scroll_from_bottom = 0;
+    }
+
+    /// Scroll the selected agent stream by `delta` visual rows (positive = older / up).
+    fn scroll_stream(&mut self, delta: i32) {
+        if self.focus != Focus::Monitor || self.agents.is_none() {
+            return;
+        }
+        if delta > 0 {
+            self.scroll_from_bottom = self
+                .scroll_from_bottom
+                .saturating_add(delta as usize);
+        } else {
+            self.scroll_from_bottom = self
+                .scroll_from_bottom
+                .saturating_sub((-delta) as usize);
+        }
+    }
+
+    fn on_mouse(&mut self, m: MouseEvent) {
+        let x = m.column;
+        let y = m.row;
+        match m.kind {
+            // Wheel / trackpad: scroll the stream when the pointer is over it.
+            MouseEventKind::ScrollUp if point_in_rect(self.hit_stream, x, y) => {
+                self.scroll_stream(3);
+            }
+            MouseEventKind::ScrollDown if point_in_rect(self.hit_stream, x, y) => {
+                self.scroll_stream(-3);
+            }
+            // Left click: select agent, or toggle thinking on the stream pane.
+            MouseEventKind::Down(MouseButton::Left) => {
+                if point_in_rect(self.hit_agents, x, y) {
+                    if let Some(pool) = self.agents.as_ref() {
+                        let n = pool.agents.len();
+                        if n == 0 {
+                            return;
+                        }
+                        // Row under the top border → agent index.
+                        let inner_y = y.saturating_sub(self.hit_agents.y.saturating_add(1));
+                        let idx = inner_y as usize;
+                        if idx < n {
+                            self.selected_agent = idx;
+                            self.scroll_from_bottom = 0;
+                            self.status = format!("selected agent {idx}");
+                        }
+                    }
+                } else if point_in_rect(self.hit_stream, x, y) {
+                    self.toggle_thinking_selected();
+                }
+            }
+            // Ignore other mouse noise (drags, right-click, wheel outside stream).
+            _ => {}
         }
     }
 
     fn on_key(&mut self, code: KeyCode) {
-        // Only explicit keyboard actions. Mouse wheel / trackpad scroll is ignored
-        // in the event loop (EnableMouseCapture + drop Event::Mouse).
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Up | KeyCode::Char('k') if self.focus == Focus::Setup => {
@@ -142,16 +247,48 @@ impl App {
                 self.auto_tick = !self.auto_tick;
                 self.status = format!("auto_tick={}", self.auto_tick);
             }
+            // Toggle the center pane between the action feed and the host grimoire.
+            KeyCode::Char('g') if self.agents.is_some() => {
+                self.show_grimoire = !self.show_grimoire;
+                self.status = if self.show_grimoire {
+                    "center: grimoire (g = action feed)".into()
+                } else {
+                    "center: action feed (g = grimoire)".into()
+                };
+            }
+            // Toggle the feed filter: all actions ↔ game-only.
+            KeyCode::Char('f') if self.agents.is_some() => {
+                self.feed_filter = match self.feed_filter {
+                    FeedFilter::All => FeedFilter::GameOnly,
+                    FeedFilter::GameOnly => FeedFilter::All,
+                };
+                self.show_grimoire = false;
+                self.status = match self.feed_filter {
+                    FeedFilter::All => "feed: all actions (f = game-only)".into(),
+                    FeedFilter::GameOnly => "feed: game actions only (f = all)".into(),
+                };
+            }
+            // Expand/collapse [think] for the selected agent (default collapsed).
+            // Same as left-click on the stream pane.
+            KeyCode::Char('h') if self.agents.is_some() => {
+                self.toggle_thinking_selected();
+            }
             KeyCode::Char(' ') if self.agents.is_some() => {
                 self.do_tick();
                 self.last_tick = Instant::now();
             }
-            // Keyboard-only log navigation (not mouse scroll). 0 = live tail.
+            // Stream scroll: keyboard and mouse wheel (over stream). 0 = live tail.
             KeyCode::PageUp if self.focus == Focus::Monitor => {
-                self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(5);
+                self.scroll_stream(5);
             }
             KeyCode::PageDown if self.focus == Focus::Monitor => {
-                self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(5);
+                self.scroll_stream(-5);
+            }
+            KeyCode::Up if self.focus == Focus::Monitor => {
+                self.scroll_stream(1);
+            }
+            KeyCode::Down if self.focus == Focus::Monitor => {
+                self.scroll_stream(-1);
             }
             KeyCode::Home if self.focus == Focus::Monitor => {
                 // Jump to live tail.
@@ -194,7 +331,11 @@ impl App {
             st.insert(created.game).0
         };
 
-        match SocketServer::start(Arc::clone(&self.store), &self.cfg.socket_path) {
+        match SocketServer::start_with_log(
+            Arc::clone(&self.store),
+            Arc::clone(&self.action_log),
+            &self.cfg.socket_path,
+        ) {
             Ok(s) => self.socket = Some(s),
             Err(e) => {
                 self.status = format!("socket: {e}");
@@ -229,6 +370,28 @@ impl App {
         self.game_id = Some(game_id);
         self.host_token = Some(created.host_token.clone());
 
+        // Register token → actor labels so the action feed can name each caller.
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            created.host_token.as_str().to_string(),
+            ActorLabel {
+                name: "Host".into(),
+                seat: None,
+                is_host: true,
+            },
+        );
+        for (i, tok) in created.player_tokens.iter().enumerate() {
+            labels.insert(
+                tok.as_str().to_string(),
+                ActorLabel {
+                    name: format!("P{i}"),
+                    seat: Some(i as u8),
+                    is_host: false,
+                },
+            );
+        }
+        self.action_log.set_labels(labels);
+
         let mut configs = vec![AgentConfig {
             role: AgentRole::Host,
             display_name: "Storyteller".into(),
@@ -250,7 +413,7 @@ impl App {
             Ok(mut pool) => match pool.kickoff_all(self.player_count) {
                 Ok(spawned) => {
                     self.status = format!(
-                        "Game {game_id} · kicked {spawned}/{} · Space=tick t=auto Tab=agent q=quit",
+                        "Game {game_id} · kicked {spawned}/{} · Space=tick · click stream=think · wheel=scroll · q=quit",
                         self.player_count + 1
                     );
                     self.auto_tick = true;
@@ -324,15 +487,108 @@ impl App {
         }
 
         self.tick_rotation = self.tick_rotation.wrapping_add(1);
+        self.last_targets = plan.iter().map(target_label).collect();
         if let Some(pool) = self.agents.as_mut() {
             match pool.tick_scheduled(&plan, &summary, &hint) {
                 Ok(spawned) => {
-                    self.status =
-                        format!("Turn tick: {spawned} of {} targeted agent(s) spawned.", plan.len());
+                    self.status = format!(
+                        "Turn tick → {}: {spawned} of {} spawned.",
+                        self.last_targets.join(", "),
+                        plan.len()
+                    );
                 }
                 Err(e) => self.status = format!("tick error: {e}"),
             }
         }
+    }
+
+    /// Concise phase label for the status bar (`Night 1`, `Day 2·noms`, `Ended: Good`).
+    fn phase_label(&self) -> String {
+        let Some(gid) = self.game_id else {
+            return "Lobby".into();
+        };
+        let st = self.store.lock().unwrap();
+        let Some(g) = st.get(GameId(gid)) else {
+            return "—".into();
+        };
+        match &g.phase {
+            Phase::Lobby => "Lobby".into(),
+            Phase::FirstNight { .. } => "Night 1".into(),
+            Phase::Night { night, .. } => format!("Night {night}"),
+            Phase::Day { day, stage } => {
+                let s = match stage {
+                    crate::game::DayStage::Discussion => "disc",
+                    crate::game::DayStage::Nominations => "noms",
+                };
+                format!("Day {day}·{s}")
+            }
+            Phase::Ended { winner, .. } => format!("Ended: {winner:?}"),
+        }
+    }
+
+    /// Labels of agents whose Grok child is currently running.
+    fn running_labels(&self) -> Vec<String> {
+        let Some(pool) = self.agents.as_ref() else {
+            return Vec::new();
+        };
+        pool.agents
+            .iter()
+            .filter(|a| *a.running.lock().unwrap())
+            .map(|a| match a.config.role {
+                AgentRole::Host => "Host".into(),
+                AgentRole::Player { seat } => format!("P{}", seat.0),
+            })
+            .collect()
+    }
+
+    /// Game-progress spans for the top bar: phase · whose turn · tick mode · running.
+    fn status_spans(&self) -> Vec<Span<'static>> {
+        let phase = self.phase_label();
+        let running = self.running_labels();
+        let turn = if self.last_targets.is_empty() {
+            "—".to_string()
+        } else {
+            self.last_targets.join(",")
+        };
+        let tick = if self.auto_tick {
+            let rem = self
+                .tick_interval
+                .saturating_sub(self.last_tick.elapsed())
+                .as_secs();
+            format!("auto {rem}s")
+        } else {
+            "manual (Space)".to_string()
+        };
+        let mut spans = vec![
+            Span::styled(
+                format!(" {phase} "),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("· turn "),
+            Span::styled(format!("{turn} "), Style::default().fg(Color::Yellow)),
+            Span::raw("· "),
+            Span::styled(
+                format!("{tick} "),
+                if self.auto_tick {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                },
+            ),
+            Span::raw("· "),
+        ];
+        if running.is_empty() {
+            spans.push(Span::styled(
+                "idle (nothing running)",
+                Style::default().fg(Color::DarkGray),
+            ));
+        } else {
+            spans.push(Span::styled(
+                format!("▶ running: {}", running.join(",")),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans
     }
 
     fn snapshot_host(&self) -> String {
@@ -375,7 +631,8 @@ impl App {
         }
     }
 
-    /// Full agent log as joined text (newest at end). Caller applies tail-anchor scroll (#45).
+    /// Agent stream for the selected seat: thinking collapsed by default so game
+    /// actions (text / tools / errors) stay visible; `h` expands `[think]` blocks.
     fn agent_log_text(&self) -> String {
         let Some(pool) = self.agents.as_ref() else {
             return String::new();
@@ -388,7 +645,8 @@ impl App {
         let log = agent.log.lock().unwrap();
         // Cap retained lines for the pane (keep a generous buffer for PgUp).
         let start = log.len().saturating_sub(400);
-        log[start..].join("\n")
+        let slice = &log[start..];
+        format_stream_for_display(slice, self.thinking_expanded.contains(&idx))
     }
 
     fn shutdown(&mut self) {
@@ -437,6 +695,114 @@ fn game_summary_and_hint(g: &Game) -> (String, String) {
         g.pending_host.as_ref().map(|p| p.kind_str())
     );
     (summary, hint)
+}
+
+/// Label a scheduler target for the status bar.
+fn target_label(t: &SchedTarget) -> String {
+    match t {
+        SchedTarget::Host(_) => "Host".into(),
+        SchedTarget::Player { seat, .. } => format!("P{}", seat.0),
+    }
+}
+
+/// Stable per-agent colour (host magenta; players cycle a palette by seat).
+fn actor_color(is_host: bool, seat: Option<u8>) -> Color {
+    if is_host {
+        return Color::Magenta;
+    }
+    const PAL: [Color; 6] = [
+        Color::Cyan,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::LightRed,
+        Color::LightGreen,
+    ];
+    PAL[(seat.unwrap_or(0) as usize) % PAL.len()]
+}
+
+/// Render one action-feed entry as a styled line. Game actions are bright with a
+/// `▶` marker; info reads are dimmed; errors are red. The actor is colour-coded.
+fn feed_line(e: &crate::harness::action_log::ActionEntry) -> Line<'static> {
+    let ac = actor_color(e.actor.is_host, e.actor.seat);
+    let (tool_style, marker) = match e.kind {
+        ActionKind::Game => (
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            "▶ ",
+        ),
+        ActionKind::Info => (Style::default().fg(Color::DarkGray), "  "),
+        ActionKind::Meta => (Style::default().fg(Color::Gray), "  "),
+    };
+    let mut spans = vec![
+        Span::styled(format!("{:>4}s ", e.secs), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:<5}", e.actor.name),
+            Style::default().fg(ac).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(marker, tool_style),
+        Span::styled(e.tool.clone(), tool_style),
+    ];
+    if !e.summary.is_empty() {
+        let sty = if e.kind == ActionKind::Game {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(e.summary.clone(), sty));
+    }
+    if e.ok {
+        spans.push(Span::styled("  ✓", Style::default().fg(Color::Green)));
+    } else {
+        spans.push(Span::styled(
+            format!("  ✗ {}", e.error.as_deref().unwrap_or("")),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Draw the global action feed (all agents), tail-anchored with `feed_scroll`.
+fn draw_action_feed(f: &mut Frame, area: Rect, app: &App) {
+    let inner_h = area.height.saturating_sub(2).max(1) as usize;
+    // Game-only pulls a wider window so real actions aren't starved by info reads.
+    let pull = match app.feed_filter {
+        FeedFilter::All => inner_h + app.feed_scroll,
+        FeedFilter::GameOnly => 1500,
+    };
+    let entries: Vec<_> = app
+        .action_log
+        .recent(pull)
+        .into_iter()
+        .filter(|e| match app.feed_filter {
+            FeedFilter::All => true,
+            FeedFilter::GameOnly => e.kind == ActionKind::Game || !e.ok,
+        })
+        .collect();
+    let end = entries.len().saturating_sub(app.feed_scroll);
+    let start = end.saturating_sub(inner_h);
+    let lines: Vec<Line> = if entries.is_empty() {
+        let msg = match app.feed_filter {
+            FeedFilter::All => "no actions yet — agents haven't called any tools",
+            FeedFilter::GameOnly => "no game actions yet (f = show all)",
+        };
+        vec![Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray)))]
+    } else {
+        entries[start..end].iter().map(feed_line).collect()
+    };
+    let filt = match app.feed_filter {
+        FeedFilter::All => "all",
+        FeedFilter::GameOnly => "game-only",
+    };
+    let tail = if app.feed_scroll == 0 { "·live" } else { "·scroll" };
+    let title = format!(
+        "actions · {filt} · {} total · f=filter g=grimoire {tail}",
+        app.action_log.len()
+    );
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
 }
 
 /// RAII guard: restores terminal raw-mode / alternate screen on Drop or panic (#49).
@@ -516,7 +882,7 @@ pub fn run_tui() -> io::Result<()> {
     let mut app = App::new();
 
     let result = loop {
-        guard.terminal_mut().draw(|f| draw(f, &app))?;
+        guard.terminal_mut().draw(|f| draw(f, &mut app))?;
         if app.should_quit {
             break Ok(());
         }
@@ -528,14 +894,13 @@ pub fn run_tui() -> io::Result<()> {
         while event::poll(Duration::from_millis(0))? {
             match event::read()? {
                 Event::Key(key) => {
-                    // Press only — ignore Release/Repeat (and anything scroll-related).
+                    // Press only — ignore Release/Repeat.
                     if key.kind == KeyEventKind::Press {
                         app.on_key(key.code);
                     }
                 }
-                // Explicit no-op: wheel, trackpad, clicks, resize, paste, focus.
-                Event::Mouse(_)
-                | Event::Resize(_, _)
+                Event::Mouse(m) => app.on_mouse(m),
+                Event::Resize(_, _)
                 | Event::FocusGained
                 | Event::FocusLost
                 | Event::Paste(_) => {}
@@ -550,7 +915,11 @@ pub fn run_tui() -> io::Result<()> {
     result
 }
 
-fn draw(f: &mut Frame, app: &App) {
+fn point_in_rect(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
+}
+
+fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -560,25 +929,26 @@ fn draw(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " botc-tui ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(
-            " players={} sessions={}  [{}]",
+    let mut title_spans = vec![Span::styled(
+        " botc-tui ",
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    match app.focus {
+        Focus::Setup => title_spans.push(Span::raw(format!(
+            " players={} sessions={}  [SETUP]",
             app.player_count,
             app.player_count + 1,
-            match app.focus {
-                Focus::Setup => "SETUP",
-                Focus::Monitor => "MONITOR",
-            }
-        )),
-    ]))
-    .block(
+        ))),
+        // Live game-progress: phase · whose turn · tick mode · what's running.
+        Focus::Monitor => {
+            title_spans.push(Span::raw(" "));
+            title_spans.extend(app.status_spans());
+        }
+    }
+    let title = Paragraph::new(Line::from(title_spans)).block(
         Block::default()
             .borders(Borders::ALL)
             .title("Trouble Brewing · multi-agent monitor"),
@@ -586,7 +956,11 @@ fn draw(f: &mut Frame, app: &App) {
     f.render_widget(title, chunks[0]);
 
     match app.focus {
-        Focus::Setup => draw_setup(f, chunks[1], app),
+        Focus::Setup => {
+            app.hit_agents = Rect::default();
+            app.hit_stream = Rect::default();
+            draw_setup(f, chunks[1], app);
+        }
         Focus::Monitor => draw_monitor(f, chunks[1], app),
     }
 
@@ -628,54 +1002,76 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 }
 
-fn draw_monitor(f: &mut Frame, area: Rect, app: &App) {
+fn draw_monitor(f: &mut Frame, area: Rect, app: &mut App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(26),
-            Constraint::Percentage(34),
+            Constraint::Percentage(22),
+            Constraint::Percentage(38),
             Constraint::Percentage(40),
         ])
         .split(area);
 
+    // Mouse hit targets (click agents / click-or-scroll stream).
+    app.hit_agents = cols[0];
+    app.hit_stream = cols[2];
+
+    // Agents list with a live status glyph: ● running (green) / ○ idle (grey).
     let items: Vec<ListItem> = if let Some(pool) = app.agents.as_ref() {
         pool.agents
             .iter()
             .enumerate()
             .map(|(i, a)| {
-                let label = match a.config.role {
-                    AgentRole::Host => "HOST  Storyteller".into(),
+                let (label, seat) = match a.config.role {
+                    AgentRole::Host => ("Host".to_string(), None),
                     AgentRole::Player { seat } => {
-                        format!("SEAT{} {}", seat.0, a.config.display_name)
+                        (format!("P{} {}", seat.0, a.config.display_name), Some(seat.0))
                     }
                 };
                 let running = *a.running.lock().unwrap();
-                let mark = if i == app.selected_agent { "▶" } else { " " };
-                let style = if i == app.selected_agent {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
+                let (glyph, gstyle) = if running {
+                    ("●", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
                 } else {
-                    Style::default()
+                    ("○", Style::default().fg(Color::DarkGray))
                 };
-                ListItem::new(format!(
-                    "{mark} {label} {}",
-                    if running { "…run" } else { "idle" }
-                ))
-                .style(style)
+                let selected = i == app.selected_agent;
+                let label_style = if selected {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(actor_color(seat.is_none(), seat))
+                };
+                let mark = if selected { "▶ " } else { "  " };
+                ListItem::new(Line::from(vec![
+                    Span::styled(glyph, gstyle),
+                    Span::raw(" "),
+                    Span::styled(mark, label_style),
+                    Span::styled(label, label_style),
+                ]))
             })
             .collect()
     } else {
         vec![ListItem::new("no agents")]
     };
-    let list =
-        List::new(items).block(Block::default().borders(Borders::ALL).title("agents (Tab)"));
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("agents · ●=running"),
+    );
     f.render_widget(list, cols[0]);
 
-    let host_p = Paragraph::new(app.snapshot_host())
-        .block(Block::default().borders(Borders::ALL).title("grimoire (host)"))
-        .wrap(Wrap { trim: false });
-    f.render_widget(host_p, cols[1]);
+    // Center: action feed by default, host grimoire on `g`.
+    if app.show_grimoire {
+        let host_p = Paragraph::new(app.snapshot_host())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("grimoire (host) · g=feed"),
+            )
+            .wrap(Wrap { trim: false });
+        f.render_widget(host_p, cols[1]);
+    } else {
+        draw_action_feed(f, cols[1], app);
+    }
 
     let agent_title = app
         .agents
@@ -701,15 +1097,84 @@ fn draw_monitor(f: &mut Frame, area: Rect, app: &App) {
     } else {
         "·scroll"
     };
+    let think_mark = if app.selected_thinking_expanded() {
+        "·think▸"
+    } else {
+        "·think▾"
+    };
     let log_p = Paragraph::new(log_text)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!("{agent_title} {tail_mark}")),
+                .title(format!(
+                    "{agent_title} {tail_mark} {think_mark}  click·h  wheel·scroll"
+                )),
         )
         .wrap(Wrap { trim: false })
         .scroll((scroll_y_u16, 0));
     f.render_widget(log_p, cols[2]);
+}
+
+/// Format agent log lines for the stream pane.
+///
+/// When `expand_think` is false (default), consecutive `[think] …` blocks collapse
+/// to a one-line summary so text / tool / error / turn-end lines (game actions)
+/// stay visible while tabbing agents. Press `h` to expand.
+pub fn format_stream_for_display(entries: &[String], expand_think: bool) -> String {
+    if expand_think {
+        return entries
+            .iter()
+            .map(|e| {
+                if e.starts_with("[think]") {
+                    format!("▸ {e}")
+                } else {
+                    e.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut think_n = 0usize;
+    let mut preview = String::new();
+
+    let flush_think = |out: &mut Vec<String>, think_n: &mut usize, preview: &mut String| {
+        if *think_n == 0 {
+            return;
+        }
+        let snip = if preview.is_empty() {
+            String::new()
+        } else {
+            let mut s: String = preview.chars().take(48).collect();
+            if preview.chars().count() > 48 {
+                s.push('…');
+            }
+            format!(" “{s}”")
+        };
+        let label = if *think_n == 1 {
+            format!("▾ [think] 1 block{snip}  (h expand)")
+        } else {
+            format!("▾ [think] {think_n} blocks{snip}  (h expand)")
+        };
+        out.push(label);
+        *think_n = 0;
+        preview.clear();
+    };
+
+    for e in entries {
+        if let Some(rest) = e.strip_prefix("[think]") {
+            think_n += 1;
+            if preview.is_empty() {
+                preview = rest.trim_start().to_string();
+            }
+        } else {
+            flush_think(&mut out, &mut think_n, &mut preview);
+            out.push(e.clone());
+        }
+    }
+    flush_think(&mut out, &mut think_n, &mut preview);
+    out.join("\n")
 }
 
 /// Wrapped visual row count at `inner_w` — same unit as `Paragraph::scroll` (#53).
@@ -738,12 +1203,79 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
+    fn point_in_rect_hit_test() {
+        let r = Rect {
+            x: 10,
+            y: 5,
+            width: 20,
+            height: 8,
+        };
+        assert!(point_in_rect(r, 10, 5));
+        assert!(point_in_rect(r, 29, 12));
+        assert!(!point_in_rect(r, 9, 5));
+        assert!(!point_in_rect(r, 30, 5));
+        assert!(!point_in_rect(r, 10, 13));
+    }
+
+    #[test]
     fn stream_scroll_defaults_to_tail() {
         // 50 rows, 10-row pane, scroll_from_bottom=0 → scroll so last 10 show.
         assert_eq!(stream_scroll_y(50, 10, 0), 40);
         assert_eq!(stream_scroll_y(5, 10, 0), 0); // fits entirely
         assert_eq!(stream_scroll_y(50, 10, 5), 35); // look 5 rows up from tail
         assert_eq!(stream_scroll_y(50, 10, 999), 0); // clamped to top
+    }
+
+    #[test]
+    fn format_stream_collapses_think_by_default() {
+        let entries = vec![
+            "[think] I should poison someone".into(),
+            "[think] maybe seat 2".into(),
+            "Calling night_action on seat 2".into(),
+            "[turn end]".into(),
+        ];
+        let collapsed = format_stream_for_display(&entries, false);
+        assert!(
+            collapsed.contains("▾ [think] 2 blocks"),
+            "collapsed summary missing: {collapsed}"
+        );
+        // Only a one-line summary (optional short preview), not the second think line.
+        assert!(
+            !collapsed.contains("maybe seat 2"),
+            "collapsed stream must not dump every think body: {collapsed}"
+        );
+        assert_eq!(
+            collapsed.lines().filter(|l| l.starts_with("▾ [think]")).count(),
+            1,
+            "consecutive thinks must merge to one summary line: {collapsed}"
+        );
+        assert!(
+            collapsed.contains("Calling night_action on seat 2"),
+            "action text must remain visible: {collapsed}"
+        );
+        assert!(collapsed.contains("[turn end]"));
+
+        let expanded = format_stream_for_display(&entries, true);
+        assert!(expanded.contains("▸ [think] I should poison someone"));
+        assert!(expanded.contains("▸ [think] maybe seat 2"));
+        assert!(expanded.contains("Calling night_action on seat 2"));
+    }
+
+    #[test]
+    fn format_stream_interleaves_think_and_action() {
+        let entries = vec![
+            "[think] first".into(),
+            "action A".into(),
+            "[think] second".into(),
+            "action B".into(),
+        ];
+        let collapsed = format_stream_for_display(&entries, false);
+        let lines: Vec<_> = collapsed.lines().collect();
+        assert_eq!(lines.len(), 4, "got {lines:?}");
+        assert!(lines[0].starts_with("▾ [think] 1 block"));
+        assert_eq!(lines[1], "action A");
+        assert!(lines[2].starts_with("▾ [think] 1 block"));
+        assert_eq!(lines[3], "action B");
     }
 
     #[test]
