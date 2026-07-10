@@ -719,6 +719,48 @@ impl App {
     }
 }
 
+/// Readable one-line rendering of a public event (for agent prompts, not Debug).
+fn fmt_public_event(e: &crate::comms::PublicEvent) -> String {
+    use crate::comms::PublicEvent::*;
+    match e {
+        Chat { seat, text, .. } => format!("P{}: {text}", seat.0),
+        StorytellerAnnounce { text } => format!("Storyteller: {text}"),
+        Nominated { by, target } => format!("P{} nominated P{}", by.0, target.0),
+        VoteCast {
+            seat,
+            nominee,
+            support,
+        } => format!(
+            "P{} voted {} on P{}",
+            seat.0,
+            if *support { "YES" } else { "no" },
+            nominee.0
+        ),
+        Executed { seat } => format!("P{} was executed", seat.0),
+        NoExecution => "No one was executed today".to_string(),
+        DiedInNight { seats } => {
+            if seats.is_empty() {
+                "No one died in the night".to_string()
+            } else {
+                format!(
+                    "Died in the night: {}",
+                    seats
+                        .iter()
+                        .map(|s| format!("P{}", s.0))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        }
+        PlayerDied { seat } => format!("P{} died", seat.0),
+        SlayerMiss { slayer, target } => {
+            format!("P{} tried to slay P{} — nothing happened", slayer.0, target.0)
+        }
+        PhaseChanged { summary } => summary.clone(),
+        GameEnded { winner } => format!("Game over — {winner:?} wins"),
+    }
+}
+
 /// Public snapshot + host hint string for tick prompts, computed from a locked game.
 /// Free function so the scheduler can build it under the store lock without a second lock.
 fn game_summary_and_hint(g: &Game) -> (String, String) {
@@ -727,21 +769,37 @@ fn game_summary_and_hint(g: &Game) -> (String, String) {
         .seats
         .iter()
         .filter(|s| s.alive)
-        .map(|s| format!("{}#{}", s.display_name, s.id.0))
+        .map(|s| format!("P{}", s.id.0))
         .collect();
-    let chat: Vec<_> = g
+    let dead: Vec<_> = g
+        .seats
+        .iter()
+        .filter(|s| !s.alive)
+        .map(|s| format!("P{}", s.id.0))
+        .collect();
+    let recent: Vec<_> = g
         .public_log
         .since(0)
         .into_iter()
         .rev()
-        .take(12)
-        .map(|(id, e)| format!("#{id} {e:?}"))
+        .take(16)
+        .map(|(_, e)| fmt_public_event(&e))
         .collect();
-    let chat: Vec<_> = chat.into_iter().rev().collect();
+    let recent: Vec<_> = recent.into_iter().rev().collect();
+    let recent_str = if recent.is_empty() {
+        "(nothing public has happened yet)".to_string()
+    } else {
+        recent.join("\n")
+    };
     let summary = format!(
-        "phase={phase}\nliving={}\nrecent_log:\n{}",
+        "phase: {phase}\nliving: {}\ndead: {}\nrecent public events:\n{}",
         living.join(", "),
-        chat.join("\n")
+        if dead.is_empty() {
+            "none".to_string()
+        } else {
+            dead.join(", ")
+        },
+        recent_str
     );
     let hint = format!(
         "pending_night={} pending_host={:?}",

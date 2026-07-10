@@ -165,9 +165,11 @@ pub fn host_task_tick(
             seat.0
         ),
         HostTask::PaceDiscussion => {
-            "It is **day (discussion)**. Let players talk. When discussion has run enough (or it is \
-             stalling), call `open_nominations` to move to nominations. Make only legal `st_announce` \
-             statements; never reveal roles."
+            "It is **day (discussion)**. **Let the players talk first — do NOT open nominations \
+             yet.** They each get to speak this round, and you'll be called again. Give discussion \
+             at least a couple of rounds (several players sharing claims/reads) before you call \
+             `open_nominations`. You may `st_announce` factual, legal statements (e.g. who died); \
+             never reveal roles or the grimoire."
                 .to_string()
         }
         HostTask::ManageNominations => {
@@ -222,10 +224,12 @@ pub fn player_task_tick(
              as the prompt requires."
         ),
         PlayerTask::Discuss => {
-            "It is **day (discussion)** and it is your turn to speak. Call `get_public_state` \
-             (and `get_private_state`) for context, then use `say` to share a read, a claim, or a \
-             question. If you want someone executed, you may `nominate` them. Say something concrete \
-             this turn — don't just inspect."
+            "It is **day (discussion)** — the whole table is talking and it is your turn to \
+             contribute. The public snapshot below already tells you what happened; call \
+             `get_private_state` for your own secret info if you need it. **You must post at least \
+             one `say` this turn** — share a read, make or dispute a claim, answer a question, or \
+             react to what others said. (You may also `nominate` someone you want executed.) Do not \
+             end the turn having only read state — say something concrete."
                 .to_string()
         }
         PlayerTask::Nominate => {

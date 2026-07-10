@@ -99,10 +99,13 @@ pub fn plan_ticks(game: &Game, rotation: usize, stall: usize) -> Vec<SchedTarget
             stage: DayStage::Discussion,
             ..
         } => {
+            // Discussion is a group activity: wake EVERY living player so they can
+            // all speak this round (across rounds they see each other's messages),
+            // plus the host to pace the day.
             let mut v = vec![SchedTarget::Host(HostTask::PaceDiscussion)];
-            if let Some(seat) = nth_living_rotating(game, rotation) {
+            for s in game.seats.iter().filter(|s| s.alive) {
                 v.push(SchedTarget::Player {
-                    seat,
+                    seat: s.id,
                     task: PlayerTask::Discuss,
                 });
             }
@@ -343,25 +346,33 @@ mod tests {
     }
 
     #[test]
-    fn discussion_ticks_host_plus_one_rotating_player() {
+    fn discussion_wakes_host_plus_all_living_players() {
         let mut g = new_game(7);
         g.phase = Phase::Day {
             day: 1,
             stage: DayStage::Discussion,
         };
-        let p0 = plan_ticks(&g, 0, 0);
-        assert!(matches!(p0[0], SchedTarget::Host(HostTask::PaceDiscussion)));
-        assert_eq!(p0.len(), 2);
-        // rotation advances the chosen player
-        let seat_a = match &plan_ticks(&g, 0, 0)[1] {
-            SchedTarget::Player { seat, .. } => *seat,
-            _ => panic!(),
-        };
-        let seat_b = match &plan_ticks(&g, 1, 0)[1] {
-            SchedTarget::Player { seat, .. } => *seat,
-            _ => panic!(),
-        };
-        assert_ne!(seat_a, seat_b);
+        let plan = plan_ticks(&g, 0, 0);
+        assert!(matches!(plan[0], SchedTarget::Host(HostTask::PaceDiscussion)));
+        // host + every living player (7 alive) = 8 targets
+        let discuss_seats: Vec<u8> = plan
+            .iter()
+            .filter_map(|t| match t {
+                SchedTarget::Player {
+                    seat,
+                    task: PlayerTask::Discuss,
+                } => Some(seat.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(discuss_seats.len(), 7, "all living players should speak");
+        // a dead player is not woken
+        g.seats[2].alive = false;
+        let plan2 = plan_ticks(&g, 0, 0);
+        assert!(!plan2.iter().any(|t| matches!(
+            t,
+            SchedTarget::Player { seat, .. } if seat.0 == 2
+        )));
     }
 
     fn open_vote_game() -> Game {
