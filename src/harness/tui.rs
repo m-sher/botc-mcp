@@ -26,7 +26,7 @@ use crate::harness::action_log::{ActionKind, ActionLog, ActorLabel};
 use crate::harness::scheduler::{plan_ticks, wait_signature, SchedTarget};
 use crate::harness::agents::{
     agent_mcp_bin_ok, find_agent_mcp_bin, find_grok, resolve_agent_mcp_bin_for_display,
-    AgentConfig, AgentPool, AgentRole, HarnessConfig,
+    AgentConfig, AgentPool, AgentRole, HarnessConfig, LineKind, LogLine,
 };
 use crate::harness::socket::SocketServer;
 use crate::mcp_server::{self, SharedStore};
@@ -633,20 +633,18 @@ impl App {
 
     /// Agent stream for the selected seat: thinking collapsed by default so game
     /// actions (text / tools / errors) stay visible; `h` expands `[think]` blocks.
-    fn agent_log_text(&self) -> String {
+    fn agent_log_lines(&self) -> Vec<Line<'static>> {
         let Some(pool) = self.agents.as_ref() else {
-            return String::new();
+            return Vec::new();
         };
         if pool.agents.is_empty() {
-            return String::new();
+            return Vec::new();
         }
         let idx = self.selected_agent.min(pool.agents.len() - 1);
         let agent = &pool.agents[idx];
         let log = agent.log.lock().unwrap();
-        // Cap retained lines for the pane (keep a generous buffer for PgUp).
-        let start = log.len().saturating_sub(400);
-        let slice = &log[start..];
-        format_stream_for_display(slice, self.thinking_expanded.contains(&idx))
+        let start = log.len().saturating_sub(600);
+        stream_lines(&log[start..], self.thinking_expanded.contains(&idx))
     }
 
     fn shutdown(&mut self) {
@@ -1085,10 +1083,12 @@ fn draw_monitor(f: &mut Frame, area: Rect, app: &mut App) {
 
     // #45/#53: tail-anchor in *wrapped visual rows* (Paragraph::scroll unit), not
     // logical lines — long Grok prose wraps in the ~40% stream column constantly.
-    let log_text = app.agent_log_text();
+    let log_lines = app.agent_log_lines();
     let inner_w = cols[2].width.saturating_sub(2);
     let view_h = cols[2].height.saturating_sub(2) as usize;
-    let row_count = stream_wrapped_row_count(&log_text, inner_w);
+    let para = Paragraph::new(log_lines).wrap(Wrap { trim: false });
+    // Wrapped-row count for the exact rendered width (tail-anchor scroll, #53).
+    let row_count = if inner_w == 0 { 0 } else { para.line_count(inner_w) };
     // scroll_from_bottom=0 → show the end; larger → look further up (row units).
     let scroll_y = stream_scroll_y(row_count, view_h, app.scroll_from_bottom);
     let scroll_y_u16 = u16::try_from(scroll_y).unwrap_or(u16::MAX);
@@ -1102,15 +1102,12 @@ fn draw_monitor(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         "·think▾"
     };
-    let log_p = Paragraph::new(log_text)
+    let log_p = para
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(
-                    "{agent_title} {tail_mark} {think_mark}  click·h  wheel·scroll"
-                )),
+            Block::default().borders(Borders::ALL).title(format!(
+                "{agent_title} {tail_mark} {think_mark}  click·h  wheel·scroll"
+            )),
         )
-        .wrap(Wrap { trim: false })
         .scroll((scroll_y_u16, 0));
     f.render_widget(log_p, cols[2]);
 }
@@ -1120,61 +1117,66 @@ fn draw_monitor(f: &mut Frame, area: Rect, app: &mut App) {
 /// When `expand_think` is false (default), consecutive `[think] …` blocks collapse
 /// to a one-line summary so text / tool / error / turn-end lines (game actions)
 /// stay visible while tabbing agents. Press `h` to expand.
-pub fn format_stream_for_display(entries: &[String], expand_think: bool) -> String {
-    if expand_think {
-        return entries
-            .iter()
-            .map(|e| {
-                if e.starts_with("[think]") {
-                    format!("▸ {e}")
-                } else {
-                    e.clone()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-    }
+/// Colour a stream line by kind — no in-text tags. Errors show red.
+fn styled_log_line(e: &LogLine) -> Line<'static> {
+    let style = match e.kind {
+        LineKind::Text => Style::default(),
+        LineKind::Thought => Style::default().fg(Color::DarkGray),
+        LineKind::Stderr => Style::default().fg(Color::Yellow),
+        LineKind::System => {
+            if e.text.to_lowercase().contains("error") {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::Cyan)
+            }
+        }
+    };
+    Line::from(Span::styled(e.text.clone(), style))
+}
 
-    let mut out: Vec<String> = Vec::new();
+/// A collapsed-thinking summary line standing in for a run of hidden thought.
+fn think_summary(n: usize, preview: &str) -> Line<'static> {
+    let snip = if preview.trim().is_empty() {
+        String::new()
+    } else {
+        let s: String = preview.trim().chars().take(48).collect();
+        let ell = if preview.trim().chars().count() > 48 { "…" } else { "" };
+        format!(" “{s}{ell}”")
+    };
+    Line::from(Span::styled(
+        format!("· thinking… {n} line(s){snip}  (h/click = show)"),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    ))
+}
+
+/// Turn the kinded log into styled display lines. When `expand` is false, runs of
+/// `Thought` lines collapse to a one-line summary (default); otherwise they show
+/// dimmed. Everything else streams verbatim, coloured by kind.
+pub fn stream_lines(entries: &[LogLine], expand: bool) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
     let mut think_n = 0usize;
     let mut preview = String::new();
-
-    let flush_think = |out: &mut Vec<String>, think_n: &mut usize, preview: &mut String| {
-        if *think_n == 0 {
-            return;
-        }
-        let snip = if preview.is_empty() {
-            String::new()
-        } else {
-            let mut s: String = preview.chars().take(48).collect();
-            if preview.chars().count() > 48 {
-                s.push('…');
-            }
-            format!(" “{s}”")
-        };
-        let label = if *think_n == 1 {
-            format!("▾ [think] 1 block{snip}  (h expand)")
-        } else {
-            format!("▾ [think] {think_n} blocks{snip}  (h expand)")
-        };
-        out.push(label);
-        *think_n = 0;
-        preview.clear();
-    };
-
     for e in entries {
-        if let Some(rest) = e.strip_prefix("[think]") {
+        if e.kind == LineKind::Thought && !expand {
             think_n += 1;
             if preview.is_empty() {
-                preview = rest.trim_start().to_string();
+                preview = e.text.clone();
             }
-        } else {
-            flush_think(&mut out, &mut think_n, &mut preview);
-            out.push(e.clone());
+            continue;
         }
+        if think_n > 0 {
+            out.push(think_summary(think_n, &preview));
+            think_n = 0;
+            preview.clear();
+        }
+        out.push(styled_log_line(e));
     }
-    flush_think(&mut out, &mut think_n, &mut preview);
-    out.join("\n")
+    if think_n > 0 {
+        out.push(think_summary(think_n, &preview));
+    }
+    out
 }
 
 /// Wrapped visual row count at `inner_w` — same unit as `Paragraph::scroll` (#53).
@@ -1226,56 +1228,60 @@ mod tests {
         assert_eq!(stream_scroll_y(50, 10, 999), 0); // clamped to top
     }
 
-    #[test]
-    fn format_stream_collapses_think_by_default() {
-        let entries = vec![
-            "[think] I should poison someone".into(),
-            "[think] maybe seat 2".into(),
-            "Calling night_action on seat 2".into(),
-            "[turn end]".into(),
-        ];
-        let collapsed = format_stream_for_display(&entries, false);
-        assert!(
-            collapsed.contains("▾ [think] 2 blocks"),
-            "collapsed summary missing: {collapsed}"
-        );
-        // Only a one-line summary (optional short preview), not the second think line.
-        assert!(
-            !collapsed.contains("maybe seat 2"),
-            "collapsed stream must not dump every think body: {collapsed}"
-        );
-        assert_eq!(
-            collapsed.lines().filter(|l| l.starts_with("▾ [think]")).count(),
-            1,
-            "consecutive thinks must merge to one summary line: {collapsed}"
-        );
-        assert!(
-            collapsed.contains("Calling night_action on seat 2"),
-            "action text must remain visible: {collapsed}"
-        );
-        assert!(collapsed.contains("[turn end]"));
-
-        let expanded = format_stream_for_display(&entries, true);
-        assert!(expanded.contains("▸ [think] I should poison someone"));
-        assert!(expanded.contains("▸ [think] maybe seat 2"));
-        assert!(expanded.contains("Calling night_action on seat 2"));
+    fn lk(kind: LineKind, text: &str) -> LogLine {
+        LogLine {
+            kind,
+            text: text.into(),
+            closed: true,
+        }
+    }
+    fn line_text(l: &Line) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
     #[test]
-    fn format_stream_interleaves_think_and_action() {
+    fn stream_collapses_think_by_default() {
         let entries = vec![
-            "[think] first".into(),
-            "action A".into(),
-            "[think] second".into(),
-            "action B".into(),
+            lk(LineKind::Thought, "I should poison someone"),
+            lk(LineKind::Thought, "maybe seat 2"),
+            lk(LineKind::Text, "Calling night_action on seat 2"),
+            lk(LineKind::System, "— turn end —"),
         ];
-        let collapsed = format_stream_for_display(&entries, false);
-        let lines: Vec<_> = collapsed.lines().collect();
-        assert_eq!(lines.len(), 4, "got {lines:?}");
-        assert!(lines[0].starts_with("▾ [think] 1 block"));
-        assert_eq!(lines[1], "action A");
-        assert!(lines[2].starts_with("▾ [think] 1 block"));
-        assert_eq!(lines[3], "action B");
+        let texts: Vec<String> = stream_lines(&entries, false).iter().map(line_text).collect();
+        assert_eq!(
+            texts.iter().filter(|t| t.contains("thinking…")).count(),
+            1,
+            "consecutive thinks must merge to one summary: {texts:?}"
+        );
+        assert!(texts.iter().any(|t| t.contains("2 line")));
+        assert!(
+            !texts.iter().any(|t| t.contains("maybe seat 2")),
+            "collapsed must not dump think bodies: {texts:?}"
+        );
+        assert!(texts.iter().any(|t| t.contains("Calling night_action on seat 2")));
+        assert!(texts.iter().any(|t| t.contains("turn end")));
+
+        let etexts: Vec<String> = stream_lines(&entries, true).iter().map(line_text).collect();
+        assert!(etexts.iter().any(|t| t.contains("I should poison someone")));
+        assert!(etexts.iter().any(|t| t.contains("maybe seat 2")));
+        // No in-text tags — colour, not text markers.
+        assert!(!etexts.iter().any(|t| t.contains("[think]")));
+    }
+
+    #[test]
+    fn stream_interleaves_think_and_action() {
+        let entries = vec![
+            lk(LineKind::Thought, "first"),
+            lk(LineKind::Text, "action A"),
+            lk(LineKind::Thought, "second"),
+            lk(LineKind::Text, "action B"),
+        ];
+        let texts: Vec<String> = stream_lines(&entries, false).iter().map(line_text).collect();
+        assert_eq!(texts.len(), 4, "got {texts:?}");
+        assert!(texts[0].contains("thinking… 1 line"));
+        assert_eq!(texts[1], "action A");
+        assert!(texts[2].contains("thinking… 1 line"));
+        assert_eq!(texts[3], "action B");
     }
 
     #[test]

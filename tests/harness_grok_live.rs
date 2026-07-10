@@ -161,7 +161,8 @@ fn harness_argv_returns_valid_json_response() {
 #[test]
 #[ignore = "invokes live `grok` binary + model API; run with: cargo test --test harness_grok_live -- --ignored"]
 fn harness_argv_streaming_json_lines_are_valid() {
-    use botc_mcp::harness::agents::StreamAssembler;
+    use botc_mcp::harness::agents::{apply_stream_event, LineKind};
+    use std::sync::Mutex;
 
     let grok = require_grok();
     let tmp = std::env::temp_dir().join(format!("botc-live-stream-{}", Uuid::new_v4()));
@@ -200,10 +201,10 @@ fn harness_argv_streaming_json_lines_are_valid() {
         output.status
     );
 
-    let mut asm = StreamAssembler::default();
-    let mut pieces = Vec::new();
+    let log = Mutex::new(Vec::new());
     let mut saw_end = false;
     let mut saw_text = false;
+    let mut thought_chunks = 0usize;
     for line in stdout.lines() {
         if line.trim().is_empty() {
             continue;
@@ -223,26 +224,26 @@ fn harness_argv_streaming_json_lines_are_valid() {
         if ty == "text" {
             saw_text = true;
         }
-        pieces.extend(asm.push_line(line));
-    }
-    pieces.extend(asm.finish());
-
-    assert!(saw_end || saw_text, "no text/end events in stream:\n{stdout}");
-    // Assembler must not produce the broken per-token think display.
-    assert!(
-        !pieces.iter().any(|p| p.matches("[think]").count() > 1 && p.contains("[think] ")),
-        "assembled log still looks chunk-broken: {pieces:?}"
-    );
-    // If we got thought lines, each should be one coalesced block with a single prefix.
-    for p in &pieces {
-        if p.starts_with("[think] ") {
-            assert_eq!(
-                p.matches("[think] ").count(),
-                1,
-                "thought line has multiple prefixes: {p:?}"
-            );
+        if ty == "thought" {
+            thought_chunks += 1;
         }
+        apply_stream_event(&log, line);
     }
 
+    let g = log.lock().unwrap();
+    assert!(saw_end || saw_text, "no text/end events in stream:\n{stdout}");
+    // Consecutive same-kind chunks must coalesce, not become one line per token.
+    let thought_lines = g.iter().filter(|l| l.kind == LineKind::Thought).count();
+    assert!(
+        thought_chunks == 0 || thought_lines < thought_chunks.max(1),
+        "thought not coalesced: {thought_chunks} chunks -> {thought_lines} lines"
+    );
+    // No in-text tags — colour, not `[think]`/`[stderr]`.
+    assert!(
+        !g.iter().any(|l| l.text.contains("[think]") || l.text.contains("[stderr]")),
+        "stream lines still carry in-text tags: {g:?}"
+    );
+
+    drop(g);
     let _ = std::fs::remove_dir_all(&tmp);
 }

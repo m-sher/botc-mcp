@@ -136,7 +136,8 @@ pub struct LiveAgent {
     /// Mutable so a failed first run can mint a fresh UUID (#47).
     pub session_id: Arc<Mutex<String>>,
     pub workdir: PathBuf,
-    pub log: Arc<Mutex<Vec<String>>>,
+    /// Live stream buffer (kinded lines for coloured, un-chunked display).
+    pub log: Arc<Mutex<Vec<LogLine>>>,
     /// True while a headless Grok child for this agent is alive.
     pub running: Arc<Mutex<bool>>,
     /// True only after a **successful** first headless run (#47).
@@ -441,8 +442,10 @@ fn spawn_grok_tick(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            push_log_line(
-                &agent.log,
+            let mut g = agent.log.lock().unwrap();
+            push_full_line(
+                &mut g,
+                LineKind::System,
                 format!("ERROR failed to spawn {}: {e}", cfg.grok_bin.display()),
             );
             return Err(e);
@@ -465,17 +468,12 @@ fn spawn_grok_tick(
         thread::spawn(move || {
             use std::io::BufRead;
             let reader = std::io::BufReader::new(stdout);
-            let mut asm = StreamAssembler::default();
+            // Process each streaming-json event as it arrives → live display.
             for line in reader.lines().flatten() {
                 if stream_line_establishes_session(&line) {
                     established.store(true, Ordering::SeqCst);
                 }
-                for piece in asm.push_line(&line) {
-                    push_log_line(&log, piece);
-                }
-            }
-            for piece in asm.finish() {
-                push_log_line(&log, piece);
+                apply_stream_event(&log, &line);
             }
         });
     }
@@ -485,7 +483,8 @@ fn spawn_grok_tick(
             use std::io::BufRead;
             let reader = std::io::BufReader::new(stderr);
             for line in reader.lines().flatten() {
-                push_log_line(&log, format!("[stderr] {line}"));
+                let mut g = log.lock().unwrap();
+                push_full_line(&mut g, LineKind::Stderr, line);
             }
         });
     }
@@ -534,102 +533,125 @@ pub fn stream_line_establishes_session(line: &str) -> bool {
     )
 }
 
-fn push_log_line(log: &Mutex<Vec<String>>, msg: String) {
-    if msg.is_empty() {
+/// Kind of a stream line — used only for colouring the display (no in-text tags).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineKind {
+    /// Model assistant text.
+    Text,
+    /// Model reasoning ("thinking").
+    Thought,
+    /// Child process stderr.
+    Stderr,
+    /// Harness / turn notices (turn end, errors).
+    System,
+}
+
+/// One display line of an agent's stream (kinded for colour; grown live).
+#[derive(Debug, Clone)]
+pub struct LogLine {
+    pub kind: LineKind,
+    pub text: String,
+    /// True once a newline closed the line (no further appends).
+    pub closed: bool,
+}
+
+const STREAM_LOG_CAP: usize = 800;
+
+fn cap_log(log: &mut Vec<LogLine>) {
+    if log.len() > STREAM_LOG_CAP {
+        let drain = log.len() - STREAM_LOG_CAP;
+        log.drain(0..drain);
+    }
+}
+
+/// Append a streaming chunk **live**: extend the current open line of the same
+/// kind, breaking to a new line on `\n`. The visible tail updates on every chunk
+/// (no buffering until a block ends), so the stream shows text as it arrives.
+pub fn append_chunk(log: &mut Vec<LogLine>, kind: LineKind, data: &str) {
+    if data.is_empty() {
         return;
     }
-    let mut g = log.lock().unwrap();
-    g.push(msg);
-    if g.len() > 400 {
-        let drain = g.len() - 400;
-        g.drain(0..drain);
+    let cont = matches!(log.last(), Some(l) if l.kind == kind && !l.closed);
+    if !cont {
+        log.push(LogLine {
+            kind,
+            text: String::new(),
+            closed: false,
+        });
     }
+    let mut parts = data.split('\n');
+    if let Some(first) = parts.next() {
+        if let Some(last) = log.last_mut() {
+            last.text.push_str(first);
+        }
+    }
+    for part in parts {
+        if let Some(last) = log.last_mut() {
+            last.closed = true;
+        }
+        log.push(LogLine {
+            kind,
+            text: part.to_string(),
+            closed: false,
+        });
+    }
+    cap_log(log);
 }
 
-/// Coalesce NDJSON `streaming-json` chunks into readable log lines.
-#[derive(Debug, Default)]
-pub struct StreamAssembler {
-    kind: Option<StreamKind>,
-    buf: String,
+/// Push a complete standalone line (stderr line / system notice).
+pub fn push_full_line(log: &mut Vec<LogLine>, kind: LineKind, text: String) {
+    if let Some(last) = log.last_mut() {
+        last.closed = true;
+    }
+    log.push(LogLine {
+        kind,
+        text,
+        closed: true,
+    });
+    cap_log(log);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamKind {
-    Text,
-    Thought,
-}
-
-impl StreamAssembler {
-    /// Ingest one stdout line; returns zero or more completed log lines.
-    pub fn push_line(&mut self, line: &str) -> Vec<String> {
-        let line = line.trim();
-        if line.is_empty() {
-            return Vec::new();
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            let mut out = self.flush();
-            out.push(line.to_string());
-            return out;
-        };
-        match v.get("type").and_then(|t| t.as_str()) {
-            Some("text") => {
-                let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
-                self.push_chunk(StreamKind::Text, data)
-            }
-            Some("thought") => {
-                let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
-                self.push_chunk(StreamKind::Thought, data)
-            }
-            Some("end") => {
-                let mut out = self.flush();
-                out.push("[turn end]".into());
-                out
-            }
-            Some("error") => {
-                let mut out = self.flush();
-                let msg = v
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("?");
-                out.push(format!("ERROR {msg}"));
-                out
-            }
-            _ => {
-                let mut out = self.flush();
-                out.push(line.to_string());
-                out
-            }
-        }
+/// Parse one grok `streaming-json` line and append it to `log` live.
+pub fn apply_stream_event(log: &Mutex<Vec<LogLine>>, line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
     }
-
-    pub fn finish(&mut self) -> Vec<String> {
-        self.flush()
-    }
-
-    fn push_chunk(&mut self, kind: StreamKind, data: &str) -> Vec<String> {
-        if data.is_empty() {
-            return Vec::new();
+    let mut guard = log.lock().unwrap();
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        push_full_line(&mut guard, LineKind::Text, line.to_string());
+        return;
+    };
+    let data = |v: &Value| {
+        v.get("data")
+            .and_then(|d| d.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("text") => append_chunk(&mut guard, LineKind::Text, &data(&v)),
+        Some("thought") => append_chunk(&mut guard, LineKind::Thought, &data(&v)),
+        Some("end") => push_full_line(&mut guard, LineKind::System, "— turn end —".into()),
+        Some("max_turns_reached") => {
+            push_full_line(&mut guard, LineKind::System, "— max turns reached —".into())
         }
-        let mut out = Vec::new();
-        if self.kind != Some(kind) {
-            out.extend(self.flush());
-            self.kind = Some(kind);
+        Some("error") => {
+            let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
+            push_full_line(&mut guard, LineKind::System, format!("error: {msg}"));
         }
-        self.buf.push_str(data);
-        out
-    }
-
-    fn flush(&mut self) -> Vec<String> {
-        if self.buf.is_empty() {
-            self.kind = None;
-            return Vec::new();
+        Some(other) => {
+            // Surface other events (tool calls, etc.) compactly rather than dropping them.
+            let name = v
+                .get("name")
+                .or_else(|| v.get("tool"))
+                .and_then(|x| x.as_str());
+            let note = match name {
+                Some(n) => format!("· {other}: {n}"),
+                None => format!("· {other}"),
+            };
+            push_full_line(&mut guard, LineKind::System, note);
         }
-        let text = std::mem::take(&mut self.buf);
-        let line = match self.kind.take() {
-            Some(StreamKind::Thought) => format!("[think] {text}"),
-            Some(StreamKind::Text) | None => text,
-        };
-        vec![line]
+        None => {}
     }
 }
 
@@ -778,9 +800,8 @@ mod tests {
     }
 
     #[test]
-    fn stream_assembler_coalesces_thought_chunks() {
-        let mut a = StreamAssembler::default();
-        let mut out = Vec::new();
+    fn stream_events_append_live_and_coalesce_by_kind() {
+        let log = Mutex::new(Vec::<LogLine>::new());
         for line in [
             r#"{"type":"thought","data":"The"}"#,
             r#"{"type":"thought","data":" task"}"#,
@@ -789,19 +810,30 @@ mod tests {
             r#"{"type":"text","data":" world"}"#,
             r#"{"type":"end","stopReason":"EndTurn","sessionId":"x"}"#,
         ] {
-            out.extend(a.push_line(line));
+            apply_stream_event(&log, line);
         }
-        out.extend(a.finish());
-        assert_eq!(
-            out,
-            vec![
-                "[think] The task is".to_string(),
-                "Hello world".to_string(),
-                "[turn end]".to_string(),
-            ],
-            "got {out:?}"
-        );
-        assert!(!out.iter().any(|s| s.contains("[think] The[think]")));
+        let g = log.lock().unwrap();
+        // Consecutive same-kind chunks coalesce into one growing line; kinds are
+        // kept (for colour) rather than tagged in-text.
+        assert_eq!(g.len(), 3);
+        assert_eq!(g[0].kind, LineKind::Thought);
+        assert_eq!(g[0].text, "The task is");
+        assert_eq!(g[1].kind, LineKind::Text);
+        assert_eq!(g[1].text, "Hello world");
+        assert_eq!(g[2].kind, LineKind::System);
+        // No in-text tags.
+        assert!(!g.iter().any(|l| l.text.contains("[think]")));
+    }
+
+    #[test]
+    fn append_chunk_breaks_on_newlines() {
+        let mut log = Vec::new();
+        append_chunk(&mut log, LineKind::Text, "line one\nline ");
+        append_chunk(&mut log, LineKind::Text, "two");
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].text, "line one");
+        assert!(log[0].closed);
+        assert_eq!(log[1].text, "line two"); // second chunk continued the open line
     }
 
     #[test]

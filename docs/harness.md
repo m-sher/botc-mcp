@@ -79,12 +79,13 @@ Three columns — **left:** agents · **center:** live **action feed** (all agen
 
 Per-agent **status glyph** in the left list: `●` green = a Grok child is running for that seat, `○` grey = idle.
 
-**Stream pane:** model `[think]` blocks are **collapsed by default** so when you Tab
-agents you see their game-facing output (text, tool results, errors, turn end). A one-line
-summary (`▾ [think] N blocks …`) stands in for hidden thought. **`h`** or **left-click the
-stream** expands that agent’s full thinking (`▸ [think] …`); again collapses. Expansion is
-**per agent**. Title shows `·think▾` / `·think▸`. **Mouse wheel over the stream** scrolls
-history (same as PgUp/PgDn); wheel elsewhere is ignored so it never synthesizes keys.
+**Stream pane:** the selected agent's raw output streams **live, token by token** (no
+buffering until a block finishes) and is **coloured by kind** rather than tagged — model
+text is default, **thinking is dim grey**, **stderr yellow**, and turn/error notices cyan/red.
+Model thinking is **collapsed by default** (a one-line `· thinking… N line(s) …` stand-in) so
+you see game-facing output first; **`h`** or **left-click the stream** expands that agent's
+full thinking; again collapses. Expansion is **per agent**; the title shows `·think▾`/`·think▸`.
+**Mouse wheel over the stream** scrolls history (same as PgUp/PgDn); wheel elsewhere is ignored.
 
 ## Turn order (scheduling)
 
