@@ -43,6 +43,33 @@ pub struct ActionEntry {
     pub kind: ActionKind,
     pub ok: bool,
     pub error: Option<String>,
+    /// Full argument JSON (token redacted, char-capped) for expanded display.
+    pub args: String,
+    /// Result preview on success (char-capped) for expanded display.
+    pub result: Option<String>,
+}
+
+/// Char-safe truncation (byte slicing panics mid-UTF-8; feed text has ✓/…/“”).
+pub fn clip_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{cut}…")
+}
+
+/// Full args as one JSON line with the auth token redacted (it must never render
+/// in the monitor — streams/feeds may be screenshotted).
+fn args_for_display(args: &Value) -> String {
+    let mut v = args.clone();
+    if let Some(obj) = v.as_object_mut() {
+        for key in ["token", "host_token", "player_token"] {
+            if obj.contains_key(key) {
+                obj.insert(key.into(), Value::String("<redacted>".into()));
+            }
+        }
+    }
+    clip_chars(&v.to_string(), 2000)
 }
 
 struct Inner {
@@ -83,7 +110,8 @@ impl ActionLog {
         self.inner.lock().unwrap().labels = labels;
     }
 
-    /// Record one dispatched RPC. `token` is the raw token string from the args.
+    /// Record one dispatched RPC. `token` is the raw token string from the args;
+    /// `result` is a preview of the successful result value (None on error).
     pub fn record_rpc(
         &self,
         token: Option<&str>,
@@ -91,6 +119,7 @@ impl ActionLog {
         args: &Value,
         ok: bool,
         error: Option<String>,
+        result: Option<String>,
     ) {
         let secs = self.start.elapsed().as_secs();
         let mut g = self.inner.lock().unwrap();
@@ -103,18 +132,12 @@ impl ActionLog {
             });
         g.seq += 1;
         let seq = g.seq;
+        let args_display = args_for_display(args);
         // Verbose trace: actor, tool, full args, and outcome (for post-mortem debugging).
-        let args_str = {
-            let s = args.to_string();
-            if s.len() > 400 {
-                format!("{}…", &s[..400])
-            } else {
-                s
-            }
-        };
         crate::dlog!(
-            "RPC #{seq} {} {tool} args={args_str} -> {}",
+            "RPC #{seq} {} {tool} args={} -> {}",
             actor.name,
+            clip_chars(&args_display, 400),
             match &error {
                 Some(e) => format!("ERR {e}"),
                 None => "ok".to_string(),
@@ -129,6 +152,8 @@ impl ActionLog {
             kind: classify(tool),
             ok,
             error,
+            args: args_display,
+            result: result.map(|r| clip_chars(&r, 600)),
         };
         g.entries.push_back(entry);
         while g.entries.len() > self.cap {
@@ -274,18 +299,40 @@ mod tests {
             ActorLabel { name: "P1".into(), seat: Some(1), is_host: false },
         );
         log.set_labels(labels);
-        log.record_rpc(Some("tok-p1"), "vote", &json!({"nominee": 0, "support": true}), true, None);
-        log.record_rpc(Some("tok-host"), "close_vote", &json!({}), true, None);
+        log.record_rpc(
+            Some("tok-p1"),
+            "vote",
+            &json!({"nominee": 0, "support": true, "token": "tok-p1"}),
+            true,
+            None,
+            Some("{\"ok\":true}".into()),
+        );
+        log.record_rpc(Some("tok-host"), "close_vote", &json!({}), true, None, None);
         let r = log.recent(10);
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].actor.name, "P1");
         assert_eq!(r[0].tool, "vote");
         assert_eq!(r[0].kind, ActionKind::Game);
+        // Expanded-view payloads: full args with the token REDACTED, plus result.
+        assert!(r[0].args.contains("\"nominee\":0"), "{}", r[0].args);
+        assert!(r[0].args.contains("<redacted>"), "{}", r[0].args);
+        assert!(!r[0].args.contains("tok-p1"), "token leaked: {}", r[0].args);
+        assert_eq!(r[0].result.as_deref(), Some("{\"ok\":true}"));
         assert_eq!(r[1].actor.name, "Host");
         // ring buffer cap
         for _ in 0..10 {
-            log.record_rpc(Some("tok-p1"), "get_public_state", &json!({}), true, None);
+            log.record_rpc(Some("tok-p1"), "get_public_state", &json!({}), true, None, None);
         }
         assert!(log.len() <= 4);
+    }
+
+    #[test]
+    fn clip_chars_is_utf8_safe() {
+        // A multi-byte char straddling the cap must not panic (old code byte-sliced).
+        let s = "a".repeat(10) + "“quoted”✓";
+        let c = clip_chars(&s, 12);
+        assert!(c.chars().count() <= 12);
+        assert!(c.ends_with('…'));
+        assert_eq!(clip_chars("short", 10), "short");
     }
 }

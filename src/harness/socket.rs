@@ -224,11 +224,18 @@ fn dispatch(store: &SharedStore, action_log: &ActionLog, req: RpcRequest) -> Rpc
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
             let outcome = mcp_server::invoke_named_tool(store, name, req.arguments.clone());
-            let (ok, err) = match &outcome {
-                Ok(_) => (true, None),
-                Err(e) => (false, Some(e.clone())),
+            let (ok, err, result_preview) = match &outcome {
+                Ok(v) => (true, None, Some(v.to_string())),
+                Err(e) => (false, Some(e.clone()), None),
             };
-            action_log.record_rpc(token.as_deref(), name, &req.arguments, ok, err.clone());
+            action_log.record_rpc(
+                token.as_deref(),
+                name,
+                &req.arguments,
+                ok,
+                err,
+                result_preview,
+            );
             match outcome {
                 Ok(result) => RpcResponse {
                     id: req.id,

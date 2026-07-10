@@ -71,11 +71,13 @@ Three columns — **left:** agents · **center:** live **action feed** (all agen
 | `g` | Center pane: toggle **action feed ↔ host grimoire** |
 | `f` | Feed filter: **all actions ↔ game-only** |
 | `h` / **click stream** | Expand/collapse **thinking** for the selected agent (default: collapsed) |
+| **click feed row** | Expand/collapse that action: full args (tokens redacted) + result/error |
+| **wheel on feed** | Scroll the action feed history |
 | `PgUp`/`PgDn`/`↑`/`↓` / **wheel on stream** | Scroll selected agent log (away from / toward live tail) |
 | `Home` | Jump to live tail |
 | `q` | Kill agents, remove workdirs, stop socket, quit |
 
-**Action feed.** Every agent tool call is recorded at the shared socket and shown here, newest at the bottom, labelled by caller (`Host` / `P0`…, colour-coded). **Game-affecting actions** (`say`, `nominate`, `vote`, `night_action`, `host_decide`, `close_vote`, …) are **highlighted** with a `▶` marker + bold tool name + cyan arg summary (e.g. `P3 ▶ vote →P1 YES ✓`); read-only inspection (`get_*_state`, `list_*`) is dimmed; errors are red. Press **`f`** to hide the info-read noise and show only game actions + errors. This is the fastest way to see *what agents are doing* (vs the per-agent stream, which shows their reasoning).
+**Action feed.** Every agent tool call is recorded at the shared socket and shown here, newest at the bottom, labelled by caller (`Host` / `P0`…, colour-coded). **Game-affecting actions** (`say`, `nominate`, `vote`, `night_action`, `host_decide`, `close_vote`, …) are **highlighted** with a `▶` marker + bold tool name + cyan arg summary (e.g. `P3 ▶ vote →P1 YES ✓`); read-only inspection (`get_*_state`, `list_*`) is dimmed; errors are red. Press **`f`** to hide the info-read noise and show only game actions + errors. **Click any row to expand it** (`▸`→`▾`): the full argument JSON (auth tokens redacted), plus the result preview or full error text; click again to collapse. **Mouse wheel over the feed** scrolls its history. This is the fastest way to see *what agents are doing* (vs the per-agent stream, which shows their reasoning).
 
 Per-agent **status glyph** in the left list: `●` green = a Grok child is running for that seat, `○` grey = idle.
 
@@ -89,31 +91,38 @@ full thinking; again collapses. Expansion is **per agent**; the title shows `·t
 
 ## Turn order (scheduling)
 
-Trouble Brewing is strictly **sequential**, so a tick does **not** wake every agent — it
-routes to the agent(s) the engine is actually waiting on, with a targeted prompt
-(`src/harness/scheduler.rs`, `plan_ticks`):
+Trouble Brewing is strictly **sequential**, so each tick wakes **exactly one agent** (plus,
+rarely, a host fallback) with a targeted prompt that says why it was woken, which actions are
+legal, and what ends the turn (`src/harness/scheduler.rs`, `plan_ticks`).
+
+The host is **minimal**: it is woken only for genuine Storyteller decisions and stall
+fallbacks. The engine self-drives the rest — a player's `nominate` auto-opens the vote,
+`vote` auto-closes once everyone has acted, and the day auto-ends into night.
 
 | Game state | Ticked this turn |
 | --- | --- |
-| Lobby | Host → `start_game` |
-| Night, `pending_host` set | Host → resolve the Storyteller decision |
+| Lobby | Host → `start_game` (normally already done by the TUI at launch) |
+| Night, `pending_host` set | Host → resolve that one Storyteller decision |
 | Night, `pending_night` set | **only that seat** → its night action (targeted wake prompt) |
-| Night, nothing pending | Host → advance the night machine |
-| Day / Discussion | Host (pace / open nominations) + one living player (round-robin) |
-| Day / Nominations, no open vote | Host (manage) + one living player (round-robin) to nominate |
-| Day / Nominations, vote open | the eligible voters who haven't voted (host is **not** co-scheduled to close — it would race the votes) |
+| Day / Discussion | **one living player at a time**, seat order, `DISCUSSION_ROUNDS` (2) full table rounds — no host |
+| Day / Discussion, rounds spent | Host → `open_nominations` + `end_nominations` (close the day) |
+| Day / Nominations, no open vote | one living player who hasn't nominated yet (rotating) — no host |
+| Day / Nominations, vote open | **one voter at a time, clockwise from the nominee**, shown the tally so far |
 | Ended | nobody — auto-tick disarms |
 
-**Stall escalation.** If the engine sits on the same wait for `STALL_ESCALATE` (3)
-consecutive cycles — a woken player never submits its night action, or a vote stops
-progressing — the plan adds a host fallback (`skip_night_action` for the stuck wake, or
-`close_vote` for the stalled vote) so a non-acting agent can't wedge the game. Normal
-turns route to only the responsible agent; the host override kicks in only after it
-demonstrably fails to act.
+**Stall escalation.** If the engine sits on the same wait for several cycles, the scheduler
+escalates: a stuck night wake → host `skip_night_action`; a stalled **voter** first yields the
+floor (each stalled cycle offers the *next* pending voter, so nobody blocks the queue) and only
+after every pending voter has been offered does the host `close_vote` (missing votes count
+"no"); nobody nominating after everyone had a turn → host `end_nominations`. **The escalation
+tick is host-only** — the stuck agent is not co-scheduled, so the host override can never race
+a recovering player. Signatures include progress counts and the living roster, so every landed
+vote, new nomination, or death resets the window. A host that repeats the same fallback 5×
+without progress stops auto-advance (`t` resumes).
 
-The one-time **kickoff** still fans out to every agent (each introduces itself); ongoing
-play is turn-routed. This is why, with the host driving, agents act on their turn instead
-of all polling tools at once.
+The one-time **kickoff** still fans out to every agent (orientation only — the first night has
+no talking); ongoing play is one turn at a time, so every speaker sees everything said before
+them and votes are cast in clockwise order like the tabletop game.
 
 ## Debug log
 
@@ -171,8 +180,8 @@ On quit (`q`) or process exit, the harness **kills** all Grok children and **rem
 - First-run success is required before `--resume` is used; a failed kickoff retries with a fresh `--session-id`.
 - Host-first Storyteller pauses require the **host** Grok agent (or skip defaults via host tools) to resolve night info.
 - Cost: N+1 model sessions, but the turn-router ticks only the 1–2 agents whose turn it is (plus a fan-out during an open vote), not all N+1 each cycle.
-- Ticks are **turn-routed** (see *Turn order*), so the night is sequential; day discussion/voting still allows a few agents per cycle, and the engine is mutex-serialized, so conflicting day actions are still possible during discussion but no longer the default.
-- Progression depends on the **host** agent driving phase transitions (open/close nominations, advance the night); if it stalls, press `Space` to re-tick or resolve via host tools.
+- Ticks are **turn-routed** (see *Turn order*): one agent per tick in every phase, so there are no concurrent day actions to conflict.
+- Progression is player/engine-driven; the host is only needed for `pending_host` decisions and stall fallbacks. Dead players don't get speaking turns (they still vote with their ghost vote); day length is bounded by `DISCUSSION_ROUNDS`.
 
 ## Tests
 

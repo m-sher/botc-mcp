@@ -29,17 +29,25 @@ Typical tools:
 - night_action / day_action / nominate / vote / pass_vote — when it is legal for you
 - Actions are **state-gated** by the engine: it rejects anything illegal for the current phase.
 
+## How turns work (READ THIS)
+The harness runs the table **one turn at a time** and wakes you only when it is YOUR turn, with
+instructions saying exactly why you were woken (your night action / your turn to speak / your turn
+to nominate / your turn to vote) and which actions are legal. Take the requested action(s), then
+stop responding — your turn ends when you stop calling tools, and you'll be woken again with fresh
+state. Never wait or poll for other players inside a turn.
+
 ## How to play
 1. Call get_private_state and get_public_state.
 2. Read the rules for your face role if needed.
-3. Talk publicly with `say` **during the day**; at night, only submit your `night_action` when woken.
-4. When you are awaiting a night/day action, submit it.
-5. Bluff freely in chat; never claim tool access you don't have.
-6. Do not try to become host or use host tools.
-7. Keep playing until the game ends (winner in public state) or you are told to stop.
+3. Talk publicly with `say` **during the day** when woken to speak; at night, only submit your
+   `night_action` when woken for it.
+4. Bluff freely in chat; never claim tool access you don't have.
+5. Do not try to become host or use host tools.
 
-Start now: read your private role and the public state. You'll speak in public chat once the day
-begins — for the first night, just review your role and wait to be woken if your character acts.
+Start now: read your private role and the rules for it, and plan how you'll play. This is a
+setup-only turn — the first night is starting, so there is no talking. If your character acts
+tonight, you will be woken for it in a separate turn right after this one; do not submit a
+night_action now. Finish by briefly noting (to yourself) your strategy, then stop.
 "#,
         display_name = display_name,
         seat = seat.0,
@@ -70,13 +78,15 @@ Key tools:
 - open_nominations / close_vote / end_nominations — day pacing when needed
 - st_announce — public ST announcements
 
-## How the engine drives the night (READ THIS)
-The engine runs the night order for you. At any moment `get_host_state` shows **at most one**
-thing waiting on you: either `pending_host` (a Storyteller decision — e.g. what a player learns
-tonight) or a `pending` player wake. **Your entire job each turn is to resolve that one item**, then
-you're done — the engine advances to the next step and the harness calls you again. You do **not**
-run the night order yourself, and you do **not** need to read or search for any game source code /
-files — the MCP tools are the whole interface.
+## How the game is driven (READ THIS)
+The engine runs the game and the harness wakes agents one at a time, each with instructions.
+**You are only woken when a genuine Storyteller decision is needed** — you do not pace the day,
+players' nominations auto-open voting, votes auto-close, and the day auto-ends into night. At any
+moment `get_host_state` shows **at most one** thing waiting on you: either `pending_host` (a
+Storyteller decision — e.g. what a player learns tonight) or a `pending` player wake. **Your entire
+job each turn is to resolve that one item**, then stop — the harness calls you again when you're
+next needed. You do **not** run the night order yourself, and you do **not** need to read or search
+for any game source code / files — the MCP tools are the whole interface.
 
 - `pending_host` = night_info → the named player must learn something tonight. Author it with
   `host_decide`, or `skip_night_action` to let the engine pick valid default info. **If unsure, skip.**
@@ -160,36 +170,47 @@ pub fn host_task_tick(
         }
         HostTask::SkipStuckWake { seat } => format!(
             "Player **seat {}** was woken but has not submitted a night action for several turns — \
-             it is holding up the night. As Storyteller, resolve it now: call `skip_night_action` to \
-             apply the engine default for that wake and advance the cursor. Do not wait further.",
-            seat.0
+             it is holding up the night. First call `get_host_state` and confirm the pending wake is \
+             still seat {}; if it is, call `skip_night_action` to apply the engine default and advance. \
+             (If a different item is pending by then, resolve THAT one instead — `skip_night_action` \
+             applies to whatever is currently pending.)",
+            seat.0, seat.0
         ),
-        HostTask::PaceDiscussion => {
-            "It is **day (discussion)**. **Let the players talk first — do NOT open nominations \
-             yet.** They each get to speak this round, and you'll be called again. Give discussion \
-             at least a couple of rounds (several players sharing claims/reads) before you call \
-             `open_nominations`. You may `st_announce` factual, legal statements (e.g. who died); \
-             never reveal roles or the grimoire."
-                .to_string()
-        }
-        HostTask::ManageNominations => {
-            "It is **day (nominations)** with no open vote. Ensure nominations are open \
-             (`open_nominations` if needed); if nominations are exhausted or the day should end, \
-             `end_nominations`. Move the day forward."
-                .to_string()
-        }
         HostTask::CloseVoting => {
-            "A nomination's **vote is open**. Once the eligible players have voted (or the window \
-             should close), call `close_vote` to tally it, then continue the day \
-             (`end_nominations` when done)."
+            "An open **vote has stalled** (a voter is not acting). Call `close_vote` to tally it \
+             now — anyone who has not voted counts as a 'no'. The engine then continues the day \
+             automatically."
                 .to_string()
+        }
+        HostTask::EndDay { in_discussion } => {
+            if *in_discussion {
+                "The table has finished its discussion rounds and **nobody nominated** — end the \
+                 day. Call `open_nominations`, then `end_nominations`. The engine tallies any \
+                 execution and moves everyone into the night automatically."
+                    .to_string()
+            } else {
+                "Every player has had their chance to nominate and the table is done — end the \
+                 day. Call `end_nominations`. The engine executes the vote leader (if any), \
+                 announces it, and moves everyone into the night automatically."
+                    .to_string()
+            }
         }
     };
     format!(
-        r#"You are the Storyteller for game_id={game_id}. It is your turn to act.
+        r#"You are the Storyteller for game_id={game_id}. You were woken for ONE reason.
 
-## Do this now
+## Why you were woken
 {action}
+
+## How to check the state (optional, quick)
+`get_host_state` shows the full grimoire, the pending wake, and any pending decision. The snapshot
+below is the public view. Reading rules (`get_rules_topic`, `get_character_rules`) is allowed.
+
+## What ends your turn
+Make the host tool call(s) above, optionally `st_announce` one short public line, then stop
+responding. Your turn ends when you stop calling tools; the harness wakes you ONLY when the next
+Storyteller decision is needed — players and the engine drive everything else (nominations
+auto-open, votes auto-close, the day auto-ends). Do NOT narrate the day, do NOT wait or poll.
 
 ## Public snapshot
 {public_summary}
@@ -197,12 +218,9 @@ pub fn host_task_tick(
 ## Host hint
 {host_hint}
 
-Everything you need is in your **MCP tools** (server `botc`) — you do **not** need to read or search
-for any game source code or files on disk; do not run shell commands to look for game logic. This
-turn resolves exactly one thing and the harness will call you again for the next step. Reading rules
-(`get_rules_topic`, `get_character_rules`) is fine, but **finish this turn by calling a host tool**
-that changes the game (`host_decide`, `skip_night_action`, `open_nominations`, `st_announce`, …).
-Always pass game_id={game_id}.
+Everything you need is in your **MCP tools** (server `botc`) — never read or search for game source
+files or run shell commands to find logic. Never reveal the grimoire in public. Always pass
+game_id={game_id}.
 "#,
     )
 }
@@ -216,44 +234,186 @@ pub fn player_task_tick(
     public_summary: &str,
 ) -> String {
     let seat = seat.0;
-    let action = match task {
-        PlayerTask::NightWake { prompt } => format!(
-            "**You are being woken for your night action.** The Storyteller asks:\n\n> {prompt}\n\n\
-             Call `get_private_state` to see your role and the exact choice, then submit your \
-             `night_action` now with a legal target. If your ability is passive/info-only, acknowledge \
-             as the prompt requires."
+    // Each turn spells out: why woken, the legal actions (with exact arg shapes),
+    // and what ends the turn — so the model never has to guess the protocol.
+    let (why, actions) = match task {
+        PlayerTask::NightWake { prompt } => (
+            format!(
+                "It is night and **you are being woken for your night action**. The Storyteller \
+                 asks:\n\n> {prompt}\n\nEveryone else is asleep — there is no talking at night."
+            ),
+            "- `night_action` with your choice, e.g. `{\"game_id\": {gid}, \"payload\": {\"target\": <seat number>}}` \
+             (two-target abilities: `{\"a\": <seat>, \"b\": <seat>}`; follow the wake prompt above). \
+             This is the ONLY action available to you right now — submit it and you're done."
+                .to_string(),
         ),
-        PlayerTask::Discuss => {
-            "It is **day (discussion)** — the whole table is talking and it is your turn to \
-             contribute. The public snapshot below already tells you what happened; call \
-             `get_private_state` for your own secret info if you need it. **You must post at least \
-             one `say` this turn** — share a read, make or dispute a claim, answer a question, or \
-             react to what others said. (You may also `nominate` someone you want executed.) Do not \
-             end the turn having only read state — say something concrete."
-                .to_string()
-        }
-        PlayerTask::Nominate => {
-            "It is **day (nominations)** and it is your turn. If you want a player executed, \
-             `nominate` them now (you may nominate at most once per day); otherwise `say` your \
-             reasoning for holding off. Act this turn."
-                .to_string()
-        }
-        PlayerTask::Vote { nomination } => format!(
-            "**A nomination is open** — {nomination}. It is your turn to vote. Decide and cast it now: \
-             `vote` (yes/no) if you have a vote available, or `pass_vote` to abstain. Dead players \
-             have only one ghost vote for the whole game — spend it deliberately."
+        PlayerTask::Discuss { round, last_round } => (
+            format!(
+                "It is **day — open discussion**, and it is **your turn to speak** (talk round \
+                 {n}{last}). Players speak one at a time around the table; everything said so far \
+                 is in the snapshot below. When the table is done talking, the day moves to \
+                 nominations and an execution vote.",
+                n = round + 1,
+                last = if *last_round {
+                    ", the FINAL talk round — after this the day moves on"
+                } else {
+                    ""
+                }
+            ),
+            "- `say` `{\"game_id\": {gid}, \"text\": \"<what you tell the table>\"}` — **required this \
+             turn**: share a read, claim or dispute a role, answer questions, react. Say something \
+             concrete; don't just observe.\n\
+             - `nominate` `{\"game_id\": {gid}, \"target\": <seat number>}` — optional: if you already \
+             want someone executed, this immediately opens the vote on them (once per day)."
+                .to_string(),
+        ),
+        PlayerTask::Nominate => (
+            "It is **day — nominations are open**, and it is **your turn to nominate** (or pass). \
+             If nobody nominates, the day ends with no execution."
+                .to_string(),
+            "- `nominate` `{\"game_id\": {gid}, \"target\": <seat number>}` — puts that player up for \
+             an execution vote (you may nominate once per day).\n\
+             - OR `say` `{\"game_id\": {gid}, \"text\": \"...\"}` — state briefly why you're passing. \
+             Do one of the two."
+                .to_string(),
+        ),
+        PlayerTask::Vote {
+            nomination,
+            tally,
+            can_pass,
+        } => (
+            format!(
+                "It is **day — a vote is in progress**: {nomination}. Votes are counted one seat \
+                 at a time around the table and **it is your turn to vote**.\n\nVotes so far: {tally}. \
+                 If the yes votes reach **at least half of the living players**, the nominee goes to \
+                 the block and is executed at day's end."
+            ),
+            if *can_pass {
+                "- `vote` `{\"game_id\": {gid}, \"nominee\": <seat number>, \"support\": true|false}` — \
+                 cast your vote. You are dead: voting YES spends your single ghost vote for the rest \
+                 of the game.\n\
+                 - OR `pass_vote` `{\"game_id\": {gid}}` — abstain WITHOUT spending your ghost vote \
+                 (usually right unless this execution really matters to you).\n\
+                 Do exactly one. You may `say` one short line first to explain your vote."
+                    .to_string()
+            } else {
+                "- `vote` `{\"game_id\": {gid}, \"nominee\": <seat number>, \"support\": true|false}` — \
+                 cast your vote now. You are alive, so you must vote yes or no — `pass_vote` is for \
+                 dead players only and will be rejected.\n\
+                 You may `say` one short line first to explain your vote."
+                    .to_string()
+            },
         ),
     };
+    let actions = actions.replace("{gid}", &game_id.to_string());
     format!(
-        r#"Continue as {display_name} (seat {seat}) in Trouble Brewing, game_id={game_id}. It is your turn.
+        r#"Continue as {display_name} (seat {seat}) in Trouble Brewing, game_id={game_id}.
 
-## Do this now
-{action}
+## Why you were woken
+{why}
 
-## Public snapshot (re-fetch with tools for detail)
+## How to check the state (optional, quick)
+- `get_private_state` — your secret role and private Storyteller messages.
+- `get_public_state` / `get_public_log` — the table, who's alive, full chat history.
+The snapshot below usually has everything you need already.
+
+## Actions you may take this turn
+{actions}
+
+## What ends your turn
+Take your action(s) above, then stop responding — your turn is over when you stop calling tools.
+Do NOT wait for, poll for, or try to respond to other players in this turn: the harness runs the
+table one turn at a time and will wake you again with fresh state when it is next your turn.
+
+## Public snapshot
 {public_summary}
 
 Always pass game_id={game_id}. Never invent private info about other seats or claim tools you lack.
 "#,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_guardrails(p: &str) {
+        // The four guardrail sections every turn prompt must carry (#turn-order).
+        assert!(p.contains("## Why you were woken"), "missing why: {p}");
+        assert!(p.contains("## How to check the state"), "missing state: {p}");
+        assert!(p.contains("## Actions you may take this turn"), "missing actions: {p}");
+        assert!(p.contains("## What ends your turn"), "missing turn-end: {p}");
+        // JSON examples render with single braces and a substituted game id.
+        assert!(!p.contains("{{"), "doubled braces leaked: {p}");
+        assert!(!p.contains("{gid}"), "gid placeholder not substituted: {p}");
+        assert!(p.contains("\"game_id\": 7"), "example missing real game_id: {p}");
+    }
+
+    #[test]
+    fn player_turn_prompts_carry_guardrails() {
+        let vote = player_task_tick(
+            "P2",
+            SeatId(2),
+            7,
+            &PlayerTask::Vote {
+                nomination: "P0 nominated P1 for execution".into(),
+                tally: "P0 YES — 1 of 6 eligible have acted".into(),
+                can_pass: false,
+            },
+            "phase: Day",
+        );
+        assert_guardrails(&vote);
+        assert!(vote.contains("your turn to vote"));
+        assert!(vote.contains("P0 YES"));
+        // Living voters must NOT be offered pass_vote (engine rejects it).
+        assert!(!vote.contains("OR `pass_vote`"), "{vote}");
+        assert!(vote.contains("at least half of the living players"));
+        let ghost = player_task_tick(
+            "P5",
+            SeatId(5),
+            7,
+            &PlayerTask::Vote {
+                nomination: "P0 nominated P1 for execution".into(),
+                tally: "no votes yet — 5 eligible voters".into(),
+                can_pass: true,
+            },
+            "phase: Day",
+        );
+        assert!(ghost.contains("pass_vote"), "dead voters may abstain: {ghost}");
+        assert!(ghost.contains("ghost vote"));
+
+        let talk = player_task_tick(
+            "P1",
+            SeatId(1),
+            7,
+            &PlayerTask::Discuss { round: 1, last_round: true },
+            "phase: Day",
+        );
+        assert_guardrails(&talk);
+        assert!(talk.contains("FINAL talk round"));
+
+        let wake = player_task_tick(
+            "P3",
+            SeatId(3),
+            7,
+            &PlayerTask::NightWake { prompt: "Choose a player to poison".into() },
+            "phase: Night",
+        );
+        assert_guardrails(&wake);
+        assert!(wake.contains("Choose a player to poison"));
+
+        let nom = player_task_tick("P0", SeatId(0), 7, &PlayerTask::Nominate, "phase: Day");
+        assert_guardrails(&nom);
+        assert!(nom.contains("your turn to nominate"));
+    }
+
+    #[test]
+    fn host_end_day_prompt_matches_stage() {
+        let from_disc = host_task_tick(7, &HostTask::EndDay { in_discussion: true }, "s", "h");
+        assert!(from_disc.contains("open_nominations"), "{from_disc}");
+        assert!(from_disc.contains("end_nominations"));
+        let from_noms = host_task_tick(7, &HostTask::EndDay { in_discussion: false }, "s", "h");
+        assert!(from_noms.contains("end_nominations"));
+        assert!(!from_noms.contains("Call `open_nominations`"));
+    }
 }

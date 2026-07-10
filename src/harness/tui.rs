@@ -68,16 +68,31 @@ struct App {
     /// Lines scrolled up from the live tail (0 = stick to newest output) (#45).
     scroll_from_bottom: usize,
     /// Round-robin cursor for discussion/nomination turns in the scheduler (#60).
+    /// Reset to 0 whenever the game enters a new phase/stage (see `stage_key`).
     tick_rotation: usize,
+    /// Key of the phase/stage the last tick planned for; a change resets `tick_rotation`
+    /// so discussion rounds start counting from the first speaker.
+    stage_key: String,
     /// Signature of what the engine was waiting on last tick, for stall detection (#60).
     wait_sig: Option<String>,
     /// Consecutive cycles the engine has sat on `wait_sig`; drives host escalation (#60).
     stall: usize,
+    /// Fingerprint of the last plan (targets + signature) for the host-retry brake.
+    last_plan_key: String,
+    /// Consecutive identical host-only plans with no state change; capped to stop
+    /// an unbounded host retry loop.
+    host_plan_repeats: usize,
     /// Agent indices whose stream shows full `[think]` blocks (default: collapsed).
     thinking_expanded: HashSet<usize>,
     /// Last drawn hit targets for mouse (agents list + stream pane).
     hit_agents: Rect,
     hit_stream: Rect,
+    /// Hit target of the action-feed pane (zero when the grimoire is shown).
+    hit_feed: Rect,
+    /// seq of the feed entry rendered on each visible feed row (for click-expand).
+    feed_rows: Vec<Option<u64>>,
+    /// Feed entries (by seq) whose full args/result are expanded.
+    feed_expanded: HashSet<u64>,
     /// Central feed of every agent tool RPC (shared with the socket server) (#UI).
     action_log: Arc<ActionLog>,
     /// Center pane shows the grimoire (true) or the action feed (false).
@@ -129,11 +144,17 @@ impl App {
             should_quit: false,
             scroll_from_bottom: 0,
             tick_rotation: 0,
+            stage_key: String::new(),
             wait_sig: None,
             stall: 0,
+            last_plan_key: String::new(),
+            host_plan_repeats: 0,
             thinking_expanded: HashSet::new(),
             hit_agents: Rect::default(),
             hit_stream: Rect::default(),
+            hit_feed: Rect::default(),
+            feed_rows: Vec::new(),
+            feed_expanded: HashSet::new(),
             action_log: Arc::new(ActionLog::default()),
             show_grimoire: false,
             last_targets: Vec::new(),
@@ -181,14 +202,20 @@ impl App {
         let x = m.column;
         let y = m.row;
         match m.kind {
-            // Wheel / trackpad: scroll the stream when the pointer is over it.
+            // Wheel / trackpad: scroll the stream or the action feed under the pointer.
             MouseEventKind::ScrollUp if point_in_rect(self.hit_stream, x, y) => {
                 self.scroll_stream(3);
             }
             MouseEventKind::ScrollDown if point_in_rect(self.hit_stream, x, y) => {
                 self.scroll_stream(-3);
             }
-            // Left click: select agent, or toggle thinking on the stream pane.
+            MouseEventKind::ScrollUp if point_in_rect(self.hit_feed, x, y) => {
+                self.feed_scroll = self.feed_scroll.saturating_add(3);
+            }
+            MouseEventKind::ScrollDown if point_in_rect(self.hit_feed, x, y) => {
+                self.feed_scroll = self.feed_scroll.saturating_sub(3);
+            }
+            // Left click: select agent, expand a feed action, or toggle thinking.
             MouseEventKind::Down(MouseButton::Left) => {
                 if point_in_rect(self.hit_agents, x, y) {
                     if let Some(pool) = self.agents.as_ref() {
@@ -205,11 +232,20 @@ impl App {
                             self.status = format!("selected agent {idx}");
                         }
                     }
+                } else if point_in_rect(self.hit_feed, x, y) {
+                    // Row under the top border → visible feed row → entry seq.
+                    let row = y.saturating_sub(self.hit_feed.y.saturating_add(1)) as usize;
+                    if let Some(Some(seq)) = self.feed_rows.get(row) {
+                        let seq = *seq;
+                        if !self.feed_expanded.remove(&seq) {
+                            self.feed_expanded.insert(seq);
+                        }
+                    }
                 } else if point_in_rect(self.hit_stream, x, y) {
                     self.toggle_thinking_selected();
                 }
             }
-            // Ignore other mouse noise (drags, right-click, wheel outside stream).
+            // Ignore other mouse noise (drags, right-click, wheel outside panes).
             _ => {}
         }
     }
@@ -474,6 +510,14 @@ impl App {
             let Some(g) = st.get(GameId(gid)) else {
                 return;
             };
+            // New phase/stage => restart the turn rotation (round counting depends
+            // on rotation starting at 0 when discussion/nominations begin).
+            let key = stage_key_of(g);
+            if key != self.stage_key {
+                crate::dlog!("STAGE {} -> {} (rotation reset)", self.stage_key, key);
+                self.stage_key = key;
+                self.tick_rotation = 0;
+            }
             // Stall detection: same wait as last cycle => it's not progressing.
             let sig = wait_signature(g);
             let stall = if sig.is_some() && sig == self.wait_sig {
@@ -522,7 +566,30 @@ impl App {
             return;
         }
 
-        self.tick_rotation = self.tick_rotation.wrapping_add(1);
+        // Host-retry brake: a host-only fallback plan that repeats with no state
+        // change means the host agent runs but never makes the required call.
+        // Without a cap, event-driven auto would re-spawn it forever (token burn).
+        let host_only = plan
+            .iter()
+            .all(|t| matches!(t, SchedTarget::Host(_)));
+        let plan_key = format!("{}|{sig:?}", plan_dbg.join(","));
+        if host_only && plan_key == self.last_plan_key {
+            self.host_plan_repeats += 1;
+        } else {
+            self.host_plan_repeats = 0;
+        }
+        self.last_plan_key = plan_key;
+        const HOST_RETRY_CAP: usize = 5;
+        if host_only && self.host_plan_repeats >= HOST_RETRY_CAP {
+            self.auto_tick = false;
+            self.status = format!(
+                "auto-advance stopped: host repeated '{}' {HOST_RETRY_CAP}x without progress (see debug log). t=resume",
+                self.last_targets.join(",")
+            );
+            crate::dlog!("TICK -> host plan repeated {HOST_RETRY_CAP}x with no progress, auto_tick disabled");
+            return;
+        }
+
         self.last_targets = plan_dbg;
         self.last_tick = Instant::now();
         if let Some(pool) = self.agents.as_mut() {
@@ -534,10 +601,14 @@ impl App {
                         plan.len()
                     );
                     crate::dlog!("TICK -> tick_scheduled spawned {spawned}/{}", plan.len());
-                    // Event-driven auto would re-fire immediately while idle; if a tick
-                    // spawns nothing (broken grok / all errored), stop auto to avoid a
-                    // hot retry loop. Re-enable with `t` after fixing.
-                    if spawned == 0 {
+                    if spawned > 0 {
+                        // Consume the turn slot only when someone actually ran —
+                        // a failed spawn must not silently skip a speaker.
+                        self.tick_rotation = self.tick_rotation.wrapping_add(1);
+                    } else {
+                        // Event-driven auto would re-fire immediately while idle; if a
+                        // tick spawns nothing (broken grok / all errored), stop auto to
+                        // avoid a hot retry loop. Re-enable with `t` after fixing.
                         self.auto_tick = false;
                         self.status =
                             "auto-advance stopped: tick spawned no agent (check grok / debug log). t=resume".into();
@@ -719,6 +790,26 @@ impl App {
     }
 }
 
+/// Stable key for the current phase/stage; a change means the turn rotation restarts.
+/// Includes the living count so a mid-stage death (Slayer shot) restarts the round
+/// with the current roster instead of mis-indexing speakers/rounds.
+fn stage_key_of(g: &Game) -> String {
+    let living = g.seats.iter().filter(|s| s.alive).count();
+    match &g.phase {
+        Phase::Lobby => "lobby".into(),
+        Phase::FirstNight { .. } => "night1".into(),
+        Phase::Night { night, .. } => format!("night{night}"),
+        Phase::Day { day, stage } => format!(
+            "day{day}-{}-{living}",
+            match stage {
+                crate::game::DayStage::Discussion => "disc",
+                crate::game::DayStage::Nominations => "noms",
+            }
+        ),
+        Phase::Ended { .. } => "ended".into(),
+    }
+}
+
 /// Readable one-line rendering of a public event (for agent prompts, not Debug).
 fn fmt_public_event(e: &crate::comms::PublicEvent) -> String {
     use crate::comms::PublicEvent::*;
@@ -874,12 +965,63 @@ fn feed_line(e: &crate::harness::action_log::ActionEntry) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Detail rows for an expanded feed entry: full args, then the result preview or
+/// full error, each chunked to the pane width. Returned WITHOUT the header row.
+fn feed_detail_lines(
+    e: &crate::harness::action_log::ActionEntry,
+    width: usize,
+) -> Vec<Line<'static>> {
+    use crate::harness::action_log::clip_chars;
+    const MAX_DETAIL_ROWS: usize = 10;
+    let indent = "      ";
+    let body_w = width.saturating_sub(indent.len()).max(8);
+    let chunk = |s: &str, style: Style, out: &mut Vec<Line<'static>>| {
+        let chars: Vec<char> = s.chars().collect();
+        for c in chars.chunks(body_w) {
+            out.push(Line::from(Span::styled(
+                format!("{indent}{}", c.iter().collect::<String>()),
+                style,
+            )));
+        }
+    };
+    let mut out = Vec::new();
+    chunk(
+        &format!("args: {}", e.args),
+        Style::default().fg(Color::Gray),
+        &mut out,
+    );
+    if let Some(err) = &e.error {
+        chunk(
+            &format!("error: {err}"),
+            Style::default().fg(Color::Red),
+            &mut out,
+        );
+    } else if let Some(res) = &e.result {
+        chunk(
+            &format!("result: {}", clip_chars(res, 600)),
+            Style::default().fg(Color::DarkGray),
+            &mut out,
+        );
+    }
+    if out.len() > MAX_DETAIL_ROWS {
+        out.truncate(MAX_DETAIL_ROWS);
+        out.push(Line::from(Span::styled(
+            format!("{indent}… (truncated)"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    out
+}
+
 /// Draw the global action feed (all agents), tail-anchored with `feed_scroll`.
-fn draw_action_feed(f: &mut Frame, area: Rect, app: &App) {
+/// Rows are pre-clipped (no wrapping) so every visible row maps to exactly one
+/// entry — that mapping (`app.feed_rows`) makes rows click-expandable.
+fn draw_action_feed(f: &mut Frame, area: Rect, app: &mut App) {
     let inner_h = area.height.saturating_sub(2).max(1) as usize;
+    let inner_w = area.width.saturating_sub(2).max(8) as usize;
     // Game-only pulls a wider window so real actions aren't starved by info reads.
     let pull = match app.feed_filter {
-        FeedFilter::All => inner_h + app.feed_scroll,
+        FeedFilter::All => inner_h + app.feed_scroll + 50,
         FeedFilter::GameOnly => 1500,
     };
     let entries: Vec<_> = app
@@ -891,29 +1033,54 @@ fn draw_action_feed(f: &mut Frame, area: Rect, app: &App) {
             FeedFilter::GameOnly => e.kind == ActionKind::Game || !e.ok,
         })
         .collect();
-    let end = entries.len().saturating_sub(app.feed_scroll);
-    let start = end.saturating_sub(inner_h);
-    let lines: Vec<Line> = if entries.is_empty() {
+
+    // Flatten entries into visual rows: header row (clickable, ▸/▾ marker) plus
+    // detail rows when expanded. Each row remembers its entry's seq.
+    let mut rows: Vec<(Line<'static>, Option<u64>)> = Vec::new();
+    for e in &entries {
+        let expanded = app.feed_expanded.contains(&e.seq);
+        let marker = if expanded { "▾" } else { "▸" };
+        let mut line = feed_line(e);
+        line.spans.insert(
+            0,
+            Span::styled(format!("{marker} "), Style::default().fg(Color::DarkGray)),
+        );
+        rows.push((line, Some(e.seq)));
+        if expanded {
+            for l in feed_detail_lines(e, inner_w) {
+                rows.push((l, Some(e.seq)));
+            }
+        }
+    }
+    if rows.is_empty() {
         let msg = match app.feed_filter {
             FeedFilter::All => "no actions yet — agents haven't called any tools",
             FeedFilter::GameOnly => "no game actions yet (f = show all)",
         };
-        vec![Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray)))]
-    } else {
-        entries[start..end].iter().map(feed_line).collect()
-    };
+        rows.push((
+            Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray))),
+            None,
+        ));
+    }
+
+    // Tail-anchored window over the visual rows.
+    let end = rows.len().saturating_sub(app.feed_scroll);
+    let start = end.saturating_sub(inner_h);
+    let window = &rows[start..end];
+    let lines: Vec<Line> = window.iter().map(|(l, _)| l.clone()).collect();
+    app.feed_rows = window.iter().map(|(_, seq)| *seq).collect();
+    app.hit_feed = area;
+
     let filt = match app.feed_filter {
         FeedFilter::All => "all",
         FeedFilter::GameOnly => "game-only",
     };
     let tail = if app.feed_scroll == 0 { "·live" } else { "·scroll" };
     let title = format!(
-        "actions · {filt} · {} total · f=filter g=grimoire {tail}",
+        "actions · {filt} · {} total · click=expand f=filter g=grimoire {tail}",
         app.action_log.len()
     );
-    let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .wrap(Wrap { trim: false });
+    let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
 }
 
@@ -1191,6 +1358,9 @@ fn draw_monitor(f: &mut Frame, area: Rect, app: &mut App) {
             )
             .wrap(Wrap { trim: false });
         f.render_widget(host_p, cols[1]);
+        // Feed not visible: kill its click/scroll targets.
+        app.hit_feed = Rect::default();
+        app.feed_rows.clear();
     } else {
         draw_action_feed(f, cols[1], app);
     }
