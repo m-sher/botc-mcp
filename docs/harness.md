@@ -151,6 +151,17 @@ On quit (`q`) or process exit, the harness **kills** all Grok children and **rem
 - Player proxies always inject their own token; they cannot escalate to host unless given the host token file.
 - Role ACL in `botc-agent-mcp` denies host-only tools for player agents (JSON-RPC `-32602`).
 - The TUI process holds the real grimoire for monitoring only.
+- **Agents are confined to *playing*, not exploring.** `grok-build` is a software-engineering
+  agent by default — given a shell it will `find`/`read` the filesystem to locate the game's
+  source or *other seats' `agent.token` files*. So each headless agent is launched with the
+  built-in **file/shell tools removed** (`--disallowed-tools run_terminal_command,read_file,
+  list_dir,search_replace,grep,…`), leaving only the MCP dispatch tools (`search_tool`/`use_tool`)
+  and planning — the game is played entirely through the `botc` MCP server, so nothing is lost.
+  It also runs with `--no-memory` (don't inherit the user's global `~/.grok/AGENTS.md` / skills /
+  MCP coding context) and `--sandbox` (fs/network confinement, defense in depth). All three are
+  fields on `HarnessConfig` (`disallowed_tools`, `no_memory`, `grok_sandbox`). Removals must be
+  self-consistent — `search_replace` (edit) requires `read_file`, so both are removed together or
+  grok refuses to start.
 
 ## Limitations (v1)
 

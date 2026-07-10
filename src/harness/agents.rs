@@ -40,6 +40,15 @@ pub struct HarnessConfig {
     pub max_turns_per_tick: u32,
     pub seed: Option<u64>,
     pub st_choice_mode: String,
+    /// Built-in grok tools to REMOVE from each agent (`--disallowed-tools`). The game
+    /// is played only through the `botc` MCP server (reached via search_tool/use_tool),
+    /// so agents don't need shell/file tools — removing them stops them exploring the
+    /// filesystem for source / other seats' tokens. NEVER remove search_tool/use_tool.
+    pub disallowed_tools: Vec<String>,
+    /// grok `--sandbox` profile confining filesystem/network (defense in depth).
+    pub grok_sandbox: Option<String>,
+    /// Pass `--no-memory` so agents don't inherit the user's global coding context.
+    pub no_memory: bool,
 }
 
 impl Default for HarnessConfig {
@@ -54,6 +63,31 @@ impl Default for HarnessConfig {
             max_turns_per_tick: 12,
             seed: Some(42),
             st_choice_mode: "host_first".into(),
+            // grok-build is a software-engineering agent; with a shell it hunts for
+            // source/tokens instead of playing. Strip every file/shell/edit/search
+            // built-in, keeping only the MCP dispatch tools (search_tool/use_tool)
+            // and todo_write. NOTE: removals must be self-consistent — search_replace
+            // (edit) requires read_file, so both go together, or grok won't start.
+            disallowed_tools: [
+                "run_terminal_command",
+                "read_file",
+                "list_dir",
+                "search_replace",
+                "grep",
+                "get_command_or_subagent_output",
+                "kill_command_or_subagent",
+                "image_edit",
+                "web_search",
+                "x_keyword_search",
+                "x_semantic_search",
+                "x_thread_fetch",
+                "x_user_search",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            grok_sandbox: Some("workspace".into()),
+            no_memory: true,
         }
     }
 }
@@ -397,6 +431,19 @@ pub fn build_grok_tick_args(
         "--no-subagents".into(),
         "--disable-web-search".into(),
     ];
+    // Confine the agent to *playing* (not exploring the repo): remove built-in
+    // file/shell tools, drop the global coding context, and sandbox the fs.
+    if !cfg.disallowed_tools.is_empty() {
+        args.push("--disallowed-tools".into());
+        args.push(cfg.disallowed_tools.join(","));
+    }
+    if cfg.no_memory {
+        args.push("--no-memory".into());
+    }
+    if let Some(profile) = &cfg.grok_sandbox {
+        args.push("--sandbox".into());
+        args.push(profile.clone());
+    }
     if session_started {
         args.push("--resume".into());
         args.push(session_id.into());
@@ -734,6 +781,34 @@ pub fn sleep_ms(ms: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grok_args_confine_agent_to_playing() {
+        let cfg = HarnessConfig::default();
+        let args = build_grok_tick_args(
+            &cfg,
+            Path::new("/tmp/wd"),
+            Path::new("/tmp/wd/prompt.txt"),
+            "11111111-1111-1111-1111-111111111111",
+            false,
+        );
+        // Built-in file/shell tools removed (so it can't hunt for source / tokens)…
+        let di = args
+            .iter()
+            .position(|a| a == "--disallowed-tools")
+            .expect("--disallowed-tools present");
+        let list = &args[di + 1];
+        assert!(list.contains("run_terminal_command"));
+        assert!(list.contains("read_file"));
+        assert!(list.contains("list_dir"));
+        // …but the MCP dispatch tools are NEVER removed (they ARE the game tools).
+        assert!(!list.contains("search_tool"));
+        assert!(!list.contains("use_tool"));
+        // Global coding context dropped + filesystem sandboxed.
+        assert!(args.contains(&"--no-memory".into()));
+        let sb = args.iter().position(|a| a == "--sandbox").expect("--sandbox");
+        assert_eq!(args[sb + 1], "workspace");
+    }
 
     #[test]
     fn grok_args_use_yolo_once_not_always_approve() {
