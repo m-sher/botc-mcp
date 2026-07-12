@@ -21,7 +21,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
-use crate::game::{Game, GameId, Phase, SeatId, StartOpts, StChoiceMode};
+use crate::game::{Game, GameId, Phase, RoleAssignment, SeatId, StartOpts, StChoiceMode};
+use crate::roles::{Character, CharacterType};
 use crate::harness::action_log::{ActionKind, ActionLog, ActorLabel};
 use crate::harness::scheduler::{plan_ticks, wait_signature, SchedTarget};
 use crate::harness::agents::{
@@ -54,6 +55,11 @@ struct App {
     /// Per-session model picks: index 0 = Host, 1..=N = players P0..P{N-1}.
     /// Kept in lockstep with `player_count` (+1 for the host row).
     seat_models: Vec<String>,
+    /// Previewed role for each player seat (index i = P{i}), shown on the setup
+    /// screen so models can be picked per role. Regenerated on count change and on
+    /// reroll; passed to `start_game` as fixed assignments so the launched game
+    /// matches exactly what was shown. Empty only if the preview draw failed.
+    setup_roles: Vec<RoleAssignment>,
     /// Focused setup row: 0 = the player-count row; 1.. = Host, P0, P1, …
     setup_row: usize,
     selected_agent: usize,
@@ -136,11 +142,12 @@ impl App {
             )
         };
         let player_count = 5;
-        Self {
+        let mut app = Self {
             focus: Focus::Setup,
             player_count,
             // One pick per session (host + players), all starting on the CLI default.
             seat_models: vec![cfg.model.clone(); player_count + 1],
+            setup_roles: Vec::new(),
             setup_row: 0,
             selected_agent: 0,
             status,
@@ -172,7 +179,42 @@ impl App {
             last_targets: Vec::new(),
             feed_scroll: 0,
             feed_filter: FeedFilter::All,
+        };
+        // Draw an initial role assignment so the setup screen shows roles immediately.
+        app.reroll_roles();
+        app
+    }
+
+    /// Draw a fresh, valid role assignment for the current player count and stash it
+    /// in `setup_roles`. Uses a throwaway game so the same engine bag logic that the
+    /// real game will use produces the preview; `launch()` then replays these exact
+    /// assignments. Leaves `status` untouched on success (keeps the boot note); only
+    /// reports on failure.
+    fn reroll_roles(&mut self) {
+        let names: Vec<String> = (0..self.player_count).map(|i| format!("P{i}")).collect();
+        let created = match Game::create(names, rand::random()) {
+            Ok(c) => c,
+            Err(e) => {
+                self.setup_roles.clear();
+                self.status = format!("role preview failed: {e}");
+                return;
+            }
+        };
+        let mut g = created.game;
+        if let Err(e) = g.start_game(&created.host_token, StartOpts::default()) {
+            self.setup_roles.clear();
+            self.status = format!("role preview failed: {e}");
+            return;
         }
+        self.setup_roles = g
+            .seats
+            .iter()
+            .map(|s| RoleAssignment {
+                seat: s.id,
+                true_character: s.true_character.expect("started game assigns every seat"),
+                believed_character: s.believed_character,
+            })
+            .collect();
     }
 
     fn selected_thinking_expanded(&self) -> bool {
@@ -271,6 +313,8 @@ impl App {
             self.player_count = pc.clamp(5, 15) as usize;
             self.seat_models
                 .resize(self.player_count + 1, self.cfg.model.clone());
+            // Roles are count-specific; redraw the assignment so the picker stays valid.
+            self.reroll_roles();
             self.status = format!(
                 "players: {}  ({} sessions incl. host)",
                 self.player_count,
@@ -310,6 +354,13 @@ impl App {
                 if self.focus == Focus::Setup =>
             {
                 self.setup_adjust(-1);
+            }
+            // Reroll the whole-table role assignment (rebuilds the bag).
+            KeyCode::Char('r') if self.focus == Focus::Setup => {
+                self.reroll_roles();
+                if !self.setup_roles.is_empty() {
+                    self.status = "rerolled roles".into();
+                }
             }
             // Apply the focused row's model to every session.
             KeyCode::Char('a') if self.focus == Focus::Setup => {
@@ -450,10 +501,19 @@ impl App {
         let start_err = {
             let mut st = self.store.lock().unwrap();
             let g = st.get_mut(GameId(game_id)).unwrap();
+            // Launch with exactly the roles shown on the setup screen. Fall back to a
+            // fresh random bag only if the preview is missing/mismatched (shouldn't
+            // happen — it's regenerated on every count change).
+            let assignments = if self.setup_roles.len() == self.player_count {
+                Some(self.setup_roles.clone())
+            } else {
+                None
+            };
             tools::start_game(
                 g,
                 &created.host_token,
                 StartOpts {
+                    assignments,
                     st_choice_mode: if self.cfg.st_choice_mode == "random" {
                         StChoiceMode::Random
                     } else {
@@ -1368,6 +1428,29 @@ fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(status, chunks[2]);
 }
 
+/// Setup-screen label for a previewed seat role. Drunk shows both its true role and
+/// the Townsfolk it believes it is, since the operator picks models on the true role.
+fn role_label(a: &RoleAssignment) -> String {
+    match a.believed_character {
+        Some(face) => format!(
+            "{} (as {})",
+            a.true_character.display_name(),
+            face.display_name()
+        ),
+        None => a.true_character.display_name().to_string(),
+    }
+}
+
+/// Colour a role by team so the operator can see the evil seats at a glance.
+fn role_style(c: Character) -> Style {
+    match c.character_type() {
+        CharacterType::Demon => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        CharacterType::Minion => Style::default().fg(Color::Red),
+        CharacterType::Outsider => Style::default().fg(Color::Yellow),
+        CharacterType::Townsfolk => Style::default().fg(Color::Green),
+    }
+}
+
 fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     let mcp = resolve_agent_mcp_bin_for_display(&app.cfg);
     let mcp_note = if agent_mcp_bin_ok(&app.cfg) {
@@ -1394,9 +1477,9 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     )));
     lines.push(Line::raw(""));
 
-    // One model row per session: Host, P0, P1, …
+    // One row per session: Host, P0, P1, … each showing seat · role · model.
     lines.push(Line::from(Span::styled(
-        "  Model per session   (←/→ change · a = apply focused model to all)",
+        "  Seat · role · model   (←/→ change model · a = apply to all · r = reroll roles)",
         dim,
     )));
     for slot in 0..=app.player_count {
@@ -1417,6 +1500,15 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
             format!("{mark}{who:<5} "),
             if app.setup_row == row { focused } else { Style::default() },
         )];
+        // Role column: Host runs the game; players show their previewed character.
+        let (role_text, role_st) = if slot == 0 {
+            ("Storyteller".to_string(), dim)
+        } else if let Some(a) = app.setup_roles.get(slot - 1) {
+            (role_label(a), role_style(a.true_character))
+        } else {
+            ("—".to_string(), dim)
+        };
+        spans.push(Span::styled(format!("{role_text:<26}"), role_st));
         spans.push(Span::styled(
             model.clone(),
             if app.setup_row == row {
@@ -1449,7 +1541,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::raw(format!("  Work root:   {}", app.cfg.work_root.display())));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "  Controls:  ↑/↓ focus row · ←/→ change (count / model) · a model→all",
+        "  Controls:  ↑/↓ focus row · ←/→ change (count / model) · a model→all · r reroll roles",
         dim,
     )));
     lines.push(Line::from(Span::styled(
@@ -1864,5 +1956,75 @@ mod tests {
             !screen2.contains("MARKER"),
             "logical-only scroll should still clip MARKER (proves wrap matters); screen:\n{screen2}"
         );
+    }
+
+    #[test]
+    fn previewed_assignment_replays_as_fixed_assignments() {
+        // The parity contract behind reroll_roles() → launch(): a role assignment
+        // drawn off a throwaway game must replay verbatim as fixed `assignments`, so
+        // the launched game shows exactly the roles the operator picked models for.
+        let names: Vec<String> = (0..7).map(|i| format!("P{i}")).collect();
+        let created = Game::create(names.clone(), 42).unwrap();
+        let mut preview = created.game;
+        preview
+            .start_game(&created.host_token, StartOpts::default())
+            .unwrap();
+        let roles: Vec<RoleAssignment> = preview
+            .seats
+            .iter()
+            .map(|s| RoleAssignment {
+                seat: s.id,
+                true_character: s.true_character.unwrap(),
+                believed_character: s.believed_character,
+            })
+            .collect();
+
+        // A legal Trouble Brewing bag: exactly one Imp, and a face iff Drunk.
+        assert_eq!(
+            roles
+                .iter()
+                .filter(|a| a.true_character == Character::Imp)
+                .count(),
+            1
+        );
+        for a in &roles {
+            assert_eq!(
+                a.believed_character.is_some(),
+                a.true_character == Character::Drunk
+            );
+        }
+
+        // Different seed — proves the launched roles come from the fixed assignments,
+        // not a fresh random bag.
+        let launched = Game::create(names, 999).unwrap();
+        let mut g = launched.game;
+        g.start_game(
+            &launched.host_token,
+            StartOpts {
+                assignments: Some(roles.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (s, a) in g.seats.iter().zip(&roles) {
+            assert_eq!(s.true_character, Some(a.true_character));
+            assert_eq!(s.believed_character, a.believed_character);
+        }
+    }
+
+    #[test]
+    fn role_label_and_style_surface_team_and_drunk_face() {
+        let imp = RoleAssignment::normal(SeatId(0), Character::Imp);
+        assert_eq!(role_label(&imp), "Imp");
+        assert_eq!(role_style(Character::Imp).fg, Some(Color::Red));
+
+        // Drunk shows both its true role and the Townsfolk it believes it is.
+        let drunk = RoleAssignment::drunk(SeatId(1), Character::Chef).unwrap();
+        assert_eq!(role_label(&drunk), "Drunk (as Chef)");
+        // …but is coloured as the Outsider it truly is, not as its face.
+        assert_eq!(role_style(drunk.true_character).fg, Some(Color::Yellow));
+
+        assert_eq!(role_style(Character::Empath).fg, Some(Color::Green));
+        assert_eq!(role_style(Character::Poisoner).fg, Some(Color::Red));
     }
 }
