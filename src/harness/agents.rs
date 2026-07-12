@@ -26,13 +26,20 @@ pub struct AgentConfig {
     pub display_name: String,
     pub token: String,
     pub game_id: u64,
+    /// Model this agent's grok sessions run on (picked per seat in setup).
+    pub model: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct HarnessConfig {
     /// Number of player seats (5–15). Host is +1 session.
     pub player_count: usize,
+    /// Default model: the starting pick for every session row in setup and the
+    /// fallback when a seat has no pick. The model actually used by an agent is
+    /// per-session ([`AgentConfig::model`]).
     pub model: String,
+    /// Models available in the setup pickers — filled from `grok models` at TUI start.
+    pub available_models: Vec<String>,
     pub grok_bin: PathBuf,
     pub agent_mcp_bin: PathBuf,
     pub work_root: PathBuf,
@@ -55,7 +62,9 @@ impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
             player_count: 5,
+            // Placeholder until `load_models_from_grok` (or the caller) fills it.
             model: "grok-build".into(),
+            available_models: Vec::new(),
             grok_bin: PathBuf::from("grok"),
             agent_mcp_bin: PathBuf::from("botc-agent-mcp"),
             work_root: PathBuf::from("/tmp/botc-harness"),
@@ -90,6 +99,177 @@ impl Default for HarnessConfig {
             no_memory: true,
         }
     }
+}
+
+/// Parse the human-readable output of `grok models`.
+///
+/// Expected shape (from the CLI today):
+/// ```text
+/// Default model: grok-code-fast-1
+///
+/// Available models:
+///   - v9-stickynote
+///   * grok-code-fast-1 (default)
+/// ```
+///
+/// Returns `(models, default_id)`. Models keep the order from the CLI. The default
+/// is taken from the `Default model:` line when present, else from a `* … (default)`
+/// bullet.
+pub fn parse_grok_models_output(stdout: &str) -> (Vec<String>, Option<String>) {
+    let mut models = Vec::new();
+    let mut default: Option<String> = None;
+    for line in stdout.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("Default model:") {
+            let id = rest.trim();
+            if !id.is_empty() {
+                default = Some(id.to_string());
+            }
+            continue;
+        }
+        let rest = if let Some(r) = t.strip_prefix("* ") {
+            r
+        } else if let Some(r) = t.strip_prefix("- ") {
+            r
+        } else {
+            continue;
+        };
+        // First token is the model id; ignore a trailing "(default)" label.
+        let id = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
+        if !models.iter().any(|m| m == &id) {
+            models.push(id);
+        }
+    }
+    (models, default)
+}
+
+/// Run `grok models` and return the available model ids plus the CLI default.
+///
+/// On failure (binary missing, non-zero exit, empty parse) returns an empty list
+/// and `None` — the caller should keep whatever `model` it already has.
+pub fn discover_models(grok_bin: &Path) -> (Vec<String>, Option<String>) {
+    let output = match Command::new(grok_bin)
+        .arg("models")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            crate::dlog!("models: failed to run `{} models`: {e}", grok_bin.display());
+            return (Vec::new(), None);
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        crate::dlog!(
+            "models: `{} models` exit={:?} stderr={}",
+            grok_bin.display(),
+            output.status.code(),
+            clip_for_log(&stderr, 200)
+        );
+        // Some builds still print the list on stdout even with a weird exit — try parse.
+    }
+    let (models, default) = parse_grok_models_output(&stdout);
+    if models.is_empty() {
+        // Fallback: sometimes the list is on stderr (or mixed).
+        let (m2, d2) = parse_grok_models_output(&stderr);
+        if !m2.is_empty() {
+            return (m2, d2.or(default));
+        }
+        crate::dlog!(
+            "models: no models parsed from `{} models` (stdout={})",
+            grok_bin.display(),
+            clip_for_log(&stdout, 200)
+        );
+    }
+    (models, default)
+}
+
+fn clip_for_log(s: &str, max: usize) -> String {
+    let s = s.replace('\n', "\\n");
+    if s.chars().count() <= max {
+        s
+    } else {
+        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
+}
+
+impl HarnessConfig {
+    /// Fill [`Self::available_models`] (and optionally [`Self::model`]) from
+    /// `grok models`. Returns a short status note for the setup screen.
+    pub fn load_models_from_grok(&mut self) -> String {
+        let (models, default) = discover_models(&self.grok_bin);
+        if models.is_empty() {
+            // Keep a one-entry picker so ←/→ is not a no-op, using the current model.
+            if self.available_models.is_empty() {
+                self.available_models = vec![self.model.clone()];
+            }
+            return format!(
+                "model list: could not read `{} models` — using {}",
+                self.grok_bin.display(),
+                self.model
+            );
+        }
+        self.available_models = models;
+        if let Some(d) = default {
+            if self.available_models.iter().any(|m| m == &d) {
+                self.model = d;
+            } else {
+                self.model = self.available_models[0].clone();
+            }
+        } else if !self.available_models.iter().any(|m| m == &self.model) {
+            self.model = self.available_models[0].clone();
+        }
+        format!(
+            "models: {} from `{} models` · selected {}",
+            self.available_models.len(),
+            self.grok_bin.display(),
+            self.model
+        )
+    }
+
+    /// Index of `self.model` in [`Self::available_models`], or `None` if custom.
+    pub fn model_index(&self) -> Option<usize> {
+        self.available_models.iter().position(|m| m == &self.model)
+    }
+
+    /// Cycle the model picker by `delta` steps (±1 for next/prev).
+    ///
+    /// If the current model is not in the list, `delta > 0` jumps to the first
+    /// entry and `delta < 0` to the last.
+    pub fn cycle_model(&mut self, delta: i32) {
+        self.model = cycle_in_list(&self.model, &self.available_models, delta);
+    }
+}
+
+/// Step `current` through `list` by `delta` (wrapping). An unknown `current`
+/// lands on the first entry going forward, the last going backward. Used by the
+/// per-seat model pickers in setup.
+pub fn cycle_in_list(current: &str, list: &[String], delta: i32) -> String {
+    if list.is_empty() || delta == 0 {
+        return current.to_string();
+    }
+    let n = list.len() as i32;
+    let idx = match list.iter().position(|m| m == current) {
+        Some(i) => {
+            let next = ((i as i32 + delta) % n + n) % n;
+            next as usize
+        }
+        None if delta > 0 => 0,
+        None => list.len() - 1,
+    };
+    list[idx].clone()
 }
 
 /// Per-agent child process coordination (#46 / #52).
@@ -410,6 +590,7 @@ fn resolve_agent_mcp_bin(cfg: &HarnessConfig) -> PathBuf {
 /// (alias of the same clap flag → "cannot be used multiple times").
 pub fn build_grok_tick_args(
     cfg: &HarnessConfig,
+    model: &str,
     workdir: &Path,
     prompt_file: &Path,
     session_id: &str,
@@ -419,7 +600,7 @@ pub fn build_grok_tick_args(
         "--prompt-file".into(),
         prompt_file.display().to_string(),
         "-m".into(),
-        cfg.model.clone(),
+        model.to_string(),
         "--cwd".into(),
         workdir.display().to_string(),
         "--max-turns".into(),
@@ -473,13 +654,15 @@ fn spawn_grok_tick(
 
     let args = build_grok_tick_args(
         cfg,
+        &agent.config.model,
         &agent.workdir,
         &prompt_file,
         &session_id,
         session_started,
     );
     crate::dlog!(
-        "SPAWN {label} mode={} session={} prompt_first_line={:?} argv=[{}]",
+        "SPAWN {label} model={} mode={} session={} prompt_first_line={:?} argv=[{}]",
+        agent.config.model,
         if session_started { "resume" } else { "fresh" },
         session_id,
         prompt.lines().next().unwrap_or(""),
@@ -783,10 +966,117 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_grok_models_output_reads_list_and_default() {
+        let sample = r#"
+You are logged in with grok.com.
+
+Default model: grok-code-fast-1
+
+Available models:
+  - v9-stickynote
+  - grok-build
+  - sxs-claude-opus-4-6
+  * grok-code-fast-1 (default)
+  - opus-4-5-caching
+"#;
+        let (models, default) = parse_grok_models_output(sample);
+        assert_eq!(
+            models,
+            vec![
+                "v9-stickynote",
+                "grok-build",
+                "sxs-claude-opus-4-6",
+                "grok-code-fast-1",
+                "opus-4-5-caching",
+            ]
+        );
+        assert_eq!(default.as_deref(), Some("grok-code-fast-1"));
+    }
+
+    #[test]
+    fn cycle_model_wraps_and_recovers_from_custom() {
+        let mut cfg = HarnessConfig::default();
+        cfg.available_models = vec![
+            "grok-build".into(),
+            "v9-stickynote".into(),
+            "other".into(),
+        ];
+        cfg.model = "grok-build".into();
+        cfg.cycle_model(1);
+        assert_eq!(cfg.model, "v9-stickynote");
+        cfg.cycle_model(-1);
+        assert_eq!(cfg.model, "grok-build");
+        // Wrap past ends.
+        cfg.cycle_model(-1);
+        assert_eq!(cfg.model, "other");
+        cfg.cycle_model(1);
+        assert_eq!(cfg.model, "grok-build");
+        // Custom / unknown id lands on an edge of the list.
+        cfg.model = "my-custom-model".into();
+        cfg.cycle_model(1);
+        assert_eq!(cfg.model, "grok-build");
+        cfg.model = "my-custom-model".into();
+        cfg.cycle_model(-1);
+        assert_eq!(cfg.model, "other");
+    }
+
+    #[test]
+    fn load_models_applies_parsed_default() {
+        let mut cfg = HarnessConfig::default();
+        // Simulate what load_models_from_grok does after a successful parse,
+        // without spawning the real binary.
+        let (models, default) = parse_grok_models_output(
+            "Default model: alpha\nAvailable models:\n  - beta\n  * alpha (default)\n",
+        );
+        cfg.available_models = models;
+        if let Some(d) = default {
+            cfg.model = d;
+        }
+        assert_eq!(cfg.model, "alpha");
+        assert_eq!(cfg.available_models, vec!["beta", "alpha"]);
+    }
+
+    #[test]
+    fn grok_args_use_the_per_agent_model() {
+        // Models are picked per seat: the argv must carry the CALLER's model,
+        // not the config default.
+        let mut cfg = HarnessConfig::default();
+        cfg.model = "config-default-model".into();
+        for model in ["host-model-a", "seat-model-b"] {
+            let args = build_grok_tick_args(
+                &cfg,
+                model,
+                Path::new("/tmp/wd"),
+                Path::new("/tmp/wd/prompt.txt"),
+                "11111111-1111-1111-1111-111111111111",
+                false,
+            );
+            let mi = args.iter().position(|a| a == "-m").expect("-m present");
+            assert_eq!(args[mi + 1], model);
+            assert!(!args.contains(&"config-default-model".to_string()));
+        }
+    }
+
+    #[test]
+    fn cycle_in_list_steps_and_wraps() {
+        let list: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        assert_eq!(cycle_in_list("a", &list, 1), "b");
+        assert_eq!(cycle_in_list("c", &list, 1), "a");
+        assert_eq!(cycle_in_list("a", &list, -1), "c");
+        // Unknown current: forward → first, backward → last.
+        assert_eq!(cycle_in_list("zzz", &list, 1), "a");
+        assert_eq!(cycle_in_list("zzz", &list, -1), "c");
+        // Empty list / zero delta are no-ops.
+        assert_eq!(cycle_in_list("keep", &[], 1), "keep");
+        assert_eq!(cycle_in_list("keep", &list, 0), "keep");
+    }
+
+    #[test]
     fn grok_args_confine_agent_to_playing() {
         let cfg = HarnessConfig::default();
         let args = build_grok_tick_args(
             &cfg,
+            "grok-build",
             Path::new("/tmp/wd"),
             Path::new("/tmp/wd/prompt.txt"),
             "11111111-1111-1111-1111-111111111111",
@@ -815,6 +1105,7 @@ mod tests {
         let cfg = HarnessConfig::default();
         let args = build_grok_tick_args(
             &cfg,
+            "grok-build",
             Path::new("/tmp/wd"),
             Path::new("/tmp/wd/prompt.txt"),
             "11111111-1111-1111-1111-111111111111",
@@ -833,6 +1124,7 @@ mod tests {
         let cfg = HarnessConfig::default();
         let args = build_grok_tick_args(
             &cfg,
+            "grok-build",
             Path::new("/tmp/wd"),
             Path::new("/tmp/wd/prompt.txt"),
             "11111111-1111-1111-1111-111111111111",
@@ -849,6 +1141,7 @@ mod tests {
         let cfg = HarnessConfig::default();
         let args = build_grok_tick_args(
             &cfg,
+            "grok-build",
             Path::new("/tmp/wd"),
             Path::new("/tmp/p"),
             "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
@@ -887,6 +1180,7 @@ mod tests {
         let cfg = HarnessConfig::default();
         let args = build_grok_tick_args(
             &cfg,
+            "grok-build",
             Path::new("/tmp/wd"),
             Path::new("/tmp/wd/prompt.txt"),
             "11111111-1111-1111-1111-111111111111",
@@ -947,6 +1241,7 @@ mod tests {
                 display_name: "ST".into(),
                 token: "tok".into(),
                 game_id: 1,
+                model: "grok-build".into(),
             }],
         )
         .unwrap();
@@ -1006,6 +1301,7 @@ mod tests {
                 display_name: "ST".into(),
                 token: "tok".into(),
                 game_id: 1,
+                model: "grok-build".into(),
             }],
         )
         .unwrap();

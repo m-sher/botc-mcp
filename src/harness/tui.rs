@@ -25,8 +25,9 @@ use crate::game::{Game, GameId, Phase, SeatId, StartOpts, StChoiceMode};
 use crate::harness::action_log::{ActionKind, ActionLog, ActorLabel};
 use crate::harness::scheduler::{plan_ticks, wait_signature, SchedTarget};
 use crate::harness::agents::{
-    agent_mcp_bin_ok, find_agent_mcp_bin, find_grok, resolve_agent_mcp_bin_for_display,
-    AgentConfig, AgentPool, AgentRole, HarnessConfig, LineKind, LogLine,
+    agent_mcp_bin_ok, cycle_in_list, find_agent_mcp_bin, find_grok,
+    resolve_agent_mcp_bin_for_display, AgentConfig, AgentPool, AgentRole, HarnessConfig,
+    LineKind, LogLine,
 };
 use crate::harness::socket::SocketServer;
 use crate::mcp_server::{self, SharedStore};
@@ -50,6 +51,11 @@ enum FeedFilter {
 struct App {
     focus: Focus,
     player_count: usize,
+    /// Per-session model picks: index 0 = Host, 1..=N = players P0..P{N-1}.
+    /// Kept in lockstep with `player_count` (+1 for the host row).
+    seat_models: Vec<String>,
+    /// Focused setup row: 0 = the player-count row; 1.. = Host, P0, P1, …
+    setup_row: usize,
     selected_agent: usize,
     status: String,
     store: SharedStore,
@@ -113,11 +119,13 @@ impl App {
         let id = uuid::Uuid::new_v4();
         cfg.work_root = PathBuf::from(format!("/tmp/botc-harness-{id}"));
         cfg.socket_path = cfg.work_root.join("engine.sock");
+        // Populate the setup picker from `grok models` (CLI default becomes selected).
+        let models_note = cfg.load_models_from_grok();
         let mcp_ok = agent_mcp_bin_ok(&cfg);
         let mcp_path = resolve_agent_mcp_bin_for_display(&cfg);
         let status = if mcp_ok {
             format!(
-                "↑/↓ players · Enter launch · q quit | grok={} mcp={}",
+                "↑/↓ row · ←/→ change · a=model to all · Enter launch · q quit | {models_note} | grok={} mcp={}",
                 cfg.grok_bin.display(),
                 mcp_path.display()
             )
@@ -127,9 +135,13 @@ impl App {
                 mcp_path.display()
             )
         };
+        let player_count = 5;
         Self {
             focus: Focus::Setup,
-            player_count: 5,
+            player_count,
+            // One pick per session (host + players), all starting on the CLI default.
+            seat_models: vec![cfg.model.clone(); player_count + 1],
+            setup_row: 0,
             selected_agent: 0,
             status,
             store: mcp_server::new_shared_store(),
@@ -250,14 +262,64 @@ impl App {
         }
     }
 
+    /// Setup ←/→: adjust the focused row. Row 0 changes the player count (the
+    /// per-seat model list grows/shrinks with it, new rows on the default model);
+    /// rows 1.. cycle that session's model through `grok models`.
+    fn setup_adjust(&mut self, delta: i32) {
+        if self.setup_row == 0 {
+            let pc = self.player_count as i32 + delta;
+            self.player_count = pc.clamp(5, 15) as usize;
+            self.seat_models
+                .resize(self.player_count + 1, self.cfg.model.clone());
+            self.status = format!(
+                "players: {}  ({} sessions incl. host)",
+                self.player_count,
+                self.player_count + 1
+            );
+        } else {
+            let idx = self.setup_row - 1;
+            let cur = self.seat_models[idx].clone();
+            self.seat_models[idx] = cycle_in_list(&cur, &self.cfg.available_models, delta);
+            let who = if idx == 0 {
+                "Host".to_string()
+            } else {
+                format!("P{}", idx - 1)
+            };
+            self.status = format!("{who} model: {}  (a = apply to all)", self.seat_models[idx]);
+        }
+    }
+
     fn on_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            // Setup: ↑/↓ move the focused row (row 0 = player count; 1.. = one
+            // model row per session), ←/→ change the focused row's value.
             KeyCode::Up | KeyCode::Char('k') if self.focus == Focus::Setup => {
-                self.player_count = (self.player_count + 1).min(15);
+                self.setup_row = self.setup_row.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') if self.focus == Focus::Setup => {
-                self.player_count = (self.player_count - 1).max(5);
+                // Rows: 0 (count) + player_count+1 model rows.
+                self.setup_row = (self.setup_row + 1).min(self.player_count + 1);
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('m')
+                if self.focus == Focus::Setup =>
+            {
+                self.setup_adjust(1);
+            }
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('M')
+                if self.focus == Focus::Setup =>
+            {
+                self.setup_adjust(-1);
+            }
+            // Apply the focused row's model to every session.
+            KeyCode::Char('a') if self.focus == Focus::Setup => {
+                if self.setup_row >= 1 {
+                    let m = self.seat_models[self.setup_row - 1].clone();
+                    for slot in self.seat_models.iter_mut() {
+                        *slot = m.clone();
+                    }
+                    self.status = format!("model for ALL sessions: {m}");
+                }
             }
             KeyCode::Enter if self.focus == Focus::Setup => self.launch(),
             KeyCode::Tab if self.agents.is_some() => {
@@ -441,11 +503,20 @@ impl App {
             created.player_tokens.len()
         );
 
+        // Per-session models from the setup picker (index 0 = host, 1+i = P{i}).
+        // Fall back to the default model if the picks are out of sync.
+        let model_for = |slot: usize| -> String {
+            self.seat_models
+                .get(slot)
+                .cloned()
+                .unwrap_or_else(|| self.cfg.model.clone())
+        };
         let mut configs = vec![AgentConfig {
             role: AgentRole::Host,
             display_name: "Storyteller".into(),
             token: created.host_token.as_str().to_string(),
             game_id,
+            model: model_for(0),
         }];
         for (i, tok) in created.player_tokens.iter().enumerate() {
             configs.push(AgentConfig {
@@ -455,6 +526,7 @@ impl App {
                 display_name: self.player_names[i].clone(),
                 token: tok.as_str().to_string(),
                 game_id,
+                model: model_for(1 + i),
             });
         }
 
@@ -924,8 +996,38 @@ fn actor_color(is_host: bool, seat: Option<u8>) -> Color {
     PAL[(seat.unwrap_or(0) as usize) % PAL.len()]
 }
 
-/// Render one action-feed entry as a styled line. Game actions are bright with a
-/// `▶` marker; info reads are dimmed; errors are red. The actor is colour-coded.
+/// `say` / `st_announce` text is never truncated in the feed — it always wraps
+/// in full. Other tools keep a short inline summary on the header row.
+fn is_speech_tool(tool: &str) -> bool {
+    matches!(tool, "say" | "st_announce")
+}
+
+fn summary_style(kind: ActionKind) -> Style {
+    if kind == ActionKind::Game {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+/// Chunk `text` into indented feed rows at `width` (pane inner width).
+fn feed_chunk_lines(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    let indent = "      ";
+    let body_w = width.saturating_sub(indent.len()).max(8);
+    let chars: Vec<char> = text.chars().collect();
+    chars
+        .chunks(body_w)
+        .map(|c| {
+            Line::from(Span::styled(
+                format!("{indent}{}", c.iter().collect::<String>()),
+                style,
+            ))
+        })
+        .collect()
+}
+
+/// Header row: time · actor · tool · status. Speech tools leave the quote off the
+/// header (it wraps in full below). Other tools put the short summary inline.
 fn feed_line(e: &crate::harness::action_log::ActionEntry) -> Line<'static> {
     let ac = actor_color(e.actor.is_host, e.actor.seat);
     let (tool_style, marker) = match e.kind {
@@ -945,14 +1047,9 @@ fn feed_line(e: &crate::harness::action_log::ActionEntry) -> Line<'static> {
         Span::styled(marker, tool_style),
         Span::styled(e.tool.clone(), tool_style),
     ];
-    if !e.summary.is_empty() {
-        let sty = if e.kind == ActionKind::Game {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
+    if !is_speech_tool(&e.tool) && !e.summary.is_empty() {
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(e.summary.clone(), sty));
+        spans.push(Span::styled(e.summary.clone(), summary_style(e.kind)));
     }
     if e.ok {
         spans.push(Span::styled("  ✓", Style::default().fg(Color::Green)));
@@ -965,43 +1062,44 @@ fn feed_line(e: &crate::harness::action_log::ActionEntry) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Detail rows for an expanded feed entry: full args, then the result preview or
-/// full error, each chunked to the pane width. Returned WITHOUT the header row.
+/// Full `say` / `st_announce` quote, wrapped — always shown (not gated on expand).
+fn feed_speech_lines(
+    e: &crate::harness::action_log::ActionEntry,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if e.summary.is_empty() {
+        return Vec::new();
+    }
+    feed_chunk_lines(&e.summary, width, summary_style(e.kind))
+}
+
+/// Expanded-only detail: args JSON, then result / error. Speech text is already
+/// visible above and is not repeated here.
 fn feed_detail_lines(
     e: &crate::harness::action_log::ActionEntry,
     width: usize,
 ) -> Vec<Line<'static>> {
     use crate::harness::action_log::clip_chars;
-    const MAX_DETAIL_ROWS: usize = 10;
+    const MAX_DETAIL_ROWS: usize = 16;
     let indent = "      ";
-    let body_w = width.saturating_sub(indent.len()).max(8);
-    let chunk = |s: &str, style: Style, out: &mut Vec<Line<'static>>| {
-        let chars: Vec<char> = s.chars().collect();
-        for c in chars.chunks(body_w) {
-            out.push(Line::from(Span::styled(
-                format!("{indent}{}", c.iter().collect::<String>()),
-                style,
-            )));
-        }
-    };
     let mut out = Vec::new();
-    chunk(
+    out.extend(feed_chunk_lines(
         &format!("args: {}", e.args),
+        width,
         Style::default().fg(Color::Gray),
-        &mut out,
-    );
+    ));
     if let Some(err) = &e.error {
-        chunk(
+        out.extend(feed_chunk_lines(
             &format!("error: {err}"),
+            width,
             Style::default().fg(Color::Red),
-            &mut out,
-        );
+        ));
     } else if let Some(res) = &e.result {
-        chunk(
+        out.extend(feed_chunk_lines(
             &format!("result: {}", clip_chars(res, 600)),
+            width,
             Style::default().fg(Color::DarkGray),
-            &mut out,
-        );
+        ));
     }
     if out.len() > MAX_DETAIL_ROWS {
         out.truncate(MAX_DETAIL_ROWS);
@@ -1034,8 +1132,9 @@ fn draw_action_feed(f: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    // Flatten entries into visual rows: header row (clickable, ▸/▾ marker) plus
-    // detail rows when expanded. Each row remembers its entry's seq.
+    // Flatten entries into visual rows: header (▸/▾) + full speech text always,
+    // plus args/result when expanded. Every row of a block maps to that seq so
+    // any click toggles expand/collapse.
     let mut rows: Vec<(Line<'static>, Option<u64>)> = Vec::new();
     for e in &entries {
         let expanded = app.feed_expanded.contains(&e.seq);
@@ -1046,6 +1145,12 @@ fn draw_action_feed(f: &mut Frame, area: Rect, app: &mut App) {
             Span::styled(format!("{marker} "), Style::default().fg(Color::DarkGray)),
         );
         rows.push((line, Some(e.seq)));
+        // say / st_announce: full quote always, never truncated (may wrap).
+        if is_speech_tool(&e.tool) {
+            for l in feed_speech_lines(e, inner_w) {
+                rows.push((l, Some(e.seq)));
+            }
+        }
         if expanded {
             for l in feed_detail_lines(e, inner_w) {
                 rows.push((l, Some(e.seq)));
@@ -1266,26 +1371,98 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     } else {
         "MISSING — cargo build --bins"
     };
-    let text = format!(
-        "Player count: {pc}   →  {tot} headless Grok sessions (host + players)\n\n\
-         Model:       {model}\n\
-         Grok binary: {grok}\n\
-         Agent MCP:   {mcp}  ({mcp_note})\n\
-         Work root:   {work}\n\n\
-         Controls:  ↑/↓  change player count\n\
-                    Enter  create game + spawn agents\n\
-                    q      quit (kills agents, removes workdirs)\n\n\
-         Each agent workdir gets .grok/config.toml → botc-agent-mcp\n\
-         (token-scoped) → Unix socket → shared in-process engine.\n\
-         Build first: cargo build --bins && cargo run --bin botc-tui",
-        pc = app.player_count,
-        tot = app.player_count + 1,
-        model = app.cfg.model,
-        grok = app.cfg.grok_bin.display(),
-        mcp = mcp.display(),
-        work = app.cfg.work_root.display(),
-    );
-    let p = Paragraph::new(text)
+    let focused = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Row 0: player count.
+    let count_mark = if app.setup_row == 0 { "▶ " } else { "  " };
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{count_mark}Players: {}    →  {} headless Grok sessions (host + players)",
+            app.player_count,
+            app.player_count + 1
+        ),
+        if app.setup_row == 0 { focused } else { Style::default() },
+    )));
+    lines.push(Line::raw(""));
+
+    // One model row per session: Host, P0, P1, …
+    lines.push(Line::from(Span::styled(
+        "  Model per session   (←/→ change · a = apply focused model to all)",
+        dim,
+    )));
+    for slot in 0..=app.player_count {
+        let row = slot + 1;
+        let who = if slot == 0 {
+            "Host".to_string()
+        } else {
+            format!("P{}", slot - 1)
+        };
+        let model = app
+            .seat_models
+            .get(slot)
+            .cloned()
+            .unwrap_or_else(|| app.cfg.model.clone());
+        let known = app.cfg.available_models.iter().any(|m| m == &model);
+        let mark = if app.setup_row == row { "▶ " } else { "  " };
+        let mut spans = vec![Span::styled(
+            format!("{mark}{who:<5} "),
+            if app.setup_row == row { focused } else { Style::default() },
+        )];
+        spans.push(Span::styled(
+            model.clone(),
+            if app.setup_row == row {
+                focused
+            } else {
+                Style::default().fg(actor_color(slot == 0, slot.checked_sub(1).map(|s| s as u8)))
+            },
+        ));
+        if !known && !app.cfg.available_models.is_empty() {
+            spans.push(Span::styled("  (not in `grok models`)", dim));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  Available models: {}",
+            if app.cfg.available_models.is_empty() {
+                "(could not read `grok models`)".to_string()
+            } else {
+                app.cfg.available_models.join(" · ")
+            }
+        ),
+        dim,
+    )));
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(format!("  Grok binary: {}", app.cfg.grok_bin.display())));
+    lines.push(Line::raw(format!("  Agent MCP:   {}  ({mcp_note})", mcp.display())));
+    lines.push(Line::raw(format!("  Work root:   {}", app.cfg.work_root.display())));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "  Controls:  ↑/↓ focus row · ←/→ change (count / model) · a model→all",
+        dim,
+    )));
+    lines.push(Line::from(Span::styled(
+        "             Enter create game + spawn agents · q quit",
+        dim,
+    )));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "  Each agent workdir gets .grok/config.toml → botc-agent-mcp (token-scoped)",
+        dim,
+    )));
+    lines.push(Line::from(Span::styled(
+        "  → Unix socket → shared in-process engine. Build first: cargo build --bins",
+        dim,
+    )));
+
+    let p = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("setup"))
         .wrap(Wrap { trim: false });
     f.render_widget(p, area);
@@ -1335,6 +1512,14 @@ fn draw_monitor(f: &mut Frame, area: Rect, app: &mut App) {
                     Span::raw(" "),
                     Span::styled(mark, label_style),
                     Span::styled(label, label_style),
+                    // Per-agent model (they can differ now) — dimmed, clipped.
+                    Span::styled(
+                        format!(
+                            " · {}",
+                            crate::harness::action_log::clip_chars(&a.config.model, 14)
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]))
             })
             .collect()
@@ -1370,8 +1555,8 @@ fn draw_monitor(f: &mut Frame, area: Rect, app: &mut App) {
         .as_ref()
         .and_then(|p| p.agents.get(app.selected_agent))
         .map(|a| match a.config.role {
-            AgentRole::Host => "stream: Storyteller".into(),
-            AgentRole::Player { seat } => format!("stream: seat{}", seat.0),
+            AgentRole::Host => format!("stream: Storyteller [{}]", a.config.model),
+            AgentRole::Player { seat } => format!("stream: seat{} [{}]", seat.0, a.config.model),
         })
         .unwrap_or_else(|| "stream".into());
 

@@ -96,7 +96,7 @@ fn harness_argv_returns_valid_json_response() {
     };
 
     // Build harness args, then swap streaming-json → json for a single assertable payload.
-    let mut args = build_grok_tick_args(&cfg, &tmp, &prompt_file, &session_id, false);
+    let mut args = build_grok_tick_args(&cfg, &cfg.model.clone(), &tmp, &prompt_file, &session_id, false);
     if let Some(i) = args.iter().position(|a| a == "streaming-json") {
         args[i] = "json".into();
     }
@@ -181,7 +181,7 @@ fn harness_argv_streaming_json_lines_are_valid() {
         max_turns_per_tick: 3,
         ..HarnessConfig::default()
     };
-    let args = build_grok_tick_args(&cfg, &tmp, &prompt_file, &session_id, false);
+    let args = build_grok_tick_args(&cfg, &cfg.model.clone(), &tmp, &prompt_file, &session_id, false);
 
     let output = Command::new(&grok)
         .args(&args)

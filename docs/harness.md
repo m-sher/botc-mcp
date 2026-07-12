@@ -53,11 +53,25 @@ cargo run --bin botc-tui
 
 ### Setup screen
 
+The setup screen is a roster: the player-count row on top, then **one model row per
+session** (Host, P0, P1, …).
+
 | Key | Action |
 | --- | --- |
-| `↑` / `↓` | Player count 5–15 (**sessions = players + 1 host**) |
+| `↑` / `↓` | Move between rows (count row / Host / P0 / P1 / …) |
+| `←` / `→` or `m` / `M` | Change the focused row: player count 5–15, or that **session's model** |
+| `a` | Apply the focused row's model to **all** sessions |
 | `Enter` | Create game, start night 1, spawn Grok agents |
 | `q` | Quit (kills Grok children and removes workdirs) |
+
+**Models are per session** — each agent (host and every seat) can run a different model,
+e.g. a strong model as the Storyteller and mixed models across seats. Each pick becomes that
+agent's `-m` on every headless `grok` spawn (and `--resume` ticks keep the same model). At
+setup the TUI runs `grok models`, parses the available IDs + default, and uses that list for
+every row's picker (see `discover_models` / `parse_grok_models_output` in
+`src/harness/agents.rs`); the CLI default is every row's starting pick. If the CLI is missing
+or returns nothing, the picker falls back to the current `model` string alone. The monitor
+shows each agent's model in the agents list and the stream title.
 
 ### Monitor screen
 
@@ -77,7 +91,9 @@ Three columns — **left:** agents · **center:** live **action feed** (all agen
 | `Home` | Jump to live tail |
 | `q` | Kill agents, remove workdirs, stop socket, quit |
 
-**Action feed.** Every agent tool call is recorded at the shared socket and shown here, newest at the bottom, labelled by caller (`Host` / `P0`…, colour-coded). **Game-affecting actions** (`say`, `nominate`, `vote`, `night_action`, `host_decide`, `close_vote`, …) are **highlighted** with a `▶` marker + bold tool name + cyan arg summary (e.g. `P3 ▶ vote →P1 YES ✓`); read-only inspection (`get_*_state`, `list_*`) is dimmed; errors are red. Press **`f`** to hide the info-read noise and show only game actions + errors. **Click any row to expand it** (`▸`→`▾`): the full argument JSON (auth tokens redacted), plus the result preview or full error text; click again to collapse. **Mouse wheel over the feed** scrolls its history. This is the fastest way to see *what agents are doing* (vs the per-agent stream, which shows their reasoning).
+**Action feed.** Every agent tool call is recorded at the shared socket and shown here, newest at the bottom, labelled by caller (`Host` / `P0`…, colour-coded). **Game-affecting actions** (`say`, `nominate`, `vote`, `night_action`, `host_decide`, `close_vote`, …) are **highlighted** with a `▶` marker + bold tool name + cyan arg summary (e.g. `P3 ▶ vote →P1 YES ✓`); read-only inspection (`get_*_state`, `list_*`) is dimmed; errors are red. Press **`f`** to hide the info-read noise and show only game actions + errors. **`say` / `st_announce` text is never truncated** — the full quote always wraps under the
+row. **Click any row to expand it** (`▸`→`▾`): full argument JSON (auth tokens redacted),
+plus the result preview or full error text; click again to collapse. **Mouse wheel over the feed** scrolls its history. This is the fastest way to see *what agents are doing* (vs the per-agent stream, which shows their reasoning).
 
 Per-agent **status glyph** in the left list: `●` green = a Grok child is running for that seat, `○` grey = idle.
 
