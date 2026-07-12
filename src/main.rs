@@ -15,7 +15,7 @@ fn main() {
 #[cfg(test)]
 mod smoke {
     use botc_mcp::comms::PublicEvent;
-    use botc_mcp::game::{Game, GameId, RoleAssignment, SeatId};
+    use botc_mcp::game::{DayStage, Game, GameId, Phase, RoleAssignment, SeatId};
     use botc_mcp::roles::Character;
     use botc_mcp::tools;
 
@@ -43,6 +43,11 @@ mod smoke {
         ])
         .unwrap();
 
+        // `say` is day-only; move to the day so this chat-sharing check is valid.
+        game.phase = Phase::Day {
+            day: 1,
+            stage: DayStage::Discussion,
+        };
         tools::say(&mut game, &alice, "I am the Imp.".into()).unwrap();
 
         let log = tools::get_public_log(&game, &bob, 0).unwrap();

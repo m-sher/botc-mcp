@@ -12,6 +12,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::harness::action_log::ActionLog;
 use crate::mcp_server::{self, SharedStore};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,7 +66,17 @@ pub struct SocketServer {
 }
 
 impl SocketServer {
+    /// Start with a throwaway action log (tests / callers that don't monitor).
     pub fn start(store: SharedStore, path: impl Into<PathBuf>) -> std::io::Result<Self> {
+        Self::start_with_log(store, Arc::new(ActionLog::default()), path)
+    }
+
+    /// Start serving, recording every dispatched tool RPC into `action_log`.
+    pub fn start_with_log(
+        store: SharedStore,
+        action_log: Arc<ActionLog>,
+        path: impl Into<PathBuf>,
+    ) -> std::io::Result<Self> {
         let path = path.into();
         if path.exists() {
             let _ = std::fs::remove_file(&path);
@@ -88,8 +99,9 @@ impl SocketServer {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let store = Arc::clone(&store);
+                        let action_log = Arc::clone(&action_log);
                         thread::spawn(move || {
-                            if let Err(e) = handle_client(store, stream) {
+                            if let Err(e) = handle_client(store, action_log, stream) {
                                 eprintln!("botc harness client error: {e}");
                             }
                         });
@@ -146,7 +158,11 @@ impl Drop for SocketServer {
     }
 }
 
-fn handle_client(store: SharedStore, stream: UnixStream) -> std::io::Result<()> {
+fn handle_client(
+    store: SharedStore,
+    action_log: Arc<ActionLog>,
+    stream: UnixStream,
+) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
@@ -175,14 +191,14 @@ fn handle_client(store: SharedStore, stream: UnixStream) -> std::io::Result<()> 
                 continue;
             }
         };
-        let resp = dispatch(&store, req);
+        let resp = dispatch(&store, &action_log, req);
         writeln!(writer, "{}", serde_json::to_string(&resp).unwrap())?;
         writer.flush()?;
     }
     Ok(())
 }
 
-fn dispatch(store: &SharedStore, req: RpcRequest) -> RpcResponse {
+fn dispatch(store: &SharedStore, action_log: &ActionLog, req: RpcRequest) -> RpcResponse {
     match req.op.as_str() {
         "ping" => RpcResponse {
             id: req.id,
@@ -202,7 +218,25 @@ fn dispatch(store: &SharedStore, req: RpcRequest) -> RpcResponse {
                     };
                 }
             };
-            match mcp_server::invoke_named_tool(store, name, req.arguments) {
+            let token = req
+                .arguments
+                .get("token")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let outcome = mcp_server::invoke_named_tool(store, name, req.arguments.clone());
+            let (ok, err, result_preview) = match &outcome {
+                Ok(v) => (true, None, Some(v.to_string())),
+                Err(e) => (false, Some(e.clone()), None),
+            };
+            action_log.record_rpc(
+                token.as_deref(),
+                name,
+                &req.arguments,
+                ok,
+                err,
+                result_preview,
+            );
+            match outcome {
                 Ok(result) => RpcResponse {
                     id: req.id,
                     ok: true,

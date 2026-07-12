@@ -211,6 +211,12 @@ impl Game {
 
     /// Public-only speech. No recipient field by design.
     pub fn say(&mut self, seat: SeatId, text: String) -> Result<(), GameError> {
+        // Public chat is a **day** activity only — at night players are asleep and
+        // silent, and there is no talking in the lobby or after the game ends.
+        // (Dead players may still speak during the day; no `alive` gate here.)
+        if !matches!(self.phase, Phase::Day { .. }) {
+            return Err(GameError::WrongPhase);
+        }
         let name = self
             .seats
             .iter()

@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::game::SeatId;
 use crate::harness::prompts;
+use crate::harness::scheduler::SchedTarget;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentRole {
@@ -25,13 +26,20 @@ pub struct AgentConfig {
     pub display_name: String,
     pub token: String,
     pub game_id: u64,
+    /// Model this agent's grok sessions run on (picked per seat in setup).
+    pub model: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct HarnessConfig {
     /// Number of player seats (5–15). Host is +1 session.
     pub player_count: usize,
+    /// Default model: the starting pick for every session row in setup and the
+    /// fallback when a seat has no pick. The model actually used by an agent is
+    /// per-session ([`AgentConfig::model`]).
     pub model: String,
+    /// Models available in the setup pickers — filled from `grok models` at TUI start.
+    pub available_models: Vec<String>,
     pub grok_bin: PathBuf,
     pub agent_mcp_bin: PathBuf,
     pub work_root: PathBuf,
@@ -39,13 +47,24 @@ pub struct HarnessConfig {
     pub max_turns_per_tick: u32,
     pub seed: Option<u64>,
     pub st_choice_mode: String,
+    /// Built-in grok tools to REMOVE from each agent (`--disallowed-tools`). The game
+    /// is played only through the `botc` MCP server (reached via search_tool/use_tool),
+    /// so agents don't need shell/file tools — removing them stops them exploring the
+    /// filesystem for source / other seats' tokens. NEVER remove search_tool/use_tool.
+    pub disallowed_tools: Vec<String>,
+    /// grok `--sandbox` profile confining filesystem/network (defense in depth).
+    pub grok_sandbox: Option<String>,
+    /// Pass `--no-memory` so agents don't inherit the user's global coding context.
+    pub no_memory: bool,
 }
 
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
             player_count: 5,
+            // Placeholder until `load_models_from_grok` (or the caller) fills it.
             model: "grok-build".into(),
+            available_models: Vec::new(),
             grok_bin: PathBuf::from("grok"),
             agent_mcp_bin: PathBuf::from("botc-agent-mcp"),
             work_root: PathBuf::from("/tmp/botc-harness"),
@@ -53,8 +72,204 @@ impl Default for HarnessConfig {
             max_turns_per_tick: 12,
             seed: Some(42),
             st_choice_mode: "host_first".into(),
+            // grok-build is a software-engineering agent; with a shell it hunts for
+            // source/tokens instead of playing. Strip every file/shell/edit/search
+            // built-in, keeping only the MCP dispatch tools (search_tool/use_tool)
+            // and todo_write. NOTE: removals must be self-consistent — search_replace
+            // (edit) requires read_file, so both go together, or grok won't start.
+            disallowed_tools: [
+                "run_terminal_command",
+                "read_file",
+                "list_dir",
+                "search_replace",
+                "grep",
+                "get_command_or_subagent_output",
+                "kill_command_or_subagent",
+                "image_edit",
+                "web_search",
+                "x_keyword_search",
+                "x_semantic_search",
+                "x_thread_fetch",
+                "x_user_search",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            grok_sandbox: Some("workspace".into()),
+            no_memory: true,
         }
     }
+}
+
+/// Parse the human-readable output of `grok models`.
+///
+/// Expected shape (from the CLI today):
+/// ```text
+/// Default model: grok-code-fast-1
+///
+/// Available models:
+///   - v9-stickynote
+///   * grok-code-fast-1 (default)
+/// ```
+///
+/// Returns `(models, default_id)`. Models keep the order from the CLI. The default
+/// is taken from the `Default model:` line when present, else from a `* … (default)`
+/// bullet.
+pub fn parse_grok_models_output(stdout: &str) -> (Vec<String>, Option<String>) {
+    let mut models = Vec::new();
+    let mut default: Option<String> = None;
+    for line in stdout.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("Default model:") {
+            let id = rest.trim();
+            if !id.is_empty() {
+                default = Some(id.to_string());
+            }
+            continue;
+        }
+        let rest = if let Some(r) = t.strip_prefix("* ") {
+            r
+        } else if let Some(r) = t.strip_prefix("- ") {
+            r
+        } else {
+            continue;
+        };
+        // First token is the model id; ignore a trailing "(default)" label.
+        let id = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
+        if !models.iter().any(|m| m == &id) {
+            models.push(id);
+        }
+    }
+    (models, default)
+}
+
+/// Run `grok models` and return the available model ids plus the CLI default.
+///
+/// On failure (binary missing, non-zero exit, empty parse) returns an empty list
+/// and `None` — the caller should keep whatever `model` it already has.
+pub fn discover_models(grok_bin: &Path) -> (Vec<String>, Option<String>) {
+    let output = match Command::new(grok_bin)
+        .arg("models")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            crate::dlog!("models: failed to run `{} models`: {e}", grok_bin.display());
+            return (Vec::new(), None);
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        crate::dlog!(
+            "models: `{} models` exit={:?} stderr={}",
+            grok_bin.display(),
+            output.status.code(),
+            clip_for_log(&stderr, 200)
+        );
+        // Some builds still print the list on stdout even with a weird exit — try parse.
+    }
+    let (models, default) = parse_grok_models_output(&stdout);
+    if models.is_empty() {
+        // Fallback: sometimes the list is on stderr (or mixed).
+        let (m2, d2) = parse_grok_models_output(&stderr);
+        if !m2.is_empty() {
+            return (m2, d2.or(default));
+        }
+        crate::dlog!(
+            "models: no models parsed from `{} models` (stdout={})",
+            grok_bin.display(),
+            clip_for_log(&stdout, 200)
+        );
+    }
+    (models, default)
+}
+
+fn clip_for_log(s: &str, max: usize) -> String {
+    let s = s.replace('\n', "\\n");
+    if s.chars().count() <= max {
+        s
+    } else {
+        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
+}
+
+impl HarnessConfig {
+    /// Fill [`Self::available_models`] (and optionally [`Self::model`]) from
+    /// `grok models`. Returns a short status note for the setup screen.
+    pub fn load_models_from_grok(&mut self) -> String {
+        let (models, default) = discover_models(&self.grok_bin);
+        if models.is_empty() {
+            // Keep a one-entry picker so ←/→ is not a no-op, using the current model.
+            if self.available_models.is_empty() {
+                self.available_models = vec![self.model.clone()];
+            }
+            return format!(
+                "model list: could not read `{} models` — using {}",
+                self.grok_bin.display(),
+                self.model
+            );
+        }
+        self.available_models = models;
+        if let Some(d) = default {
+            if self.available_models.iter().any(|m| m == &d) {
+                self.model = d;
+            } else {
+                self.model = self.available_models[0].clone();
+            }
+        } else if !self.available_models.iter().any(|m| m == &self.model) {
+            self.model = self.available_models[0].clone();
+        }
+        format!(
+            "models: {} from `{} models` · selected {}",
+            self.available_models.len(),
+            self.grok_bin.display(),
+            self.model
+        )
+    }
+
+    /// Index of `self.model` in [`Self::available_models`], or `None` if custom.
+    pub fn model_index(&self) -> Option<usize> {
+        self.available_models.iter().position(|m| m == &self.model)
+    }
+
+    /// Cycle the model picker by `delta` steps (±1 for next/prev).
+    ///
+    /// If the current model is not in the list, `delta > 0` jumps to the first
+    /// entry and `delta < 0` to the last.
+    pub fn cycle_model(&mut self, delta: i32) {
+        self.model = cycle_in_list(&self.model, &self.available_models, delta);
+    }
+}
+
+/// Step `current` through `list` by `delta` (wrapping). An unknown `current`
+/// lands on the first entry going forward, the last going backward. Used by the
+/// per-seat model pickers in setup.
+pub fn cycle_in_list(current: &str, list: &[String], delta: i32) -> String {
+    if list.is_empty() || delta == 0 {
+        return current.to_string();
+    }
+    let n = list.len() as i32;
+    let idx = match list.iter().position(|m| m == current) {
+        Some(i) => {
+            let next = ((i as i32 + delta) % n + n) % n;
+            next as usize
+        }
+        None if delta > 0 => 0,
+        None => list.len() - 1,
+    };
+    list[idx].clone()
 }
 
 /// Per-agent child process coordination (#46 / #52).
@@ -135,7 +350,8 @@ pub struct LiveAgent {
     /// Mutable so a failed first run can mint a fresh UUID (#47).
     pub session_id: Arc<Mutex<String>>,
     pub workdir: PathBuf,
-    pub log: Arc<Mutex<Vec<String>>>,
+    /// Live stream buffer (kinded lines for coloured, un-chunked display).
+    pub log: Arc<Mutex<Vec<LogLine>>>,
     /// True while a headless Grok child for this agent is alive.
     pub running: Arc<Mutex<bool>>,
     /// True only after a **successful** first headless run (#47).
@@ -246,6 +462,61 @@ impl AgentPool {
         Ok(n)
     }
 
+    /// Turn-routed tick (#60): run only the agents the scheduler selected this
+    /// cycle, each with a targeted role/phase prompt. Skips agents whose previous
+    /// tick is still running. Returns how many were spawned.
+    pub fn tick_scheduled(
+        &mut self,
+        targets: &[SchedTarget],
+        public_summary: &str,
+        host_hint: &str,
+    ) -> std::io::Result<usize> {
+        let mut n = 0;
+        let mut last_err: Option<std::io::Error> = None;
+        for target in targets {
+            let idx = match target {
+                SchedTarget::Host(_) => self
+                    .agents
+                    .iter()
+                    .position(|a| matches!(a.config.role, AgentRole::Host)),
+                SchedTarget::Player { seat, .. } => {
+                    let seat = *seat;
+                    self.agents
+                        .iter()
+                        .position(|a| matches!(a.config.role, AgentRole::Player { seat: s } if s == seat))
+                }
+            };
+            let Some(idx) = idx else { continue };
+            let prompt = match target {
+                SchedTarget::Host(task) => {
+                    let a = &self.agents[idx];
+                    prompts::host_task_tick(a.config.game_id, task, public_summary, host_hint)
+                }
+                SchedTarget::Player { seat, task } => {
+                    let a = &self.agents[idx];
+                    prompts::player_task_tick(
+                        &a.config.display_name,
+                        *seat,
+                        a.config.game_id,
+                        task,
+                        public_summary,
+                    )
+                }
+            };
+            match spawn_grok_tick(&self.cfg, &mut self.agents[idx], &prompt) {
+                Ok(TickOutcome::Spawned) => n += 1,
+                Ok(TickOutcome::SkippedStillRunning) => {}
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if n == 0 {
+            if let Some(e) = last_err {
+                return Err(e);
+            }
+        }
+        Ok(n)
+    }
+
     /// Kill all grok children and remove workdirs containing tokens (#46).
     pub fn stop_all(&mut self) {
         for agent in &mut self.agents {
@@ -319,6 +590,7 @@ fn resolve_agent_mcp_bin(cfg: &HarnessConfig) -> PathBuf {
 /// (alias of the same clap flag → "cannot be used multiple times").
 pub fn build_grok_tick_args(
     cfg: &HarnessConfig,
+    model: &str,
     workdir: &Path,
     prompt_file: &Path,
     session_id: &str,
@@ -328,7 +600,7 @@ pub fn build_grok_tick_args(
         "--prompt-file".into(),
         prompt_file.display().to_string(),
         "-m".into(),
-        cfg.model.clone(),
+        model.to_string(),
         "--cwd".into(),
         workdir.display().to_string(),
         "--max-turns".into(),
@@ -340,6 +612,19 @@ pub fn build_grok_tick_args(
         "--no-subagents".into(),
         "--disable-web-search".into(),
     ];
+    // Confine the agent to *playing* (not exploring the repo): remove built-in
+    // file/shell tools, drop the global coding context, and sandbox the fs.
+    if !cfg.disallowed_tools.is_empty() {
+        args.push("--disallowed-tools".into());
+        args.push(cfg.disallowed_tools.join(","));
+    }
+    if cfg.no_memory {
+        args.push("--no-memory".into());
+    }
+    if let Some(profile) = &cfg.grok_sandbox {
+        args.push("--sandbox".into());
+        args.push(profile.clone());
+    }
     if session_started {
         args.push("--resume".into());
         args.push(session_id.into());
@@ -355,7 +640,9 @@ fn spawn_grok_tick(
     agent: &mut LiveAgent,
     prompt: &str,
 ) -> std::io::Result<TickOutcome> {
+    let label = agent_label(&agent.config.role);
     if *agent.running.lock().unwrap() {
+        crate::dlog!("SPAWN {label} SKIPPED (previous tick still running)");
         return Ok(TickOutcome::SkippedStillRunning);
     }
 
@@ -363,18 +650,23 @@ fn spawn_grok_tick(
     fs::write(&prompt_file, prompt)?;
 
     let session_started = *agent.session_started.lock().unwrap();
-    // If a previous first-run failed, mint a fresh session id so --session-id is not a collision (#47).
-    if !session_started {
-        // Keep existing id for first attempt; regenerate only after a failed attempt (see waiter).
-    }
     let session_id = agent.session_id.lock().unwrap().clone();
 
     let args = build_grok_tick_args(
         cfg,
+        &agent.config.model,
         &agent.workdir,
         &prompt_file,
         &session_id,
         session_started,
+    );
+    crate::dlog!(
+        "SPAWN {label} model={} mode={} session={} prompt_first_line={:?} argv=[{}]",
+        agent.config.model,
+        if session_started { "resume" } else { "fresh" },
+        session_id,
+        prompt.lines().next().unwrap_or(""),
+        args.join(" ")
     );
 
     let mut cmd = Command::new(&cfg.grok_bin);
@@ -385,8 +677,10 @@ fn spawn_grok_tick(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            push_log_line(
-                &agent.log,
+            let mut g = agent.log.lock().unwrap();
+            push_full_line(
+                &mut g,
+                LineKind::System,
                 format!("ERROR failed to spawn {}: {e}", cfg.grok_bin.display()),
             );
             return Err(e);
@@ -409,17 +703,12 @@ fn spawn_grok_tick(
         thread::spawn(move || {
             use std::io::BufRead;
             let reader = std::io::BufReader::new(stdout);
-            let mut asm = StreamAssembler::default();
+            // Process each streaming-json event as it arrives → live display.
             for line in reader.lines().flatten() {
                 if stream_line_establishes_session(&line) {
                     established.store(true, Ordering::SeqCst);
                 }
-                for piece in asm.push_line(&line) {
-                    push_log_line(&log, piece);
-                }
-            }
-            for piece in asm.finish() {
-                push_log_line(&log, piece);
+                apply_stream_event(&log, &line);
             }
         });
     }
@@ -429,7 +718,8 @@ fn spawn_grok_tick(
             use std::io::BufRead;
             let reader = std::io::BufReader::new(stderr);
             for line in reader.lines().flatten() {
-                push_log_line(&log, format!("[stderr] {line}"));
+                let mut g = log.lock().unwrap();
+                push_full_line(&mut g, LineKind::Stderr, line);
             }
         });
     }
@@ -438,8 +728,9 @@ fn spawn_grok_tick(
 
     // Waiter: session_started from stream evidence (#47/#56), not exit code alone.
     let child_slot_w = Arc::clone(&child_slot);
+    let exit_label = label.clone();
     thread::spawn(move || {
-        let _status = child_slot_w.wait_exit();
+        let status = child_slot_w.wait_exit();
         // stdout reader may still be finishing; give it a brief moment.
         for _ in 0..10 {
             if session_established.load(Ordering::SeqCst) {
@@ -448,16 +739,32 @@ fn spawn_grok_tick(
             thread::sleep(Duration::from_millis(10));
         }
         let established = session_established.load(Ordering::SeqCst);
+        let was_started = *session_started_flag.lock().unwrap();
+        let mut regenerated = false;
         if established {
             *session_started_flag.lock().unwrap() = true;
-        } else if !*session_started_flag.lock().unwrap() {
+        } else if !was_started {
             // No session was created (auth/spawn death) — next tick uses a fresh --session-id.
             *session_id_slot.lock().unwrap() = uuid::Uuid::new_v4().to_string();
+            regenerated = true;
         }
         *running_flag.lock().unwrap() = false;
+        crate::dlog!(
+            "EXIT {exit_label} status={:?} established={established} session_started(now)={} regenerated_id={regenerated}",
+            status.map(|s| s.code()),
+            established || was_started
+        );
     });
 
     Ok(TickOutcome::Spawned)
+}
+
+/// Short label for an agent role (for logs / feed).
+fn agent_label(role: &AgentRole) -> String {
+    match role {
+        AgentRole::Host => "Host".to_string(),
+        AgentRole::Player { seat } => format!("P{}", seat.0),
+    }
 }
 
 /// True if a streaming-json line means grok created/used a session (#56).
@@ -478,102 +785,125 @@ pub fn stream_line_establishes_session(line: &str) -> bool {
     )
 }
 
-fn push_log_line(log: &Mutex<Vec<String>>, msg: String) {
-    if msg.is_empty() {
+/// Kind of a stream line — used only for colouring the display (no in-text tags).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineKind {
+    /// Model assistant text.
+    Text,
+    /// Model reasoning ("thinking").
+    Thought,
+    /// Child process stderr.
+    Stderr,
+    /// Harness / turn notices (turn end, errors).
+    System,
+}
+
+/// One display line of an agent's stream (kinded for colour; grown live).
+#[derive(Debug, Clone)]
+pub struct LogLine {
+    pub kind: LineKind,
+    pub text: String,
+    /// True once a newline closed the line (no further appends).
+    pub closed: bool,
+}
+
+const STREAM_LOG_CAP: usize = 800;
+
+fn cap_log(log: &mut Vec<LogLine>) {
+    if log.len() > STREAM_LOG_CAP {
+        let drain = log.len() - STREAM_LOG_CAP;
+        log.drain(0..drain);
+    }
+}
+
+/// Append a streaming chunk **live**: extend the current open line of the same
+/// kind, breaking to a new line on `\n`. The visible tail updates on every chunk
+/// (no buffering until a block ends), so the stream shows text as it arrives.
+pub fn append_chunk(log: &mut Vec<LogLine>, kind: LineKind, data: &str) {
+    if data.is_empty() {
         return;
     }
-    let mut g = log.lock().unwrap();
-    g.push(msg);
-    if g.len() > 400 {
-        let drain = g.len() - 400;
-        g.drain(0..drain);
+    let cont = matches!(log.last(), Some(l) if l.kind == kind && !l.closed);
+    if !cont {
+        log.push(LogLine {
+            kind,
+            text: String::new(),
+            closed: false,
+        });
     }
+    let mut parts = data.split('\n');
+    if let Some(first) = parts.next() {
+        if let Some(last) = log.last_mut() {
+            last.text.push_str(first);
+        }
+    }
+    for part in parts {
+        if let Some(last) = log.last_mut() {
+            last.closed = true;
+        }
+        log.push(LogLine {
+            kind,
+            text: part.to_string(),
+            closed: false,
+        });
+    }
+    cap_log(log);
 }
 
-/// Coalesce NDJSON `streaming-json` chunks into readable log lines.
-#[derive(Debug, Default)]
-pub struct StreamAssembler {
-    kind: Option<StreamKind>,
-    buf: String,
+/// Push a complete standalone line (stderr line / system notice).
+pub fn push_full_line(log: &mut Vec<LogLine>, kind: LineKind, text: String) {
+    if let Some(last) = log.last_mut() {
+        last.closed = true;
+    }
+    log.push(LogLine {
+        kind,
+        text,
+        closed: true,
+    });
+    cap_log(log);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamKind {
-    Text,
-    Thought,
-}
-
-impl StreamAssembler {
-    /// Ingest one stdout line; returns zero or more completed log lines.
-    pub fn push_line(&mut self, line: &str) -> Vec<String> {
-        let line = line.trim();
-        if line.is_empty() {
-            return Vec::new();
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            let mut out = self.flush();
-            out.push(line.to_string());
-            return out;
-        };
-        match v.get("type").and_then(|t| t.as_str()) {
-            Some("text") => {
-                let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
-                self.push_chunk(StreamKind::Text, data)
-            }
-            Some("thought") => {
-                let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
-                self.push_chunk(StreamKind::Thought, data)
-            }
-            Some("end") => {
-                let mut out = self.flush();
-                out.push("[turn end]".into());
-                out
-            }
-            Some("error") => {
-                let mut out = self.flush();
-                let msg = v
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("?");
-                out.push(format!("ERROR {msg}"));
-                out
-            }
-            _ => {
-                let mut out = self.flush();
-                out.push(line.to_string());
-                out
-            }
-        }
+/// Parse one grok `streaming-json` line and append it to `log` live.
+pub fn apply_stream_event(log: &Mutex<Vec<LogLine>>, line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
     }
-
-    pub fn finish(&mut self) -> Vec<String> {
-        self.flush()
-    }
-
-    fn push_chunk(&mut self, kind: StreamKind, data: &str) -> Vec<String> {
-        if data.is_empty() {
-            return Vec::new();
+    let mut guard = log.lock().unwrap();
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        push_full_line(&mut guard, LineKind::Text, line.to_string());
+        return;
+    };
+    let data = |v: &Value| {
+        v.get("data")
+            .and_then(|d| d.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("text") => append_chunk(&mut guard, LineKind::Text, &data(&v)),
+        Some("thought") => append_chunk(&mut guard, LineKind::Thought, &data(&v)),
+        Some("end") => push_full_line(&mut guard, LineKind::System, "— turn end —".into()),
+        Some("max_turns_reached") => {
+            push_full_line(&mut guard, LineKind::System, "— max turns reached —".into())
         }
-        let mut out = Vec::new();
-        if self.kind != Some(kind) {
-            out.extend(self.flush());
-            self.kind = Some(kind);
+        Some("error") => {
+            let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
+            push_full_line(&mut guard, LineKind::System, format!("error: {msg}"));
         }
-        self.buf.push_str(data);
-        out
-    }
-
-    fn flush(&mut self) -> Vec<String> {
-        if self.buf.is_empty() {
-            self.kind = None;
-            return Vec::new();
+        Some(other) => {
+            // Surface other events (tool calls, etc.) compactly rather than dropping them.
+            let name = v
+                .get("name")
+                .or_else(|| v.get("tool"))
+                .and_then(|x| x.as_str());
+            let note = match name {
+                Some(n) => format!("· {other}: {n}"),
+                None => format!("· {other}"),
+            };
+            push_full_line(&mut guard, LineKind::System, note);
         }
-        let text = std::mem::take(&mut self.buf);
-        let line = match self.kind.take() {
-            Some(StreamKind::Thought) => format!("[think] {text}"),
-            Some(StreamKind::Text) | None => text,
-        };
-        vec![line]
+        None => {}
     }
 }
 
@@ -636,10 +966,146 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_grok_models_output_reads_list_and_default() {
+        let sample = r#"
+You are logged in with grok.com.
+
+Default model: grok-code-fast-1
+
+Available models:
+  - v9-stickynote
+  - grok-build
+  - sxs-claude-opus-4-6
+  * grok-code-fast-1 (default)
+  - opus-4-5-caching
+"#;
+        let (models, default) = parse_grok_models_output(sample);
+        assert_eq!(
+            models,
+            vec![
+                "v9-stickynote",
+                "grok-build",
+                "sxs-claude-opus-4-6",
+                "grok-code-fast-1",
+                "opus-4-5-caching",
+            ]
+        );
+        assert_eq!(default.as_deref(), Some("grok-code-fast-1"));
+    }
+
+    #[test]
+    fn cycle_model_wraps_and_recovers_from_custom() {
+        let mut cfg = HarnessConfig::default();
+        cfg.available_models = vec![
+            "grok-build".into(),
+            "v9-stickynote".into(),
+            "other".into(),
+        ];
+        cfg.model = "grok-build".into();
+        cfg.cycle_model(1);
+        assert_eq!(cfg.model, "v9-stickynote");
+        cfg.cycle_model(-1);
+        assert_eq!(cfg.model, "grok-build");
+        // Wrap past ends.
+        cfg.cycle_model(-1);
+        assert_eq!(cfg.model, "other");
+        cfg.cycle_model(1);
+        assert_eq!(cfg.model, "grok-build");
+        // Custom / unknown id lands on an edge of the list.
+        cfg.model = "my-custom-model".into();
+        cfg.cycle_model(1);
+        assert_eq!(cfg.model, "grok-build");
+        cfg.model = "my-custom-model".into();
+        cfg.cycle_model(-1);
+        assert_eq!(cfg.model, "other");
+    }
+
+    #[test]
+    fn load_models_applies_parsed_default() {
+        let mut cfg = HarnessConfig::default();
+        // Simulate what load_models_from_grok does after a successful parse,
+        // without spawning the real binary.
+        let (models, default) = parse_grok_models_output(
+            "Default model: alpha\nAvailable models:\n  - beta\n  * alpha (default)\n",
+        );
+        cfg.available_models = models;
+        if let Some(d) = default {
+            cfg.model = d;
+        }
+        assert_eq!(cfg.model, "alpha");
+        assert_eq!(cfg.available_models, vec!["beta", "alpha"]);
+    }
+
+    #[test]
+    fn grok_args_use_the_per_agent_model() {
+        // Models are picked per seat: the argv must carry the CALLER's model,
+        // not the config default.
+        let mut cfg = HarnessConfig::default();
+        cfg.model = "config-default-model".into();
+        for model in ["host-model-a", "seat-model-b"] {
+            let args = build_grok_tick_args(
+                &cfg,
+                model,
+                Path::new("/tmp/wd"),
+                Path::new("/tmp/wd/prompt.txt"),
+                "11111111-1111-1111-1111-111111111111",
+                false,
+            );
+            let mi = args.iter().position(|a| a == "-m").expect("-m present");
+            assert_eq!(args[mi + 1], model);
+            assert!(!args.contains(&"config-default-model".to_string()));
+        }
+    }
+
+    #[test]
+    fn cycle_in_list_steps_and_wraps() {
+        let list: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        assert_eq!(cycle_in_list("a", &list, 1), "b");
+        assert_eq!(cycle_in_list("c", &list, 1), "a");
+        assert_eq!(cycle_in_list("a", &list, -1), "c");
+        // Unknown current: forward → first, backward → last.
+        assert_eq!(cycle_in_list("zzz", &list, 1), "a");
+        assert_eq!(cycle_in_list("zzz", &list, -1), "c");
+        // Empty list / zero delta are no-ops.
+        assert_eq!(cycle_in_list("keep", &[], 1), "keep");
+        assert_eq!(cycle_in_list("keep", &list, 0), "keep");
+    }
+
+    #[test]
+    fn grok_args_confine_agent_to_playing() {
+        let cfg = HarnessConfig::default();
+        let args = build_grok_tick_args(
+            &cfg,
+            "grok-build",
+            Path::new("/tmp/wd"),
+            Path::new("/tmp/wd/prompt.txt"),
+            "11111111-1111-1111-1111-111111111111",
+            false,
+        );
+        // Built-in file/shell tools removed (so it can't hunt for source / tokens)…
+        let di = args
+            .iter()
+            .position(|a| a == "--disallowed-tools")
+            .expect("--disallowed-tools present");
+        let list = &args[di + 1];
+        assert!(list.contains("run_terminal_command"));
+        assert!(list.contains("read_file"));
+        assert!(list.contains("list_dir"));
+        // …but the MCP dispatch tools are NEVER removed (they ARE the game tools).
+        assert!(!list.contains("search_tool"));
+        assert!(!list.contains("use_tool"));
+        // Global coding context dropped + filesystem sandboxed.
+        assert!(args.contains(&"--no-memory".into()));
+        let sb = args.iter().position(|a| a == "--sandbox").expect("--sandbox");
+        assert_eq!(args[sb + 1], "workspace");
+    }
+
+    #[test]
     fn grok_args_use_yolo_once_not_always_approve() {
         let cfg = HarnessConfig::default();
         let args = build_grok_tick_args(
             &cfg,
+            "grok-build",
             Path::new("/tmp/wd"),
             Path::new("/tmp/wd/prompt.txt"),
             "11111111-1111-1111-1111-111111111111",
@@ -658,6 +1124,7 @@ mod tests {
         let cfg = HarnessConfig::default();
         let args = build_grok_tick_args(
             &cfg,
+            "grok-build",
             Path::new("/tmp/wd"),
             Path::new("/tmp/wd/prompt.txt"),
             "11111111-1111-1111-1111-111111111111",
@@ -674,6 +1141,7 @@ mod tests {
         let cfg = HarnessConfig::default();
         let args = build_grok_tick_args(
             &cfg,
+            "grok-build",
             Path::new("/tmp/wd"),
             Path::new("/tmp/p"),
             "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
@@ -712,6 +1180,7 @@ mod tests {
         let cfg = HarnessConfig::default();
         let args = build_grok_tick_args(
             &cfg,
+            "grok-build",
             Path::new("/tmp/wd"),
             Path::new("/tmp/wd/prompt.txt"),
             "11111111-1111-1111-1111-111111111111",
@@ -722,9 +1191,8 @@ mod tests {
     }
 
     #[test]
-    fn stream_assembler_coalesces_thought_chunks() {
-        let mut a = StreamAssembler::default();
-        let mut out = Vec::new();
+    fn stream_events_append_live_and_coalesce_by_kind() {
+        let log = Mutex::new(Vec::<LogLine>::new());
         for line in [
             r#"{"type":"thought","data":"The"}"#,
             r#"{"type":"thought","data":" task"}"#,
@@ -733,19 +1201,30 @@ mod tests {
             r#"{"type":"text","data":" world"}"#,
             r#"{"type":"end","stopReason":"EndTurn","sessionId":"x"}"#,
         ] {
-            out.extend(a.push_line(line));
+            apply_stream_event(&log, line);
         }
-        out.extend(a.finish());
-        assert_eq!(
-            out,
-            vec![
-                "[think] The task is".to_string(),
-                "Hello world".to_string(),
-                "[turn end]".to_string(),
-            ],
-            "got {out:?}"
-        );
-        assert!(!out.iter().any(|s| s.contains("[think] The[think]")));
+        let g = log.lock().unwrap();
+        // Consecutive same-kind chunks coalesce into one growing line; kinds are
+        // kept (for colour) rather than tagged in-text.
+        assert_eq!(g.len(), 3);
+        assert_eq!(g[0].kind, LineKind::Thought);
+        assert_eq!(g[0].text, "The task is");
+        assert_eq!(g[1].kind, LineKind::Text);
+        assert_eq!(g[1].text, "Hello world");
+        assert_eq!(g[2].kind, LineKind::System);
+        // No in-text tags.
+        assert!(!g.iter().any(|l| l.text.contains("[think]")));
+    }
+
+    #[test]
+    fn append_chunk_breaks_on_newlines() {
+        let mut log = Vec::new();
+        append_chunk(&mut log, LineKind::Text, "line one\nline ");
+        append_chunk(&mut log, LineKind::Text, "two");
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].text, "line one");
+        assert!(log[0].closed);
+        assert_eq!(log[1].text, "line two"); // second chunk continued the open line
     }
 
     #[test]
@@ -762,6 +1241,7 @@ mod tests {
                 display_name: "ST".into(),
                 token: "tok".into(),
                 game_id: 1,
+                model: "grok-build".into(),
             }],
         )
         .unwrap();
@@ -821,6 +1301,7 @@ mod tests {
                 display_name: "ST".into(),
                 token: "tok".into(),
                 game_id: 1,
+                model: "grok-build".into(),
             }],
         )
         .unwrap();

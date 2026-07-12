@@ -172,10 +172,163 @@ fn tool_descriptors() -> Vec<Value> {
             json!({
                 "name": name,
                 "description": tool_description(name),
-                "inputSchema": { "type": "object" }
+                "inputSchema": tool_schema(name)
             })
         })
         .collect()
+}
+
+/// Full JSON Schema for one tool's arguments, matching the dispatch parsing
+/// exactly. Empty `properties` here left model agents unable to see what any
+/// tool takes — they guessed arg names, then went hunting for the source to
+/// find the signatures. Every schema must name and type every accepted field.
+fn tool_schema(name: &str) -> Value {
+    // Shared fragments. `token` is optional on the wire: the harness proxy
+    // injects the caller's token automatically; direct MCP connections pass it.
+    let game_id = json!({ "type": "integer", "description": "Game id (from create_game; the harness proxy can inject it)" });
+    let token = json!({ "type": "string", "description": "Auth token — omit when connected via the harness proxy (it injects yours); required for direct connections" });
+    let seat = |what: &str| json!({ "type": "integer", "minimum": 0, "description": format!("Seat number of {what} (players are P0, P1, … = 0, 1, …)") });
+    match name {
+        "create_game" => json!({
+            "type": "object",
+            "properties": {
+                "names": { "type": "array", "items": { "type": "string" }, "minItems": 5, "maxItems": 15, "description": "Display names, one per seat (5–15 players)" },
+                "seed": { "type": "integer", "description": "Optional RNG seed (omit for CSPRNG)" },
+                "secret_salt": { "type": "integer", "description": "Optional RNG salt for deterministic replay (omit for CSPRNG)" },
+            },
+            "required": ["names"],
+        }),
+        "start_game" => json!({
+            "type": "object",
+            "properties": {
+                "game_id": game_id,
+                "token": token,
+                "assignments": { "type": "array", "description": "Optional fixed role assignments (omit for a random bag)", "items": { "type": "object", "properties": {
+                    "seat": seat("the player"),
+                    "character": { "type": "string", "description": "True character name, e.g. Imp, Empath, Drunk" },
+                    "believed": { "type": "string", "description": "Required when character=Drunk: the Townsfolk face they believe they are" },
+                }, "required": ["seat", "character"] } },
+                "registration_mode": { "type": "string", "enum": ["random", "always_true", "always_misreg"], "description": "Spy/Recluse registration policy for engine-random draws (default random)" },
+                "drunk_faces": { "type": "array", "description": "Optional Drunk face overrides", "items": { "type": "object", "properties": { "seat": seat("the Drunk"), "face": { "type": "string" } }, "required": ["seat", "face"] } },
+                "red_herring": { "type": "integer", "description": "Optional Fortune Teller red-herring seat" },
+                "demon_bluffs": { "type": "array", "items": { "type": "string" }, "description": "Optional three not-in-play good characters shown to the demon" },
+                "st_choice_mode": { "type": "string", "enum": ["host_first", "random"], "description": "Storyteller decisions pause for the host (default) or resolve randomly" },
+            },
+            "required": ["game_id"],
+        }),
+        "get_public_state" | "get_host_state" | "open_nominations" | "close_vote"
+        | "end_nominations" | "skip_night_action" | "pass_vote" => json!({
+            "type": "object",
+            "properties": { "game_id": game_id, "token": token },
+            "required": ["game_id"],
+        }),
+        "get_public_log" => json!({
+            "type": "object",
+            "properties": {
+                "game_id": game_id,
+                "token": token,
+                "cursor": { "type": "integer", "description": "Return events after this event id (0 = from the start)" },
+            },
+            "required": ["game_id"],
+        }),
+        "get_private_state" => json!({
+            "type": "object",
+            "properties": {
+                "game_id": game_id,
+                "token": token,
+                "cursor": { "type": "integer", "description": "Return private messages after this id (0 = all)" },
+            },
+            "required": ["game_id"],
+        }),
+        "get_character_rules" => json!({
+            "type": "object",
+            "properties": {
+                "character": { "type": "string", "description": "Character name, e.g. Empath, Imp, Fortune Teller" },
+            },
+            "required": ["character"],
+        }),
+        "list_characters" | "list_rules_topics" => json!({
+            "type": "object",
+            "properties": {},
+            "description": "No arguments",
+        }),
+        "get_rules_topic" => json!({
+            "type": "object",
+            "properties": {
+                "topic": { "type": "string", "description": "Topic id from list_rules_topics, e.g. gameplay_loop, voting, night_order" },
+            },
+            "required": ["topic"],
+        }),
+        "say" | "st_announce" | "host_queue_lie" => json!({
+            "type": "object",
+            "properties": {
+                "game_id": game_id,
+                "token": token,
+                "text": { "type": "string", "description": "The message text" },
+            },
+            "required": ["game_id", "text"],
+        }),
+        "night_action" => json!({
+            "type": "object",
+            "properties": {
+                "game_id": game_id,
+                "token": token,
+                "payload": { "type": "object", "description": "Your night choice; shape follows the wake prompt", "properties": {
+                    "target": seat("your single target (PickOne abilities: Poisoner, Imp, Monk, Butler, Ravenkeeper…)"),
+                    "a": seat("first target (PickTwo abilities: Fortune Teller)"),
+                    "b": seat("second target (PickTwo abilities)"),
+                    "ack": { "type": "boolean", "description": "true to acknowledge an info-only wake with no choice" },
+                    "character": { "type": "string", "description": "Character name guess (Ravenkeeper-style prompts that ask for a character)" },
+                } },
+            },
+            "required": ["game_id", "payload"],
+        }),
+        "day_action" => json!({
+            "type": "object",
+            "properties": {
+                "game_id": game_id,
+                "token": token,
+                "payload": { "type": "object", "description": "The day ability to use", "properties": {
+                    "action": { "type": "string", "enum": ["slay"], "description": "Day ability: Slayer's public shot" },
+                    "target": seat("the player you claim to slay"),
+                }, "required": ["action", "target"] },
+            },
+            "required": ["game_id", "payload"],
+        }),
+        "nominate" => json!({
+            "type": "object",
+            "properties": {
+                "game_id": game_id,
+                "token": token,
+                "target": seat("the player you nominate for execution"),
+            },
+            "required": ["game_id", "target"],
+        }),
+        "vote" => json!({
+            "type": "object",
+            "properties": {
+                "game_id": game_id,
+                "token": token,
+                "nominee": seat("the currently nominated player"),
+                "support": { "type": "boolean", "description": "true = vote to execute, false = vote against" },
+            },
+            "required": ["game_id", "nominee", "support"],
+        }),
+        "host_decide" => json!({
+            "type": "object",
+            "properties": {
+                "game_id": game_id,
+                "token": token,
+                "type": { "type": "string", "enum": ["night_info", "mayor_redirect", "starpass_pick"], "description": "Which pending Storyteller decision you are resolving (must match pending_host)" },
+                "text": { "type": "string", "description": "night_info: the private info text the player learns" },
+                "choice": { "type": "string", "enum": ["kill_mayor", "kill_other", "nobody"], "description": "mayor_redirect: outcome choice" },
+                "target": { "type": "integer", "description": "mayor_redirect kill_other: seat to redirect onto; starpass_pick: the minion seat that becomes the Imp" },
+            },
+            "required": ["game_id", "type"],
+        }),
+        // Unknown tool (kept in sync with TOOL_NAMES by the schema test below).
+        _ => json!({ "type": "object", "properties": {} }),
+    }
 }
 
 fn tool_description(name: &str) -> &'static str {
@@ -195,8 +348,8 @@ fn tool_description(name: &str) -> &'static str {
         "night_action" => "Player night choice for current pending wake",
         "day_action" => "Player day ability (Slayer slay)",
         "nominate" => "Player nominate a living seat",
-        "vote" => "Player cast yes/no on open nomination",
-        "pass_vote" => "Dead player: abstain without spending ghost vote",
+        "vote" => "Player cast yes/no on the open nomination (once per seat; a second vote on the same nomination is rejected)",
+        "pass_vote" => "Dead player: abstain without spending ghost vote (once per open nomination)",
         "open_nominations" => "Host: Discussion → Nominations",
         "close_vote" => "Host: close current vote window (may auto-end day when no noms remain)",
         "end_nominations" => "Host: execute vote leader (if any), begin next night",
@@ -1229,5 +1382,75 @@ mod tests {
         let line = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#;
         let resp: Value = serde_json::from_str(&handle_line(&store, line).unwrap()).unwrap();
         assert_eq!(resp["result"]["serverInfo"]["name"], "botc-mcp");
+    }
+
+    /// Empty `properties` left model agents unable to see any tool's arguments —
+    /// they guessed field names and went hunting for the source to find the
+    /// signatures. Every tool must publish a real schema.
+    #[test]
+    fn every_tool_publishes_a_real_input_schema() {
+        // The only tools that genuinely take no arguments.
+        const NO_ARG_TOOLS: &[&str] = &["list_characters", "list_rules_topics"];
+        for t in tool_descriptors() {
+            let name = t["name"].as_str().unwrap();
+            let schema = &t["inputSchema"];
+            assert_eq!(schema["type"], "object", "{name}: schema must be an object");
+            let props = schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{name}: schema has no properties key"));
+            if NO_ARG_TOOLS.contains(&name) {
+                continue;
+            }
+            assert!(
+                !props.is_empty(),
+                "{name}: empty properties — agents can't see its arguments"
+            );
+            // Every property must carry a type and a description.
+            for (field, spec) in props {
+                assert!(
+                    spec.get("type").is_some(),
+                    "{name}.{field}: missing type"
+                );
+                assert!(
+                    spec.get("description").is_some(),
+                    "{name}.{field}: missing description"
+                );
+            }
+        }
+    }
+
+    /// Spot-check that published schemas match what the dispatcher actually parses.
+    #[test]
+    fn schemas_match_dispatch_parsing() {
+        let by_name = |n: &str| {
+            tool_descriptors()
+                .into_iter()
+                .find(|t| t["name"] == n)
+                .unwrap()["inputSchema"]
+                .clone()
+        };
+        let req = |s: &Value| -> Vec<String> {
+            s["required"]
+                .as_array()
+                .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+                .unwrap_or_default()
+        };
+        let say = by_name("say");
+        assert!(req(&say).contains(&"text".to_string()), "say parses `text`");
+        let vote = by_name("vote");
+        assert!(req(&vote).contains(&"nominee".to_string()));
+        assert!(req(&vote).contains(&"support".to_string()));
+        let nominate = by_name("nominate");
+        assert!(req(&nominate).contains(&"target".to_string()));
+        let na = by_name("night_action");
+        assert!(na["properties"]["payload"]["properties"]["target"].is_object());
+        let hd = by_name("host_decide");
+        let types: Vec<&str> = hd["properties"]["type"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(types, vec!["night_info", "mayor_redirect", "starpass_pick"]);
     }
 }

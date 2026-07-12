@@ -228,11 +228,17 @@ pub fn vote(game: &mut Game, seat: SeatId, nominee: SeatId, support: bool) -> Re
     if open.target != nominee {
         return Err(GameError::IllegalAction("nominee is not current nomination"));
     }
+    // One ballot per seat per open nomination (yes or no). Multiple nominations
+    // per day are fine; re-voting the same open nom is not.
     if open.votes.iter().any(|(s, _)| *s == seat) {
-        return Err(GameError::IllegalAction("already voted on this nomination"));
+        return Err(GameError::IllegalAction(
+            "already voted on this nomination (one vote per seat per nomination)",
+        ));
     }
     if open.passes.contains(&seat) {
-        return Err(GameError::IllegalAction("already passed on this nomination"));
+        return Err(GameError::IllegalAction(
+            "already passed on this nomination (one response per seat per nomination)",
+        ));
     }
 
     let voter = seat_ref(game, seat)?;
@@ -303,10 +309,14 @@ pub fn pass_vote(game: &mut Game, seat: SeatId) -> Result<(), GameError> {
         .as_ref()
         .ok_or(GameError::IllegalAction("no open nomination"))?;
     if open.votes.iter().any(|(s, _)| *s == seat) {
-        return Err(GameError::IllegalAction("already voted on this nomination"));
+        return Err(GameError::IllegalAction(
+            "already voted on this nomination (one vote per seat per nomination)",
+        ));
     }
     if open.passes.contains(&seat) {
-        return Err(GameError::IllegalAction("already passed on this nomination"));
+        return Err(GameError::IllegalAction(
+            "already passed on this nomination (one response per seat per nomination)",
+        ));
     }
 
     let voter = seat_ref(game, seat)?;

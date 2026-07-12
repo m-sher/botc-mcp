@@ -8,7 +8,7 @@ It:
 2. Exposes that game over a **Unix-socket tool RPC**.
 3. Spawns **N player + 1 host** headless [Grok Build](https://grok.x.ai) sessions.
 4. Each session loads a project-scoped MCP config pointing at `botc-agent-mcp`, a stdio MCP proxy that injects that agent’s token and forwards tools to the shared engine.
-5. Shows a **ratatui** board: agent list, host grimoire, and live agent streams (tail-anchored).
+5. Shows a **ratatui** board: agent list (with running/idle glyphs), a live **action feed** (every agent tool call, game actions highlighted) or host grimoire, and the selected agent's stream.
 
 ```
 ┌────────────────────────────────────────────────────────────┐
@@ -53,24 +53,128 @@ cargo run --bin botc-tui
 
 ### Setup screen
 
+The setup screen is a roster: the player-count row on top, then **one model row per
+session** (Host, P0, P1, …).
+
 | Key | Action |
 | --- | --- |
-| `↑` / `↓` | Player count 5–15 (**sessions = players + 1 host**) |
+| `↑` / `↓` | Move between rows (count row / Host / P0 / P1 / …) |
+| `←` / `→` or `m` / `M` | Change the focused row: player count 5–15, or that **session's model** |
+| `a` | Apply the focused row's model to **all** sessions |
 | `Enter` | Create game, start night 1, spawn Grok agents |
 | `q` | Quit (kills Grok children and removes workdirs) |
 
+**Models are per session** — each agent (host and every seat) can run a different model,
+e.g. a strong model as the Storyteller and mixed models across seats. Each pick becomes that
+agent's `-m` on every headless `grok` spawn (and `--resume` ticks keep the same model). At
+setup the TUI runs `grok models`, parses the available IDs + default, and uses that list for
+every row's picker (see `discover_models` / `parse_grok_models_output` in
+`src/harness/agents.rs`); the CLI default is every row's starting pick. If the CLI is missing
+or returns nothing, the picker falls back to the current `model` string alone. The monitor
+shows each agent's model in the agents list and the stream title.
+
 ### Monitor screen
 
-| Key | Action |
+Three columns — **left:** agents · **center:** live **action feed** (all agents) or host grimoire · **right:** the selected agent's raw stream. The **top bar** shows live progress: `phase · turn <who> · auto Ns / manual · running: <who>` — so you can always tell whether anything is actually running.
+
+| Key / mouse | Action |
 | --- | --- |
-| `Tab` / `Shift+Tab` | Select agent stream (resets to live tail) |
-| `Space` | Kick every agent for another multi-turn tick |
-| `t` | Toggle auto-tick (~45s) |
-| `PgUp` / `PgDn` | Scroll selected agent log (away from / toward live tail) |
+| `Tab` / `Shift+Tab` / **click agent** | Select agent stream (resets to live tail) |
+| `Space` | Advance **one turn** manually — ticks the agent(s) the engine is waiting on (only when idle; if a turn is still running it waits) |
+| `t` | Toggle **auto-advance** — event-driven: the next turn is ticked the moment all agents go idle (no timer; a running agent is never skipped) |
+| `g` | Center pane: toggle **action feed ↔ host grimoire** |
+| `f` | Feed filter: **all actions ↔ game-only** |
+| `h` / **click stream** | Expand/collapse **thinking** for the selected agent (default: collapsed) |
+| **click feed row** | Expand/collapse that action: full args (tokens redacted) + result/error |
+| **wheel on feed** | Scroll the action feed history |
+| `PgUp`/`PgDn`/`↑`/`↓` / **wheel on stream** | Scroll selected agent log (away from / toward live tail) |
 | `Home` | Jump to live tail |
 | `q` | Kill agents, remove workdirs, stop socket, quit |
 
-Left: agents · Center: **host grimoire** (true roles) · Right: selected agent’s stream (**newest lines visible by default**).
+**Action feed.** Every agent tool call is recorded at the shared socket and shown here, newest at the bottom, labelled by caller (`Host` / `P0`…, colour-coded). **Game-affecting actions** (`say`, `nominate`, `vote`, `night_action`, `host_decide`, `close_vote`, …) are **highlighted** with a `▶` marker + bold tool name + cyan arg summary (e.g. `P3 ▶ vote →P1 YES ✓`); read-only inspection (`get_*_state`, `list_*`) is dimmed; errors are red. Press **`f`** to hide the info-read noise and show only game actions + errors. **`say` / `st_announce` text is never truncated** — the full quote always wraps under the
+row. **Click any row to expand it** (`▸`→`▾`): full argument JSON (auth tokens redacted),
+plus the result preview or full error text; click again to collapse. **Mouse wheel over the feed** scrolls its history. This is the fastest way to see *what agents are doing* (vs the per-agent stream, which shows their reasoning).
+
+Per-agent **status glyph** in the left list: `●` green = a Grok child is running for that seat, `○` grey = idle.
+
+**Stream pane:** the selected agent's raw output streams **live, token by token** (no
+buffering until a block finishes) and is **coloured by kind** rather than tagged — model
+text is default, **thinking is dim grey**, **stderr yellow**, and turn/error notices cyan/red.
+Model thinking is **collapsed by default** (a one-line `· thinking… N line(s) …` stand-in) so
+you see game-facing output first; **`h`** or **left-click the stream** expands that agent's
+full thinking; again collapses. Expansion is **per agent**; the title shows `·think▾`/`·think▸`.
+**Mouse wheel over the stream** scrolls history (same as PgUp/PgDn); wheel elsewhere is ignored.
+
+## Turn order (scheduling)
+
+Trouble Brewing is strictly **sequential**, so each tick wakes **exactly one agent** (plus,
+rarely, a host fallback) with a targeted prompt that says why it was woken, which actions are
+legal, and what ends the turn (`src/harness/scheduler.rs`, `plan_ticks`).
+
+The host is **minimal**: it is woken only for genuine Storyteller decisions and stall
+fallbacks. The engine self-drives the rest — a player's `nominate` auto-opens the vote,
+`vote` auto-closes once everyone has acted, and the day auto-ends into night.
+
+| Game state | Ticked this turn |
+| --- | --- |
+| Lobby | Host → `start_game` (normally already done by the TUI at launch) |
+| Night, `pending_host` set | Host → resolve that one Storyteller decision |
+| Night, `pending_night` set | **only that seat** → its night action (targeted wake prompt) |
+| Day / Discussion | **one living player at a time**, seat order, `DISCUSSION_ROUNDS` (2) full table rounds — no host |
+| Day / Discussion, rounds spent | Host → `open_nominations` + `end_nominations` (close the day) |
+| Day / Nominations, no open vote | one living player who hasn't nominated yet (rotating) — no host |
+| Day / Nominations, vote open | **one voter at a time, clockwise from the nominee**, shown the tally so far |
+| Ended | nobody — auto-tick disarms |
+
+**Stall escalation.** If the engine sits on the same wait for several cycles, the scheduler
+escalates: a stuck night wake → host `skip_night_action`; a stalled **voter** first yields the
+floor (each stalled cycle offers the *next* pending voter, so nobody blocks the queue) and only
+after every pending voter has been offered does the host `close_vote` (missing votes count
+"no"); nobody nominating after everyone had a turn → host `end_nominations`. **The escalation
+tick is host-only** — the stuck agent is not co-scheduled, so the host override can never race
+a recovering player. Signatures include progress counts and the living roster, so every landed
+vote, new nomination, or death resets the window. A host that repeats the same fallback 5×
+without progress stops auto-advance (`t` resumes).
+
+The one-time **kickoff** still fans out to every agent (orientation only — the first night has
+no talking); ongoing play is one turn at a time, so every speaker sees everything said before
+them and votes are cast in clockwise order like the tabletop game.
+
+## Results log (ranking corpus)
+
+Alongside the debug log, the TUI **appends** ranking-relevant outcomes to a JSONL file
+(default `botc-results.jsonl` at the repo root, override with `BOTC_RESULTS_LOG`). One JSON object per
+line, schema field `v` (currently `1`). Survives quit; not under the deleted work root.
+
+| `event` | When | Useful for |
+| --- | --- | --- |
+| `game_start` | After launch | Per-seat `model`, `true_character`, `team`, seed, host model |
+| `death` | Exec / night / day kill | Survival metrics (`cause`: `executed` \| `night` \| `day`) |
+| `nomination` | Someone is put on the block | Social targeting later |
+| `game_end` | Engine `Ended` | `winner`, `reason`, per-seat `won` |
+| `game_abort` | Quit before end | Filter incomplete runs |
+
+Chat and full tool traces are **not** in this file (see the debug log / action feed for those).
+
+## Debug log
+
+The TUI writes a **verbose, timestamped** trace to a file (the full-screen UI can't use
+stdout). Default `/tmp/botc-tui-debug.log` (override with `BOTC_TUI_LOG`); the path is shown
+in the status line at launch, and it survives quit (it is **not** under the deleted work root).
+
+Each line is `[HH:MM:SS.mmm +elapsedms] …`. It records the state machine end to end:
+
+- `LAUNCH` — game id, player count, ST mode, token count.
+- `TICK` — every scheduler cycle: `sig` (what the engine waits on), `stall`, live `phase` /
+  `pending_host` / `pending_night` / nomination state, and the routed `plan=[…]`.
+- `SPAWN` / `EXIT` — per agent: resume-vs-fresh, session id, first prompt line, full argv;
+  and on exit the code, whether the session was `established`, and any id regeneration.
+  (`SPAWN … SKIPPED` is a defensive no-op that should not appear now that ticks only fire when idle.)
+- `RPC` — every tool call through the socket: `actor tool args=… -> ok/ERR`.
+
+So a stuck host shows up plainly: a `SPAWN Host` with no following `EXIT Host` for a long time
+means the tick hung (the game waits for it — it is never skipped); repeated `TICK … plan=[Host]`
+with no `RPC Host …` between them means the host agent isn't calling any tools.
 
 ## Workdirs
 
@@ -88,16 +192,28 @@ On quit (`q`) or process exit, the harness **kills** all Grok children and **rem
 - Player proxies always inject their own token; they cannot escalate to host unless given the host token file.
 - Role ACL in `botc-agent-mcp` denies host-only tools for player agents (JSON-RPC `-32602`).
 - The TUI process holds the real grimoire for monitoring only.
+- **Agents are confined to *playing*, not exploring.** `grok-build` is a software-engineering
+  agent by default — given a shell it will `find`/`read` the filesystem to locate the game's
+  source or *other seats' `agent.token` files*. So each headless agent is launched with the
+  built-in **file/shell tools removed** (`--disallowed-tools run_terminal_command,read_file,
+  list_dir,search_replace,grep,…`), leaving only the MCP dispatch tools (`search_tool`/`use_tool`)
+  and planning — the game is played entirely through the `botc` MCP server, so nothing is lost.
+  It also runs with `--no-memory` (don't inherit the user's global `~/.grok/AGENTS.md` / skills /
+  MCP coding context) and `--sandbox` (fs/network confinement, defense in depth). All three are
+  fields on `HarnessConfig` (`disallowed_tools`, `no_memory`, `grok_sandbox`). Removals must be
+  self-consistent — `search_replace` (edit) requires `read_file`, so both are removed together or
+  grok refuses to start.
 
 ## Limitations (v1)
 
-- Agents are driven by **periodic headless ticks** (`grok --prompt-file … --resume`), not a single eternal ACP connection.
+- Agents are driven by **event-driven headless ticks** (`grok --prompt-file … --resume`), not a single eternal ACP connection: the next turn is ticked when all agents go idle, and a running agent is never skipped (a hung agent will hold the game until it exits — watch the debug log).
 - Auto-approve uses a **single** flag (`--yolo`). Do not also pass `--always-approve` (same clap option → CLI error).
-- A tick is skipped per agent if the previous Grok process for that seat is still running.
+- The next turn is only ticked once **all** agents are idle, so a per-seat tick is never spawned on top of a still-running one.
 - First-run success is required before `--resume` is used; a failed kickoff retries with a fresh `--session-id`.
 - Host-first Storyteller pauses require the **host** Grok agent (or skip defaults via host tools) to resolve night info.
-- Cost: N+1 model sessions. Start with 5 players.
-- Concurrent agents may issue conflicting day actions; the engine is mutex-serialized but not turn-locked.
+- Cost: N+1 model sessions, but the turn-router ticks only the 1–2 agents whose turn it is (plus a fan-out during an open vote), not all N+1 each cycle.
+- Ticks are **turn-routed** (see *Turn order*): one agent per tick in every phase, so there are no concurrent day actions to conflict.
+- Progression is player/engine-driven; the host is only needed for `pending_host` decisions and stall fallbacks. Dead players don't get speaking turns (they still vote with their ghost vote); day length is bounded by `DISCUSSION_ROUNDS`.
 
 ## Tests
 

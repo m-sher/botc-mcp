@@ -1,12 +1,14 @@
 //! Ratatui monitoring UI for the multi-agent harness.
 
+use std::collections::HashSet;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+    MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -19,10 +21,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
-use crate::game::{Game, GameId, SeatId, StartOpts, StChoiceMode};
+use crate::game::{Game, GameId, Phase, RoleAssignment, SeatId, StartOpts, StChoiceMode};
+use crate::roles::{Character, CharacterType};
+use crate::harness::action_log::{ActionKind, ActionLog, ActorLabel};
+use crate::harness::scheduler::{plan_ticks, wait_signature, SchedTarget};
 use crate::harness::agents::{
-    agent_mcp_bin_ok, find_agent_mcp_bin, find_grok, resolve_agent_mcp_bin_for_display,
-    AgentConfig, AgentPool, AgentRole, HarnessConfig,
+    agent_mcp_bin_ok, cycle_in_list, find_agent_mcp_bin, find_grok,
+    resolve_agent_mcp_bin_for_display, AgentConfig, AgentPool, AgentRole, HarnessConfig,
+    LineKind, LogLine,
 };
 use crate::harness::socket::SocketServer;
 use crate::mcp_server::{self, SharedStore};
@@ -34,9 +40,28 @@ enum Focus {
     Monitor,
 }
 
+/// Which actions the feed shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeedFilter {
+    /// Everything, incl. info reads (dimmed).
+    All,
+    /// Only game-affecting actions and errors.
+    GameOnly,
+}
+
 struct App {
     focus: Focus,
     player_count: usize,
+    /// Per-session model picks: index 0 = Host, 1..=N = players P0..P{N-1}.
+    /// Kept in lockstep with `player_count` (+1 for the host row).
+    seat_models: Vec<String>,
+    /// Previewed role for each player seat (index i = P{i}), shown on the setup
+    /// screen so models can be picked per role. Regenerated on count change and on
+    /// reroll; passed to `start_game` as fixed assignments so the launched game
+    /// matches exactly what was shown. Empty only if the preview draw failed.
+    setup_roles: Vec<RoleAssignment>,
+    /// Focused setup row: 0 = the player-count row; 1.. = Host, P0, P1, …
+    setup_row: usize,
     selected_agent: usize,
     status: String,
     store: SharedStore,
@@ -45,13 +70,57 @@ struct App {
     player_names: Vec<String>,
     socket: Option<SocketServer>,
     agents: Option<AgentPool>,
+    /// Event-driven auto-advance: when on, the next turn is ticked as soon as all
+    /// agents are idle (no fixed timer; a running agent is never skipped).
     auto_tick: bool,
+    /// When the last tick was launched — shown as "last turn Ns ago" (staleness).
     last_tick: Instant,
-    tick_interval: Duration,
     cfg: HarnessConfig,
     should_quit: bool,
     /// Lines scrolled up from the live tail (0 = stick to newest output) (#45).
     scroll_from_bottom: usize,
+    /// Round-robin cursor for discussion/nomination turns in the scheduler (#60).
+    /// Reset to 0 whenever the game enters a new phase/stage (see `stage_key`).
+    tick_rotation: usize,
+    /// Key of the phase/stage the last tick planned for; a change resets `tick_rotation`
+    /// so discussion rounds start counting from the first speaker.
+    stage_key: String,
+    /// Signature of what the engine was waiting on last tick, for stall detection (#60).
+    wait_sig: Option<String>,
+    /// Consecutive cycles the engine has sat on `wait_sig`; drives host escalation (#60).
+    stall: usize,
+    /// Fingerprint of the last plan (targets + signature) for the host-retry brake.
+    last_plan_key: String,
+    /// Consecutive identical host-only plans with no state change; capped to stop
+    /// an unbounded host retry loop.
+    host_plan_repeats: usize,
+    /// Agent indices whose stream shows full `[think]` blocks (default: collapsed).
+    thinking_expanded: HashSet<usize>,
+    /// Last drawn hit targets for mouse (agents list + stream pane).
+    hit_agents: Rect,
+    hit_stream: Rect,
+    /// Hit target of the action-feed pane (zero when the grimoire is shown).
+    hit_feed: Rect,
+    /// seq of the feed entry rendered on each visible feed row (for click-expand).
+    feed_rows: Vec<Option<u64>>,
+    /// Feed entries (by seq) whose full args/result are expanded.
+    feed_expanded: HashSet<u64>,
+    /// Central feed of every agent tool RPC (shared with the socket server) (#UI).
+    action_log: Arc<ActionLog>,
+    /// Center pane shows the grimoire (true) or the action feed (false).
+    show_grimoire: bool,
+    /// Labels of the agents targeted by the most recent scheduled tick (for the status bar).
+    last_targets: Vec<String>,
+    /// Rows scrolled up from the tail of the action feed (0 = live).
+    feed_scroll: usize,
+    /// Which actions the feed shows (all vs game-only).
+    feed_filter: FeedFilter,
+    /// Stable id for this TUI process (stamped on every results-log line).
+    run_id: String,
+    /// Public-log cursor already drained into the ranking results log.
+    results_public_cursor: u64,
+    /// True after `game_end` or `game_abort` has been written for the current game.
+    results_terminal_logged: bool,
 }
 
 impl App {
@@ -62,11 +131,13 @@ impl App {
         let id = uuid::Uuid::new_v4();
         cfg.work_root = PathBuf::from(format!("/tmp/botc-harness-{id}"));
         cfg.socket_path = cfg.work_root.join("engine.sock");
+        // Populate the setup picker from `grok models` (CLI default becomes selected).
+        let models_note = cfg.load_models_from_grok();
         let mcp_ok = agent_mcp_bin_ok(&cfg);
         let mcp_path = resolve_agent_mcp_bin_for_display(&cfg);
         let status = if mcp_ok {
             format!(
-                "↑/↓ players · Enter launch · q quit | grok={} mcp={}",
+                "↑/↓ row · ←/→ change · a=model to all · Enter launch · q quit | {models_note} | grok={} mcp={}",
                 cfg.grok_bin.display(),
                 mcp_path.display()
             )
@@ -76,9 +147,14 @@ impl App {
                 mcp_path.display()
             )
         };
-        Self {
+        let player_count = 5;
+        let mut app = Self {
             focus: Focus::Setup,
-            player_count: 5,
+            player_count,
+            // One pick per session (host + players), all starting on the CLI default.
+            seat_models: vec![cfg.model.clone(); player_count + 1],
+            setup_roles: Vec::new(),
+            setup_row: 0,
             selected_agent: 0,
             status,
             store: mcp_server::new_shared_store(),
@@ -89,23 +165,221 @@ impl App {
             agents: None,
             auto_tick: false,
             last_tick: Instant::now(),
-            tick_interval: Duration::from_secs(45),
             cfg,
             should_quit: false,
             scroll_from_bottom: 0,
+            tick_rotation: 0,
+            stage_key: String::new(),
+            wait_sig: None,
+            stall: 0,
+            last_plan_key: String::new(),
+            host_plan_repeats: 0,
+            thinking_expanded: HashSet::new(),
+            hit_agents: Rect::default(),
+            hit_stream: Rect::default(),
+            hit_feed: Rect::default(),
+            feed_rows: Vec::new(),
+            feed_expanded: HashSet::new(),
+            action_log: Arc::new(ActionLog::default()),
+            show_grimoire: false,
+            last_targets: Vec::new(),
+            feed_scroll: 0,
+            feed_filter: FeedFilter::All,
+            run_id: uuid::Uuid::new_v4().to_string(),
+            results_public_cursor: 0,
+            results_terminal_logged: false,
+        };
+        // Draw an initial role assignment so the setup screen shows roles immediately.
+        app.reroll_roles();
+        app
+    }
+
+    /// Draw a fresh, valid role assignment for the current player count and stash it
+    /// in `setup_roles`. Uses a throwaway game so the same engine bag logic that the
+    /// real game will use produces the preview; `launch()` then replays these exact
+    /// assignments. Leaves `status` untouched on success (keeps the boot note); only
+    /// reports on failure.
+    fn reroll_roles(&mut self) {
+        let names: Vec<String> = (0..self.player_count).map(|i| format!("P{i}")).collect();
+        let created = match Game::create(names, rand::random()) {
+            Ok(c) => c,
+            Err(e) => {
+                self.setup_roles.clear();
+                self.status = format!("role preview failed: {e}");
+                return;
+            }
+        };
+        let mut g = created.game;
+        if let Err(e) = g.start_game(&created.host_token, StartOpts::default()) {
+            self.setup_roles.clear();
+            self.status = format!("role preview failed: {e}");
+            return;
+        }
+        self.setup_roles = g
+            .seats
+            .iter()
+            .map(|s| RoleAssignment {
+                seat: s.id,
+                true_character: s.true_character.expect("started game assigns every seat"),
+                believed_character: s.believed_character,
+            })
+            .collect();
+    }
+
+    fn selected_thinking_expanded(&self) -> bool {
+        self.thinking_expanded.contains(&self.selected_agent)
+    }
+
+    fn toggle_thinking_selected(&mut self) {
+        if self.agents.is_none() {
+            return;
+        }
+        let idx = self.selected_agent;
+        if self.thinking_expanded.contains(&idx) {
+            self.thinking_expanded.remove(&idx);
+            self.status = format!("agent {idx}: thinking collapsed (h / click stream)");
+        } else {
+            self.thinking_expanded.insert(idx);
+            self.status = format!("agent {idx}: thinking expanded (h / click stream)");
+        }
+        self.scroll_from_bottom = 0;
+    }
+
+    /// Scroll the selected agent stream by `delta` visual rows (positive = older / up).
+    fn scroll_stream(&mut self, delta: i32) {
+        if self.focus != Focus::Monitor || self.agents.is_none() {
+            return;
+        }
+        if delta > 0 {
+            self.scroll_from_bottom = self
+                .scroll_from_bottom
+                .saturating_add(delta as usize);
+        } else {
+            self.scroll_from_bottom = self
+                .scroll_from_bottom
+                .saturating_sub((-delta) as usize);
+        }
+    }
+
+    fn on_mouse(&mut self, m: MouseEvent) {
+        let x = m.column;
+        let y = m.row;
+        match m.kind {
+            // Wheel / trackpad: scroll the stream or the action feed under the pointer.
+            MouseEventKind::ScrollUp if point_in_rect(self.hit_stream, x, y) => {
+                self.scroll_stream(3);
+            }
+            MouseEventKind::ScrollDown if point_in_rect(self.hit_stream, x, y) => {
+                self.scroll_stream(-3);
+            }
+            MouseEventKind::ScrollUp if point_in_rect(self.hit_feed, x, y) => {
+                self.feed_scroll = self.feed_scroll.saturating_add(3);
+            }
+            MouseEventKind::ScrollDown if point_in_rect(self.hit_feed, x, y) => {
+                self.feed_scroll = self.feed_scroll.saturating_sub(3);
+            }
+            // Left click: select agent, expand a feed action, or toggle thinking.
+            MouseEventKind::Down(MouseButton::Left) => {
+                if point_in_rect(self.hit_agents, x, y) {
+                    if let Some(pool) = self.agents.as_ref() {
+                        let n = pool.agents.len();
+                        if n == 0 {
+                            return;
+                        }
+                        // Row under the top border → agent index.
+                        let inner_y = y.saturating_sub(self.hit_agents.y.saturating_add(1));
+                        let idx = inner_y as usize;
+                        if idx < n {
+                            self.selected_agent = idx;
+                            self.scroll_from_bottom = 0;
+                            self.status = format!("selected agent {idx}");
+                        }
+                    }
+                } else if point_in_rect(self.hit_feed, x, y) {
+                    // Row under the top border → visible feed row → entry seq.
+                    let row = y.saturating_sub(self.hit_feed.y.saturating_add(1)) as usize;
+                    if let Some(Some(seq)) = self.feed_rows.get(row) {
+                        let seq = *seq;
+                        if !self.feed_expanded.remove(&seq) {
+                            self.feed_expanded.insert(seq);
+                        }
+                    }
+                } else if point_in_rect(self.hit_stream, x, y) {
+                    self.toggle_thinking_selected();
+                }
+            }
+            // Ignore other mouse noise (drags, right-click, wheel outside panes).
+            _ => {}
+        }
+    }
+
+    /// Setup ←/→: adjust the focused row. Row 0 changes the player count (the
+    /// per-seat model list grows/shrinks with it, new rows on the default model);
+    /// rows 1.. cycle that session's model through `grok models`.
+    fn setup_adjust(&mut self, delta: i32) {
+        if self.setup_row == 0 {
+            let pc = self.player_count as i32 + delta;
+            self.player_count = pc.clamp(5, 15) as usize;
+            self.seat_models
+                .resize(self.player_count + 1, self.cfg.model.clone());
+            // Roles are count-specific; redraw the assignment so the picker stays valid.
+            self.reroll_roles();
+            self.status = format!(
+                "players: {}  ({} sessions incl. host)",
+                self.player_count,
+                self.player_count + 1
+            );
+        } else {
+            let idx = self.setup_row - 1;
+            let cur = self.seat_models[idx].clone();
+            self.seat_models[idx] = cycle_in_list(&cur, &self.cfg.available_models, delta);
+            let who = if idx == 0 {
+                "Host".to_string()
+            } else {
+                format!("P{}", idx - 1)
+            };
+            self.status = format!("{who} model: {}  (a = apply to all)", self.seat_models[idx]);
         }
     }
 
     fn on_key(&mut self, code: KeyCode) {
-        // Only explicit keyboard actions. Mouse wheel / trackpad scroll is ignored
-        // in the event loop (EnableMouseCapture + drop Event::Mouse).
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            // Setup: ↑/↓ move the focused row (row 0 = player count; 1.. = one
+            // model row per session), ←/→ change the focused row's value.
             KeyCode::Up | KeyCode::Char('k') if self.focus == Focus::Setup => {
-                self.player_count = (self.player_count + 1).min(15);
+                self.setup_row = self.setup_row.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') if self.focus == Focus::Setup => {
-                self.player_count = (self.player_count - 1).max(5);
+                // Rows: 0 (count) + player_count+1 model rows.
+                self.setup_row = (self.setup_row + 1).min(self.player_count + 1);
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('m')
+                if self.focus == Focus::Setup =>
+            {
+                self.setup_adjust(1);
+            }
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('M')
+                if self.focus == Focus::Setup =>
+            {
+                self.setup_adjust(-1);
+            }
+            // Reroll the whole-table role assignment (rebuilds the bag).
+            KeyCode::Char('r') if self.focus == Focus::Setup => {
+                self.reroll_roles();
+                if !self.setup_roles.is_empty() {
+                    self.status = "rerolled roles".into();
+                }
+            }
+            // Apply the focused row's model to every session.
+            KeyCode::Char('a') if self.focus == Focus::Setup => {
+                if self.setup_row >= 1 {
+                    let m = self.seat_models[self.setup_row - 1].clone();
+                    for slot in self.seat_models.iter_mut() {
+                        *slot = m.clone();
+                    }
+                    self.status = format!("model for ALL sessions: {m}");
+                }
             }
             KeyCode::Enter if self.focus == Focus::Setup => self.launch(),
             KeyCode::Tab if self.agents.is_some() => {
@@ -132,16 +406,53 @@ impl App {
                 self.auto_tick = !self.auto_tick;
                 self.status = format!("auto_tick={}", self.auto_tick);
             }
-            KeyCode::Char(' ') if self.agents.is_some() => {
-                self.do_tick();
-                self.last_tick = Instant::now();
+            // Toggle the center pane between the action feed and the host grimoire.
+            KeyCode::Char('g') if self.agents.is_some() => {
+                self.show_grimoire = !self.show_grimoire;
+                self.status = if self.show_grimoire {
+                    "center: grimoire (g = action feed)".into()
+                } else {
+                    "center: action feed (g = grimoire)".into()
+                };
             }
-            // Keyboard-only log navigation (not mouse scroll). 0 = live tail.
+            // Toggle the feed filter: all actions ↔ game-only.
+            KeyCode::Char('f') if self.agents.is_some() => {
+                self.feed_filter = match self.feed_filter {
+                    FeedFilter::All => FeedFilter::GameOnly,
+                    FeedFilter::GameOnly => FeedFilter::All,
+                };
+                self.show_grimoire = false;
+                self.status = match self.feed_filter {
+                    FeedFilter::All => "feed: all actions (f = game-only)".into(),
+                    FeedFilter::GameOnly => "feed: game actions only (f = all)".into(),
+                };
+            }
+            // Expand/collapse [think] for the selected agent (default collapsed).
+            // Same as left-click on the stream pane.
+            KeyCode::Char('h') if self.agents.is_some() => {
+                self.toggle_thinking_selected();
+            }
+            KeyCode::Char(' ') if self.agents.is_some() => {
+                // Never skip a running agent: only advance when everything is idle.
+                if self.any_agent_running() {
+                    self.status =
+                        "still running — advances automatically when this turn finishes".into();
+                } else {
+                    self.do_tick();
+                }
+            }
+            // Stream scroll: keyboard and mouse wheel (over stream). 0 = live tail.
             KeyCode::PageUp if self.focus == Focus::Monitor => {
-                self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(5);
+                self.scroll_stream(5);
             }
             KeyCode::PageDown if self.focus == Focus::Monitor => {
-                self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(5);
+                self.scroll_stream(-5);
+            }
+            KeyCode::Up if self.focus == Focus::Monitor => {
+                self.scroll_stream(1);
+            }
+            KeyCode::Down if self.focus == Focus::Monitor => {
+                self.scroll_stream(-1);
             }
             KeyCode::Home if self.focus == Focus::Monitor => {
                 // Jump to live tail.
@@ -184,7 +495,11 @@ impl App {
             st.insert(created.game).0
         };
 
-        match SocketServer::start(Arc::clone(&self.store), &self.cfg.socket_path) {
+        match SocketServer::start_with_log(
+            Arc::clone(&self.store),
+            Arc::clone(&self.action_log),
+            &self.cfg.socket_path,
+        ) {
             Ok(s) => self.socket = Some(s),
             Err(e) => {
                 self.status = format!("socket: {e}");
@@ -195,10 +510,19 @@ impl App {
         let start_err = {
             let mut st = self.store.lock().unwrap();
             let g = st.get_mut(GameId(game_id)).unwrap();
+            // Launch with exactly the roles shown on the setup screen. Fall back to a
+            // fresh random bag only if the preview is missing/mismatched (shouldn't
+            // happen — it's regenerated on every count change).
+            let assignments = if self.setup_roles.len() == self.player_count {
+                Some(self.setup_roles.clone())
+            } else {
+                None
+            };
             tools::start_game(
                 g,
                 &created.host_token,
                 StartOpts {
+                    assignments,
                     st_choice_mode: if self.cfg.st_choice_mode == "random" {
                         StChoiceMode::Random
                     } else {
@@ -219,11 +543,49 @@ impl App {
         self.game_id = Some(game_id);
         self.host_token = Some(created.host_token.clone());
 
+        // Register token → actor labels so the action feed can name each caller.
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            created.host_token.as_str().to_string(),
+            ActorLabel {
+                name: "Host".into(),
+                seat: None,
+                is_host: true,
+            },
+        );
+        for (i, tok) in created.player_tokens.iter().enumerate() {
+            labels.insert(
+                tok.as_str().to_string(),
+                ActorLabel {
+                    name: format!("P{i}"),
+                    seat: Some(i as u8),
+                    is_host: false,
+                },
+            );
+        }
+        self.action_log.set_labels(labels);
+        crate::dlog!(
+            "LAUNCH game_id={game_id} players={} st_mode={} host_token={}… players_tokens={}",
+            self.player_count,
+            self.cfg.st_choice_mode,
+            &created.host_token.as_str()[..8.min(created.host_token.as_str().len())],
+            created.player_tokens.len()
+        );
+
+        // Per-session models from the setup picker (index 0 = host, 1+i = P{i}).
+        // Fall back to the default model if the picks are out of sync.
+        let model_for = |slot: usize| -> String {
+            self.seat_models
+                .get(slot)
+                .cloned()
+                .unwrap_or_else(|| self.cfg.model.clone())
+        };
         let mut configs = vec![AgentConfig {
             role: AgentRole::Host,
             display_name: "Storyteller".into(),
             token: created.host_token.as_str().to_string(),
             game_id,
+            model: model_for(0),
         }];
         for (i, tok) in created.player_tokens.iter().enumerate() {
             configs.push(AgentConfig {
@@ -233,32 +595,97 @@ impl App {
                 display_name: self.player_names[i].clone(),
                 token: tok.as_str().to_string(),
                 game_id,
+                model: model_for(1 + i),
             });
         }
 
         match AgentPool::prepare(&self.cfg, configs) {
-            Ok(mut pool) => match pool.kickoff_all(self.player_count) {
-                Ok(spawned) => {
-                    self.status = format!(
-                        "Game {game_id} · kicked {spawned}/{} · Space=tick t=auto Tab=agent q=quit",
-                        self.player_count + 1
-                    );
-                    self.auto_tick = true;
-                    self.last_tick = Instant::now();
-                    self.focus = Focus::Monitor;
-                    self.scroll_from_bottom = 0;
-                    self.agents = Some(pool);
+            Ok(mut pool) => {
+                // Ranking corpus: log the full seat↔model↔role table once at start.
+                {
+                    let st = self.store.lock().unwrap();
+                    if let Some(g) = st.get(GameId(game_id)) {
+                        let agent_cfgs: Vec<_> =
+                            pool.agents.iter().map(|a| a.config.clone()).collect();
+                        crate::harness::results_log::log_game_start(
+                            &self.run_id,
+                            game_id,
+                            g,
+                            &agent_cfgs,
+                            seed,
+                            &self.cfg.st_choice_mode,
+                        );
+                        // Catch any public events already emitted during start_game.
+                        self.results_public_cursor =
+                            crate::harness::results_log::drain_public_events(
+                                &self.run_id,
+                                game_id,
+                                g,
+                                &agent_cfgs,
+                                0,
+                            );
+                    }
                 }
-                Err(e) => {
-                    // Partial pool still owns workdirs — keep it so shutdown/stop_all cleans up.
-                    self.status = format!("kickoff: {e}");
-                    self.agents = Some(pool);
+                self.results_terminal_logged = false;
+                match pool.kickoff_all(self.player_count) {
+                    Ok(spawned) => {
+                        self.status = format!(
+                            "Game {game_id} · kicked {spawned}/{} · Space=tick · click stream=think · wheel=scroll · q=quit",
+                            self.player_count + 1
+                        );
+                        self.auto_tick = true;
+                        self.last_tick = Instant::now();
+                        self.focus = Focus::Monitor;
+                        self.scroll_from_bottom = 0;
+                        self.agents = Some(pool);
+                        crate::dlog!("LAUNCH kickoff spawned {spawned}/{}", self.player_count + 1);
+                    }
+                    Err(e) => {
+                        // Partial pool still owns workdirs — keep it so shutdown/stop_all cleans up.
+                        self.status = format!("kickoff: {e}");
+                        self.agents = Some(pool);
+                        crate::dlog!("LAUNCH kickoff ERROR {e}");
+                    }
                 }
-            },
+            }
             Err(e) => {
                 self.status = format!("prepare: {e}");
                 // #55/#58: socket + partial work_root without agents.
                 self.abort_partial_launch();
+            }
+        }
+    }
+
+    /// Agent configs for results logging (empty if no pool).
+    fn agent_configs_for_results(&self) -> Vec<AgentConfig> {
+        self.agents
+            .as_ref()
+            .map(|p| p.agents.iter().map(|a| a.config.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Drain ranking-relevant public events; if the game just ended, write `game_end` once.
+    fn results_poll(&mut self) {
+        let Some(gid) = self.game_id else {
+            return;
+        };
+        let agent_cfgs = self.agent_configs_for_results();
+        let st = self.store.lock().unwrap();
+        let Some(g) = st.get(GameId(gid)) else {
+            return;
+        };
+        self.results_public_cursor = crate::harness::results_log::drain_public_events(
+            &self.run_id,
+            gid,
+            g,
+            &agent_cfgs,
+            self.results_public_cursor,
+        );
+        if !self.results_terminal_logged {
+            if matches!(g.phase, Phase::Ended { .. }) {
+                crate::harness::results_log::log_game_end(&self.run_id, gid, g, &agent_cfgs);
+                self.results_terminal_logged = true;
+                crate::dlog!("RESULTS game_end logged run_id={}", self.run_id);
             }
         }
     }
@@ -273,61 +700,228 @@ impl App {
         }
     }
 
+    /// One turn-routed tick (#60): plan from engine state, then tick only the
+    /// agent(s) the game is waiting on. Stops (and disarms auto-tick) at `Ended`.
     fn do_tick(&mut self) {
         let Some(gid) = self.game_id else {
             return;
         };
-        let (summary, hint) = self.public_summary_and_hint(gid);
+        // Read all we need under one short lock: the plan, the prompt context,
+        // and whether the game is over. Do NOT hold the lock while spawning grok.
+        let (plan, summary, hint, ended, sig, stall, state_dbg) = {
+            let st = self.store.lock().unwrap();
+            let Some(g) = st.get(GameId(gid)) else {
+                return;
+            };
+            // New phase/stage => restart the turn rotation (round counting depends
+            // on rotation starting at 0 when discussion/nominations begin).
+            let key = stage_key_of(g);
+            if key != self.stage_key {
+                crate::dlog!("STAGE {} -> {} (rotation reset)", self.stage_key, key);
+                self.stage_key = key;
+                self.tick_rotation = 0;
+            }
+            // Stall detection: same wait as last cycle => it's not progressing.
+            let sig = wait_signature(g);
+            let stall = if sig.is_some() && sig == self.wait_sig {
+                self.stall + 1
+            } else {
+                0
+            };
+            let plan = plan_ticks(g, self.tick_rotation, stall);
+            let (summary, hint) = game_summary_and_hint(g);
+            let state_dbg = format!(
+                "phase={:?} pending_host={:?} pending_night={:?} nom={:?}",
+                g.phase,
+                g.pending_host.as_ref().map(|p| p.kind_str()),
+                g.pending_night.as_ref().map(|w| w.seat.0),
+                g.current_nomination
+                    .as_ref()
+                    .map(|n| (n.by.0, n.target.0, n.votes.len())),
+            );
+            (
+                plan,
+                summary,
+                hint,
+                matches!(g.phase, Phase::Ended { .. }),
+                sig,
+                stall,
+                state_dbg,
+            )
+        };
+        self.wait_sig = sig.clone();
+        self.stall = stall;
+
+        let plan_dbg: Vec<String> = plan.iter().map(target_label).collect();
+        crate::dlog!(
+            "TICK rotation={} sig={:?} stall={} {} plan=[{}]",
+            self.tick_rotation,
+            sig,
+            stall,
+            state_dbg,
+            plan_dbg.join(", ")
+        );
+
+        // Always drain ranking events (deaths / noms) even on the end tick.
+        self.results_poll();
+
+        if ended {
+            self.auto_tick = false;
+            self.status = "Game ended — agents idle. Press q to quit or Tab to review streams.".into();
+            crate::dlog!("TICK -> game ended, auto_tick off");
+            return;
+        }
+
+        // Host-retry brake: a host-only fallback plan that repeats with no state
+        // change means the host agent runs but never makes the required call.
+        // Without a cap, event-driven auto would re-spawn it forever (token burn).
+        let host_only = plan
+            .iter()
+            .all(|t| matches!(t, SchedTarget::Host(_)));
+        let plan_key = format!("{}|{sig:?}", plan_dbg.join(","));
+        if host_only && plan_key == self.last_plan_key {
+            self.host_plan_repeats += 1;
+        } else {
+            self.host_plan_repeats = 0;
+        }
+        self.last_plan_key = plan_key;
+        const HOST_RETRY_CAP: usize = 5;
+        if host_only && self.host_plan_repeats >= HOST_RETRY_CAP {
+            self.auto_tick = false;
+            self.status = format!(
+                "auto-advance stopped: host repeated '{}' {HOST_RETRY_CAP}x without progress (see debug log). t=resume",
+                self.last_targets.join(",")
+            );
+            crate::dlog!("TICK -> host plan repeated {HOST_RETRY_CAP}x with no progress, auto_tick disabled");
+            return;
+        }
+
+        self.last_targets = plan_dbg;
+        self.last_tick = Instant::now();
         if let Some(pool) = self.agents.as_mut() {
-            let total = pool.agents.len();
-            match pool.tick_all(&summary, &hint) {
+            match pool.tick_scheduled(&plan, &summary, &hint) {
                 Ok(spawned) => {
-                    let skipped = total.saturating_sub(spawned);
-                    self.status = if skipped == 0 {
-                        format!("Ticked {spawned}/{total} agents.")
+                    self.status = format!(
+                        "Turn tick → {}: {spawned} of {} spawned.",
+                        self.last_targets.join(", "),
+                        plan.len()
+                    );
+                    crate::dlog!("TICK -> tick_scheduled spawned {spawned}/{}", plan.len());
+                    if spawned > 0 {
+                        // Consume the turn slot only when someone actually ran —
+                        // a failed spawn must not silently skip a speaker.
+                        self.tick_rotation = self.tick_rotation.wrapping_add(1);
                     } else {
-                        format!(
-                            "Ticked {spawned}/{total} agents ({skipped} still running previous tick)."
-                        )
-                    };
+                        // Event-driven auto would re-fire immediately while idle; if a
+                        // tick spawns nothing (broken grok / all errored), stop auto to
+                        // avoid a hot retry loop. Re-enable with `t` after fixing.
+                        self.auto_tick = false;
+                        self.status =
+                            "auto-advance stopped: tick spawned no agent (check grok / debug log). t=resume".into();
+                        crate::dlog!("TICK -> 0 spawned, auto_tick disabled");
+                    }
                 }
-                Err(e) => self.status = format!("tick error: {e}"),
+                Err(e) => {
+                    self.auto_tick = false;
+                    self.status = format!("tick error (auto stopped): {e}");
+                    crate::dlog!("TICK -> tick_scheduled ERROR {e}, auto_tick disabled");
+                }
             }
         }
     }
 
-    fn public_summary_and_hint(&self, game_id: u64) -> (String, String) {
-        let st = self.store.lock().unwrap();
-        let Some(g) = st.get(GameId(game_id)) else {
-            return ("(no game)".into(), String::new());
+    /// Concise phase label for the status bar (`Night 1`, `Day 2·noms`, `Ended: Good`).
+    fn phase_label(&self) -> String {
+        let Some(gid) = self.game_id else {
+            return "Lobby".into();
         };
-        let phase = format!("{:?}", g.phase);
-        let living: Vec<_> = g
-            .seats
+        let st = self.store.lock().unwrap();
+        let Some(g) = st.get(GameId(gid)) else {
+            return "—".into();
+        };
+        match &g.phase {
+            Phase::Lobby => "Lobby".into(),
+            Phase::FirstNight { .. } => "Night 1".into(),
+            Phase::Night { night, .. } => format!("Night {night}"),
+            Phase::Day { day, stage } => {
+                let s = match stage {
+                    crate::game::DayStage::Discussion => "disc",
+                    crate::game::DayStage::Nominations => "noms",
+                };
+                format!("Day {day}·{s}")
+            }
+            Phase::Ended { winner, .. } => format!("Ended: {winner:?}"),
+        }
+    }
+
+    /// True if any agent's Grok child is currently running.
+    fn any_agent_running(&self) -> bool {
+        self.agents
+            .as_ref()
+            .map(|p| p.agents.iter().any(|a| *a.running.lock().unwrap()))
+            .unwrap_or(false)
+    }
+
+    /// Labels of agents whose Grok child is currently running.
+    fn running_labels(&self) -> Vec<String> {
+        let Some(pool) = self.agents.as_ref() else {
+            return Vec::new();
+        };
+        pool.agents
             .iter()
-            .filter(|s| s.alive)
-            .map(|s| format!("{}#{}", s.display_name, s.id.0))
-            .collect();
-        let chat: Vec<_> = g
-            .public_log
-            .since(0)
-            .into_iter()
-            .rev()
-            .take(12)
-            .map(|(id, e)| format!("#{id} {e:?}"))
-            .collect();
-        let chat: Vec<_> = chat.into_iter().rev().collect();
-        let summary = format!(
-            "phase={phase}\nliving={}\nrecent_log:\n{}",
-            living.join(", "),
-            chat.join("\n")
-        );
-        let hint = format!(
-            "pending_night={} pending_host={:?}",
-            g.pending_night.is_some(),
-            g.pending_host.as_ref().map(|p| p.kind_str())
-        );
-        (summary, hint)
+            .filter(|a| *a.running.lock().unwrap())
+            .map(|a| match a.config.role {
+                AgentRole::Host => "Host".into(),
+                AgentRole::Player { seat } => format!("P{}", seat.0),
+            })
+            .collect()
+    }
+
+    /// Game-progress spans for the top bar: phase · whose turn · tick mode · running.
+    fn status_spans(&self) -> Vec<Span<'static>> {
+        let phase = self.phase_label();
+        let running = self.running_labels();
+        let turn = if self.last_targets.is_empty() {
+            "—".to_string()
+        } else {
+            self.last_targets.join(",")
+        };
+        let ago = self.last_tick.elapsed().as_secs();
+        let tick = if self.auto_tick {
+            "auto (on turn end)".to_string()
+        } else {
+            "manual (Space)".to_string()
+        };
+        let mut spans = vec![
+            Span::styled(
+                format!(" {phase} "),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("· turn "),
+            Span::styled(format!("{turn} "), Style::default().fg(Color::Yellow)),
+            Span::raw("· "),
+            Span::styled(
+                format!("{tick} "),
+                if self.auto_tick {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                },
+            ),
+            Span::raw("· "),
+        ];
+        if running.is_empty() {
+            spans.push(Span::styled(
+                format!("idle · last turn {ago}s ago"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        } else {
+            spans.push(Span::styled(
+                format!("▶ running: {}", running.join(",")),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans
     }
 
     fn snapshot_host(&self) -> String {
@@ -370,23 +964,70 @@ impl App {
         }
     }
 
-    /// Full agent log as joined text (newest at end). Caller applies tail-anchor scroll (#45).
-    fn agent_log_text(&self) -> String {
+    /// Agent stream for the selected seat: thinking collapsed by default so game
+    /// actions (text / tools / errors) stay visible; `h` expands `[think]` blocks.
+    fn agent_log_lines(&self) -> Vec<Line<'static>> {
         let Some(pool) = self.agents.as_ref() else {
-            return String::new();
+            return Vec::new();
         };
         if pool.agents.is_empty() {
-            return String::new();
+            return Vec::new();
         }
         let idx = self.selected_agent.min(pool.agents.len() - 1);
         let agent = &pool.agents[idx];
         let log = agent.log.lock().unwrap();
-        // Cap retained lines for the pane (keep a generous buffer for PgUp).
-        let start = log.len().saturating_sub(400);
-        log[start..].join("\n")
+        let start = log.len().saturating_sub(600);
+        stream_lines(&log[start..], self.thinking_expanded.contains(&idx))
     }
 
     fn shutdown(&mut self) {
+        // Ranking: if the game never reached Ended, record an abort before we
+        // tear down the store/pool (so we still have models + grimoire).
+        if let Some(gid) = self.game_id {
+            if !self.results_terminal_logged {
+                let agent_cfgs = self.agent_configs_for_results();
+                let st = self.store.lock().unwrap();
+                let g = st.get(GameId(gid));
+                // Final drain of any unlogged public events.
+                if let Some(game) = g {
+                    self.results_public_cursor =
+                        crate::harness::results_log::drain_public_events(
+                            &self.run_id,
+                            gid,
+                            game,
+                            &agent_cfgs,
+                            self.results_public_cursor,
+                        );
+                    if matches!(game.phase, Phase::Ended { .. }) {
+                        crate::harness::results_log::log_game_end(
+                            &self.run_id,
+                            gid,
+                            game,
+                            &agent_cfgs,
+                        );
+                    } else {
+                        crate::harness::results_log::log_game_abort(
+                            &self.run_id,
+                            gid,
+                            Some(game),
+                            &agent_cfgs,
+                            "tui_quit",
+                        );
+                    }
+                } else {
+                    crate::harness::results_log::log_game_abort(
+                        &self.run_id,
+                        gid,
+                        None,
+                        &agent_cfgs,
+                        "tui_quit",
+                    );
+                }
+                self.results_terminal_logged = true;
+                crate::dlog!("RESULTS terminal event logged on shutdown run_id={}", self.run_id);
+            }
+        }
+
         // Stop agents first (kills children + removes work root with tokens).
         if let Some(mut pool) = self.agents.take() {
             pool.stop_all();
@@ -400,6 +1041,337 @@ impl App {
             let _ = std::fs::remove_dir_all(&self.cfg.work_root);
         }
     }
+}
+
+/// Stable key for the current phase/stage; a change means the turn rotation restarts.
+/// Includes the living count so a mid-stage death (Slayer shot) restarts the round
+/// with the current roster instead of mis-indexing speakers/rounds.
+fn stage_key_of(g: &Game) -> String {
+    let living = g.seats.iter().filter(|s| s.alive).count();
+    match &g.phase {
+        Phase::Lobby => "lobby".into(),
+        Phase::FirstNight { .. } => "night1".into(),
+        Phase::Night { night, .. } => format!("night{night}"),
+        Phase::Day { day, stage } => format!(
+            "day{day}-{}-{living}",
+            match stage {
+                crate::game::DayStage::Discussion => "disc",
+                crate::game::DayStage::Nominations => "noms",
+            }
+        ),
+        Phase::Ended { .. } => "ended".into(),
+    }
+}
+
+/// Readable one-line rendering of a public event (for agent prompts, not Debug).
+fn fmt_public_event(e: &crate::comms::PublicEvent) -> String {
+    use crate::comms::PublicEvent::*;
+    // Each event MUST be a single line: the snapshot lists one event per line, so a
+    // message with embedded newlines would blur where one speaker ends and the next
+    // begins — which makes agents think a message was "cut off" or reorder events.
+    let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match e {
+        Chat { seat, text, .. } => format!("P{}: {}", seat.0, one_line(text)),
+        StorytellerAnnounce { text } => format!("Storyteller: {}", one_line(text)),
+        Nominated { by, target } => format!("P{} nominated P{}", by.0, target.0),
+        VoteCast {
+            seat,
+            nominee,
+            support,
+        } => format!(
+            "P{} voted {} on P{}",
+            seat.0,
+            if *support { "YES" } else { "no" },
+            nominee.0
+        ),
+        Executed { seat } => format!("P{} was executed", seat.0),
+        NoExecution => "No one was executed today".to_string(),
+        DiedInNight { seats } => {
+            if seats.is_empty() {
+                "No one died in the night".to_string()
+            } else {
+                format!(
+                    "Died in the night: {}",
+                    seats
+                        .iter()
+                        .map(|s| format!("P{}", s.0))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        }
+        PlayerDied { seat } => format!("P{} died", seat.0),
+        SlayerMiss { slayer, target } => {
+            format!("P{} tried to slay P{} — nothing happened", slayer.0, target.0)
+        }
+        PhaseChanged { summary } => summary.clone(),
+        GameEnded { winner } => format!("Game over — {winner:?} wins"),
+    }
+}
+
+/// Public snapshot + host hint string for tick prompts, computed from a locked game.
+/// Free function so the scheduler can build it under the store lock without a second lock.
+fn game_summary_and_hint(g: &Game) -> (String, String) {
+    let phase = format!("{:?}", g.phase);
+    let living: Vec<_> = g
+        .seats
+        .iter()
+        .filter(|s| s.alive)
+        .map(|s| format!("P{}", s.id.0))
+        .collect();
+    let dead: Vec<_> = g
+        .seats
+        .iter()
+        .filter(|s| !s.alive)
+        .map(|s| format!("P{}", s.id.0))
+        .collect();
+    let recent: Vec<_> = g
+        .public_log
+        .since(0)
+        .into_iter()
+        .rev()
+        .take(16)
+        .map(|(_, e)| fmt_public_event(&e))
+        .collect();
+    let recent: Vec<_> = recent.into_iter().rev().collect();
+    let recent_str = if recent.is_empty() {
+        "(nothing public has happened yet)".to_string()
+    } else {
+        recent.join("\n")
+    };
+    let summary = format!(
+        "phase: {phase}\nliving: {}\ndead: {}\nrecent public events:\n{}",
+        living.join(", "),
+        if dead.is_empty() {
+            "none".to_string()
+        } else {
+            dead.join(", ")
+        },
+        recent_str
+    );
+    let hint = format!(
+        "pending_night={} pending_host={:?}",
+        g.pending_night.is_some(),
+        g.pending_host.as_ref().map(|p| p.kind_str())
+    );
+    (summary, hint)
+}
+
+/// Label a scheduler target for the status bar.
+fn target_label(t: &SchedTarget) -> String {
+    match t {
+        SchedTarget::Host(_) => "Host".into(),
+        SchedTarget::Player { seat, .. } => format!("P{}", seat.0),
+    }
+}
+
+/// Stable per-agent colour (host magenta; players cycle a palette by seat).
+fn actor_color(is_host: bool, seat: Option<u8>) -> Color {
+    if is_host {
+        return Color::Magenta;
+    }
+    const PAL: [Color; 6] = [
+        Color::Cyan,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::LightRed,
+        Color::LightGreen,
+    ];
+    PAL[(seat.unwrap_or(0) as usize) % PAL.len()]
+}
+
+/// `say` / `st_announce` text is never truncated in the feed — it always wraps
+/// in full. Other tools keep a short inline summary on the header row.
+fn is_speech_tool(tool: &str) -> bool {
+    matches!(tool, "say" | "st_announce")
+}
+
+fn summary_style(kind: ActionKind) -> Style {
+    if kind == ActionKind::Game {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+/// Chunk `text` into indented feed rows at `width` (pane inner width).
+fn feed_chunk_lines(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    let indent = "      ";
+    let body_w = width.saturating_sub(indent.len()).max(8);
+    let chars: Vec<char> = text.chars().collect();
+    chars
+        .chunks(body_w)
+        .map(|c| {
+            Line::from(Span::styled(
+                format!("{indent}{}", c.iter().collect::<String>()),
+                style,
+            ))
+        })
+        .collect()
+}
+
+/// Header row: time · actor · tool · status. Speech tools leave the quote off the
+/// header (it wraps in full below). Other tools put the short summary inline.
+fn feed_line(e: &crate::harness::action_log::ActionEntry) -> Line<'static> {
+    let ac = actor_color(e.actor.is_host, e.actor.seat);
+    let (tool_style, marker) = match e.kind {
+        ActionKind::Game => (
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            "▶ ",
+        ),
+        ActionKind::Info => (Style::default().fg(Color::DarkGray), "  "),
+        ActionKind::Meta => (Style::default().fg(Color::Gray), "  "),
+    };
+    let mut spans = vec![
+        Span::styled(format!("{:>4}s ", e.secs), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:<5}", e.actor.name),
+            Style::default().fg(ac).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(marker, tool_style),
+        Span::styled(e.tool.clone(), tool_style),
+    ];
+    if !is_speech_tool(&e.tool) && !e.summary.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(e.summary.clone(), summary_style(e.kind)));
+    }
+    if e.ok {
+        spans.push(Span::styled("  ✓", Style::default().fg(Color::Green)));
+    } else {
+        spans.push(Span::styled(
+            format!("  ✗ {}", e.error.as_deref().unwrap_or("")),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Full `say` / `st_announce` quote, wrapped — always shown (not gated on expand).
+fn feed_speech_lines(
+    e: &crate::harness::action_log::ActionEntry,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if e.summary.is_empty() {
+        return Vec::new();
+    }
+    feed_chunk_lines(&e.summary, width, summary_style(e.kind))
+}
+
+/// Expanded-only detail: args JSON, then result / error. Speech text is already
+/// visible above and is not repeated here.
+fn feed_detail_lines(
+    e: &crate::harness::action_log::ActionEntry,
+    width: usize,
+) -> Vec<Line<'static>> {
+    use crate::harness::action_log::clip_chars;
+    const MAX_DETAIL_ROWS: usize = 16;
+    let indent = "      ";
+    let mut out = Vec::new();
+    out.extend(feed_chunk_lines(
+        &format!("args: {}", e.args),
+        width,
+        Style::default().fg(Color::Gray),
+    ));
+    if let Some(err) = &e.error {
+        out.extend(feed_chunk_lines(
+            &format!("error: {err}"),
+            width,
+            Style::default().fg(Color::Red),
+        ));
+    } else if let Some(res) = &e.result {
+        out.extend(feed_chunk_lines(
+            &format!("result: {}", clip_chars(res, 600)),
+            width,
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if out.len() > MAX_DETAIL_ROWS {
+        out.truncate(MAX_DETAIL_ROWS);
+        out.push(Line::from(Span::styled(
+            format!("{indent}… (truncated)"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    out
+}
+
+/// Draw the global action feed (all agents), tail-anchored with `feed_scroll`.
+/// Rows are pre-clipped (no wrapping) so every visible row maps to exactly one
+/// entry — that mapping (`app.feed_rows`) makes rows click-expandable.
+fn draw_action_feed(f: &mut Frame, area: Rect, app: &mut App) {
+    let inner_h = area.height.saturating_sub(2).max(1) as usize;
+    let inner_w = area.width.saturating_sub(2).max(8) as usize;
+    // Game-only pulls a wider window so real actions aren't starved by info reads.
+    let pull = match app.feed_filter {
+        FeedFilter::All => inner_h + app.feed_scroll + 50,
+        FeedFilter::GameOnly => 1500,
+    };
+    let entries: Vec<_> = app
+        .action_log
+        .recent(pull)
+        .into_iter()
+        .filter(|e| match app.feed_filter {
+            FeedFilter::All => true,
+            FeedFilter::GameOnly => e.kind == ActionKind::Game || !e.ok,
+        })
+        .collect();
+
+    // Flatten entries into visual rows: header (▸/▾) + full speech text always,
+    // plus args/result when expanded. Every row of a block maps to that seq so
+    // any click toggles expand/collapse.
+    let mut rows: Vec<(Line<'static>, Option<u64>)> = Vec::new();
+    for e in &entries {
+        let expanded = app.feed_expanded.contains(&e.seq);
+        let marker = if expanded { "▾" } else { "▸" };
+        let mut line = feed_line(e);
+        line.spans.insert(
+            0,
+            Span::styled(format!("{marker} "), Style::default().fg(Color::DarkGray)),
+        );
+        rows.push((line, Some(e.seq)));
+        // say / st_announce: full quote always, never truncated (may wrap).
+        if is_speech_tool(&e.tool) {
+            for l in feed_speech_lines(e, inner_w) {
+                rows.push((l, Some(e.seq)));
+            }
+        }
+        if expanded {
+            for l in feed_detail_lines(e, inner_w) {
+                rows.push((l, Some(e.seq)));
+            }
+        }
+    }
+    if rows.is_empty() {
+        let msg = match app.feed_filter {
+            FeedFilter::All => "no actions yet — agents haven't called any tools",
+            FeedFilter::GameOnly => "no game actions yet (f = show all)",
+        };
+        rows.push((
+            Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray))),
+            None,
+        ));
+    }
+
+    // Tail-anchored window over the visual rows.
+    let end = rows.len().saturating_sub(app.feed_scroll);
+    let start = end.saturating_sub(inner_h);
+    let window = &rows[start..end];
+    let lines: Vec<Line> = window.iter().map(|(l, _)| l.clone()).collect();
+    app.feed_rows = window.iter().map(|(_, seq)| *seq).collect();
+    app.hit_feed = area;
+
+    let filt = match app.feed_filter {
+        FeedFilter::All => "all",
+        FeedFilter::GameOnly => "game-only",
+    };
+    let tail = if app.feed_scroll == 0 { "·live" } else { "·scroll" };
+    let title = format!(
+        "actions · {filt} · {} total · click=expand f=filter g=grimoire {tail}",
+        app.action_log.len()
+    );
+    let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(p, area);
 }
 
 /// RAII guard: restores terminal raw-mode / alternate screen on Drop or panic (#49).
@@ -474,31 +1446,50 @@ fn install_panic_hook() {
 }
 
 pub fn run_tui() -> io::Result<()> {
+    let log_path = crate::harness::debug_log::log_path();
+    crate::harness::debug_log::init(&log_path);
+    let results_path = crate::harness::results_log::init();
     install_panic_hook();
     let mut guard = TerminalGuard::enter()?;
     let mut app = App::new();
+    app.status = format!(
+        "{}  · debug: {log_path}  · results: {}",
+        app.status,
+        results_path.display()
+    );
+    crate::dlog!(
+        "run_tui: grok={} model={} agent_mcp={} results={}",
+        app.cfg.grok_bin.display(),
+        app.cfg.model,
+        app.cfg.agent_mcp_bin.display(),
+        results_path.display()
+    );
 
     let result = loop {
-        guard.terminal_mut().draw(|f| draw(f, &app))?;
+        guard.terminal_mut().draw(|f| draw(f, &mut app))?;
         if app.should_quit {
             break Ok(());
         }
-        if app.auto_tick && app.agents.is_some() && app.last_tick.elapsed() >= app.tick_interval {
+        // Event-driven auto-advance: tick the next turn as soon as every agent is
+        // idle (a running agent is never skipped; there is no fixed timer).
+        if app.auto_tick && app.agents.is_some() && !app.any_agent_running() {
             app.do_tick();
-            app.last_tick = Instant::now();
+        } else if app.agents.is_some() && app.game_id.is_some() && !app.any_agent_running() {
+            // Between turns (manual mode / idle), still drain deaths & noms into
+            // the ranking log without spawning agents.
+            app.results_poll();
         }
         // Drain the whole queue so scroll floods don't lag behind real keys.
         while event::poll(Duration::from_millis(0))? {
             match event::read()? {
                 Event::Key(key) => {
-                    // Press only — ignore Release/Repeat (and anything scroll-related).
+                    // Press only — ignore Release/Repeat.
                     if key.kind == KeyEventKind::Press {
                         app.on_key(key.code);
                     }
                 }
-                // Explicit no-op: wheel, trackpad, clicks, resize, paste, focus.
-                Event::Mouse(_)
-                | Event::Resize(_, _)
+                Event::Mouse(m) => app.on_mouse(m),
+                Event::Resize(_, _)
                 | Event::FocusGained
                 | Event::FocusLost
                 | Event::Paste(_) => {}
@@ -513,7 +1504,11 @@ pub fn run_tui() -> io::Result<()> {
     result
 }
 
-fn draw(f: &mut Frame, app: &App) {
+fn point_in_rect(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
+}
+
+fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -523,25 +1518,26 @@ fn draw(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " botc-tui ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(
-            " players={} sessions={}  [{}]",
+    let mut title_spans = vec![Span::styled(
+        " botc-tui ",
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    match app.focus {
+        Focus::Setup => title_spans.push(Span::raw(format!(
+            " players={} sessions={}  [SETUP]",
             app.player_count,
             app.player_count + 1,
-            match app.focus {
-                Focus::Setup => "SETUP",
-                Focus::Monitor => "MONITOR",
-            }
-        )),
-    ]))
-    .block(
+        ))),
+        // Live game-progress: phase · whose turn · tick mode · what's running.
+        Focus::Monitor => {
+            title_spans.push(Span::raw(" "));
+            title_spans.extend(app.status_spans());
+        }
+    }
+    let title = Paragraph::new(Line::from(title_spans)).block(
         Block::default()
             .borders(Borders::ALL)
             .title("Trouble Brewing · multi-agent monitor"),
@@ -549,7 +1545,11 @@ fn draw(f: &mut Frame, app: &App) {
     f.render_widget(title, chunks[0]);
 
     match app.focus {
-        Focus::Setup => draw_setup(f, chunks[1], app),
+        Focus::Setup => {
+            app.hit_agents = Rect::default();
+            app.hit_stream = Rect::default();
+            draw_setup(f, chunks[1], app);
+        }
         Focus::Monitor => draw_monitor(f, chunks[1], app),
     }
 
@@ -559,6 +1559,29 @@ fn draw(f: &mut Frame, app: &App) {
     f.render_widget(status, chunks[2]);
 }
 
+/// Setup-screen label for a previewed seat role. Drunk shows both its true role and
+/// the Townsfolk it believes it is, since the operator picks models on the true role.
+fn role_label(a: &RoleAssignment) -> String {
+    match a.believed_character {
+        Some(face) => format!(
+            "{} (as {})",
+            a.true_character.display_name(),
+            face.display_name()
+        ),
+        None => a.true_character.display_name().to_string(),
+    }
+}
+
+/// Colour a role by team so the operator can see the evil seats at a glance.
+fn role_style(c: Character) -> Style {
+    match c.character_type() {
+        CharacterType::Demon => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        CharacterType::Minion => Style::default().fg(Color::Red),
+        CharacterType::Outsider => Style::default().fg(Color::Yellow),
+        CharacterType::Townsfolk => Style::default().fg(Color::Green),
+    }
+}
+
 fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     let mcp = resolve_agent_mcp_bin_for_display(&app.cfg);
     let mcp_note = if agent_mcp_bin_ok(&app.cfg) {
@@ -566,96 +1589,212 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     } else {
         "MISSING — cargo build --bins"
     };
-    let text = format!(
-        "Player count: {pc}   →  {tot} headless Grok sessions (host + players)\n\n\
-         Model:       {model}\n\
-         Grok binary: {grok}\n\
-         Agent MCP:   {mcp}  ({mcp_note})\n\
-         Work root:   {work}\n\n\
-         Controls:  ↑/↓  change player count\n\
-                    Enter  create game + spawn agents\n\
-                    q      quit (kills agents, removes workdirs)\n\n\
-         Each agent workdir gets .grok/config.toml → botc-agent-mcp\n\
-         (token-scoped) → Unix socket → shared in-process engine.\n\
-         Build first: cargo build --bins && cargo run --bin botc-tui",
-        pc = app.player_count,
-        tot = app.player_count + 1,
-        model = app.cfg.model,
-        grok = app.cfg.grok_bin.display(),
-        mcp = mcp.display(),
-        work = app.cfg.work_root.display(),
-    );
-    let p = Paragraph::new(text)
+    let focused = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Row 0: player count.
+    let count_mark = if app.setup_row == 0 { "▶ " } else { "  " };
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{count_mark}Players: {}    →  {} headless Grok sessions (host + players)",
+            app.player_count,
+            app.player_count + 1
+        ),
+        if app.setup_row == 0 { focused } else { Style::default() },
+    )));
+    lines.push(Line::raw(""));
+
+    // One row per session: Host, P0, P1, … each showing seat · role · model.
+    lines.push(Line::from(Span::styled(
+        "  Seat · role · model   (←/→ change model · a = apply to all · r = reroll roles)",
+        dim,
+    )));
+    for slot in 0..=app.player_count {
+        let row = slot + 1;
+        let who = if slot == 0 {
+            "Host".to_string()
+        } else {
+            format!("P{}", slot - 1)
+        };
+        let model = app
+            .seat_models
+            .get(slot)
+            .cloned()
+            .unwrap_or_else(|| app.cfg.model.clone());
+        let known = app.cfg.available_models.iter().any(|m| m == &model);
+        let mark = if app.setup_row == row { "▶ " } else { "  " };
+        let mut spans = vec![Span::styled(
+            format!("{mark}{who:<5} "),
+            if app.setup_row == row { focused } else { Style::default() },
+        )];
+        // Role column: Host runs the game; players show their previewed character.
+        let (role_text, role_st) = if slot == 0 {
+            ("Storyteller".to_string(), dim)
+        } else if let Some(a) = app.setup_roles.get(slot - 1) {
+            (role_label(a), role_style(a.true_character))
+        } else {
+            ("—".to_string(), dim)
+        };
+        spans.push(Span::styled(format!("{role_text:<26}"), role_st));
+        spans.push(Span::styled(
+            model.clone(),
+            if app.setup_row == row {
+                focused
+            } else {
+                Style::default().fg(actor_color(slot == 0, slot.checked_sub(1).map(|s| s as u8)))
+            },
+        ));
+        if !known && !app.cfg.available_models.is_empty() {
+            spans.push(Span::styled("  (not in `grok models`)", dim));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  Available models: {}",
+            if app.cfg.available_models.is_empty() {
+                "(could not read `grok models`)".to_string()
+            } else {
+                app.cfg.available_models.join(" · ")
+            }
+        ),
+        dim,
+    )));
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(format!("  Grok binary: {}", app.cfg.grok_bin.display())));
+    lines.push(Line::raw(format!("  Agent MCP:   {}  ({mcp_note})", mcp.display())));
+    lines.push(Line::raw(format!("  Work root:   {}", app.cfg.work_root.display())));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "  Controls:  ↑/↓ focus row · ←/→ change (count / model) · a model→all · r reroll roles",
+        dim,
+    )));
+    lines.push(Line::from(Span::styled(
+        "             Enter create game + spawn agents · q quit",
+        dim,
+    )));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "  Each agent workdir gets .grok/config.toml → botc-agent-mcp (token-scoped)",
+        dim,
+    )));
+    lines.push(Line::from(Span::styled(
+        "  → Unix socket → shared in-process engine. Build first: cargo build --bins",
+        dim,
+    )));
+
+    let p = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("setup"))
         .wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
 
-fn draw_monitor(f: &mut Frame, area: Rect, app: &App) {
+fn draw_monitor(f: &mut Frame, area: Rect, app: &mut App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(26),
-            Constraint::Percentage(34),
+            Constraint::Percentage(22),
+            Constraint::Percentage(38),
             Constraint::Percentage(40),
         ])
         .split(area);
 
+    // Mouse hit targets (click agents / click-or-scroll stream).
+    app.hit_agents = cols[0];
+    app.hit_stream = cols[2];
+
+    // Agents list with a live status glyph: ● running (green) / ○ idle (grey).
     let items: Vec<ListItem> = if let Some(pool) = app.agents.as_ref() {
         pool.agents
             .iter()
             .enumerate()
             .map(|(i, a)| {
-                let label = match a.config.role {
-                    AgentRole::Host => "HOST  Storyteller".into(),
+                let (label, seat) = match a.config.role {
+                    AgentRole::Host => ("Host".to_string(), None),
                     AgentRole::Player { seat } => {
-                        format!("SEAT{} {}", seat.0, a.config.display_name)
+                        (format!("P{} {}", seat.0, a.config.display_name), Some(seat.0))
                     }
                 };
                 let running = *a.running.lock().unwrap();
-                let mark = if i == app.selected_agent { "▶" } else { " " };
-                let style = if i == app.selected_agent {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
+                let (glyph, gstyle) = if running {
+                    ("●", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
                 } else {
-                    Style::default()
+                    ("○", Style::default().fg(Color::DarkGray))
                 };
-                ListItem::new(format!(
-                    "{mark} {label} {}",
-                    if running { "…run" } else { "idle" }
-                ))
-                .style(style)
+                let selected = i == app.selected_agent;
+                let label_style = if selected {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(actor_color(seat.is_none(), seat))
+                };
+                let mark = if selected { "▶ " } else { "  " };
+                ListItem::new(Line::from(vec![
+                    Span::styled(glyph, gstyle),
+                    Span::raw(" "),
+                    Span::styled(mark, label_style),
+                    Span::styled(label, label_style),
+                    // Per-agent model (they can differ now) — dimmed, clipped.
+                    Span::styled(
+                        format!(
+                            " · {}",
+                            crate::harness::action_log::clip_chars(&a.config.model, 14)
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
             })
             .collect()
     } else {
         vec![ListItem::new("no agents")]
     };
-    let list =
-        List::new(items).block(Block::default().borders(Borders::ALL).title("agents (Tab)"));
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("agents · ●=running"),
+    );
     f.render_widget(list, cols[0]);
 
-    let host_p = Paragraph::new(app.snapshot_host())
-        .block(Block::default().borders(Borders::ALL).title("grimoire (host)"))
-        .wrap(Wrap { trim: false });
-    f.render_widget(host_p, cols[1]);
+    // Center: action feed by default, host grimoire on `g`.
+    if app.show_grimoire {
+        let host_p = Paragraph::new(app.snapshot_host())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("grimoire (host) · g=feed"),
+            )
+            .wrap(Wrap { trim: false });
+        f.render_widget(host_p, cols[1]);
+        // Feed not visible: kill its click/scroll targets.
+        app.hit_feed = Rect::default();
+        app.feed_rows.clear();
+    } else {
+        draw_action_feed(f, cols[1], app);
+    }
 
     let agent_title = app
         .agents
         .as_ref()
         .and_then(|p| p.agents.get(app.selected_agent))
         .map(|a| match a.config.role {
-            AgentRole::Host => "stream: Storyteller".into(),
-            AgentRole::Player { seat } => format!("stream: seat{}", seat.0),
+            AgentRole::Host => format!("stream: Storyteller [{}]", a.config.model),
+            AgentRole::Player { seat } => format!("stream: seat{} [{}]", seat.0, a.config.model),
         })
         .unwrap_or_else(|| "stream".into());
 
     // #45/#53: tail-anchor in *wrapped visual rows* (Paragraph::scroll unit), not
     // logical lines — long Grok prose wraps in the ~40% stream column constantly.
-    let log_text = app.agent_log_text();
+    let log_lines = app.agent_log_lines();
     let inner_w = cols[2].width.saturating_sub(2);
     let view_h = cols[2].height.saturating_sub(2) as usize;
-    let row_count = stream_wrapped_row_count(&log_text, inner_w);
+    let para = Paragraph::new(log_lines).wrap(Wrap { trim: false });
+    // Wrapped-row count for the exact rendered width (tail-anchor scroll, #53).
+    let row_count = if inner_w == 0 { 0 } else { para.line_count(inner_w) };
     // scroll_from_bottom=0 → show the end; larger → look further up (row units).
     let scroll_y = stream_scroll_y(row_count, view_h, app.scroll_from_bottom);
     let scroll_y_u16 = u16::try_from(scroll_y).unwrap_or(u16::MAX);
@@ -664,15 +1803,86 @@ fn draw_monitor(f: &mut Frame, area: Rect, app: &App) {
     } else {
         "·scroll"
     };
-    let log_p = Paragraph::new(log_text)
+    let think_mark = if app.selected_thinking_expanded() {
+        "·think▸"
+    } else {
+        "·think▾"
+    };
+    let log_p = para
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("{agent_title} {tail_mark}")),
+            Block::default().borders(Borders::ALL).title(format!(
+                "{agent_title} {tail_mark} {think_mark}  click·h  wheel·scroll"
+            )),
         )
-        .wrap(Wrap { trim: false })
         .scroll((scroll_y_u16, 0));
     f.render_widget(log_p, cols[2]);
+}
+
+/// Format agent log lines for the stream pane.
+///
+/// When `expand_think` is false (default), consecutive `[think] …` blocks collapse
+/// to a one-line summary so text / tool / error / turn-end lines (game actions)
+/// stay visible while tabbing agents. Press `h` to expand.
+/// Colour a stream line by kind — no in-text tags. Errors show red.
+fn styled_log_line(e: &LogLine) -> Line<'static> {
+    let style = match e.kind {
+        LineKind::Text => Style::default(),
+        LineKind::Thought => Style::default().fg(Color::DarkGray),
+        LineKind::Stderr => Style::default().fg(Color::Yellow),
+        LineKind::System => {
+            if e.text.to_lowercase().contains("error") {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::Cyan)
+            }
+        }
+    };
+    Line::from(Span::styled(e.text.clone(), style))
+}
+
+/// A collapsed-thinking summary line standing in for a run of hidden thought.
+fn think_summary(n: usize, preview: &str) -> Line<'static> {
+    let snip = if preview.trim().is_empty() {
+        String::new()
+    } else {
+        let s: String = preview.trim().chars().take(48).collect();
+        let ell = if preview.trim().chars().count() > 48 { "…" } else { "" };
+        format!(" “{s}{ell}”")
+    };
+    Line::from(Span::styled(
+        format!("· thinking… {n} line(s){snip}  (h/click = show)"),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    ))
+}
+
+/// Turn the kinded log into styled display lines. When `expand` is false, runs of
+/// `Thought` lines collapse to a one-line summary (default); otherwise they show
+/// dimmed. Everything else streams verbatim, coloured by kind.
+pub fn stream_lines(entries: &[LogLine], expand: bool) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut think_n = 0usize;
+    let mut preview = String::new();
+    for e in entries {
+        if e.kind == LineKind::Thought && !expand {
+            think_n += 1;
+            if preview.is_empty() {
+                preview = e.text.clone();
+            }
+            continue;
+        }
+        if think_n > 0 {
+            out.push(think_summary(think_n, &preview));
+            think_n = 0;
+            preview.clear();
+        }
+        out.push(styled_log_line(e));
+    }
+    if think_n > 0 {
+        out.push(think_summary(think_n, &preview));
+    }
+    out
 }
 
 /// Wrapped visual row count at `inner_w` — same unit as `Paragraph::scroll` (#53).
@@ -701,12 +1911,83 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
+    fn point_in_rect_hit_test() {
+        let r = Rect {
+            x: 10,
+            y: 5,
+            width: 20,
+            height: 8,
+        };
+        assert!(point_in_rect(r, 10, 5));
+        assert!(point_in_rect(r, 29, 12));
+        assert!(!point_in_rect(r, 9, 5));
+        assert!(!point_in_rect(r, 30, 5));
+        assert!(!point_in_rect(r, 10, 13));
+    }
+
+    #[test]
     fn stream_scroll_defaults_to_tail() {
         // 50 rows, 10-row pane, scroll_from_bottom=0 → scroll so last 10 show.
         assert_eq!(stream_scroll_y(50, 10, 0), 40);
         assert_eq!(stream_scroll_y(5, 10, 0), 0); // fits entirely
         assert_eq!(stream_scroll_y(50, 10, 5), 35); // look 5 rows up from tail
         assert_eq!(stream_scroll_y(50, 10, 999), 0); // clamped to top
+    }
+
+    fn lk(kind: LineKind, text: &str) -> LogLine {
+        LogLine {
+            kind,
+            text: text.into(),
+            closed: true,
+        }
+    }
+    fn line_text(l: &Line) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn stream_collapses_think_by_default() {
+        let entries = vec![
+            lk(LineKind::Thought, "I should poison someone"),
+            lk(LineKind::Thought, "maybe seat 2"),
+            lk(LineKind::Text, "Calling night_action on seat 2"),
+            lk(LineKind::System, "— turn end —"),
+        ];
+        let texts: Vec<String> = stream_lines(&entries, false).iter().map(line_text).collect();
+        assert_eq!(
+            texts.iter().filter(|t| t.contains("thinking…")).count(),
+            1,
+            "consecutive thinks must merge to one summary: {texts:?}"
+        );
+        assert!(texts.iter().any(|t| t.contains("2 line")));
+        assert!(
+            !texts.iter().any(|t| t.contains("maybe seat 2")),
+            "collapsed must not dump think bodies: {texts:?}"
+        );
+        assert!(texts.iter().any(|t| t.contains("Calling night_action on seat 2")));
+        assert!(texts.iter().any(|t| t.contains("turn end")));
+
+        let etexts: Vec<String> = stream_lines(&entries, true).iter().map(line_text).collect();
+        assert!(etexts.iter().any(|t| t.contains("I should poison someone")));
+        assert!(etexts.iter().any(|t| t.contains("maybe seat 2")));
+        // No in-text tags — colour, not text markers.
+        assert!(!etexts.iter().any(|t| t.contains("[think]")));
+    }
+
+    #[test]
+    fn stream_interleaves_think_and_action() {
+        let entries = vec![
+            lk(LineKind::Thought, "first"),
+            lk(LineKind::Text, "action A"),
+            lk(LineKind::Thought, "second"),
+            lk(LineKind::Text, "action B"),
+        ];
+        let texts: Vec<String> = stream_lines(&entries, false).iter().map(line_text).collect();
+        assert_eq!(texts.len(), 4, "got {texts:?}");
+        assert!(texts[0].contains("thinking… 1 line"));
+        assert_eq!(texts[1], "action A");
+        assert!(texts[2].contains("thinking… 1 line"));
+        assert_eq!(texts[3], "action B");
     }
 
     #[test]
@@ -806,5 +2087,75 @@ mod tests {
             !screen2.contains("MARKER"),
             "logical-only scroll should still clip MARKER (proves wrap matters); screen:\n{screen2}"
         );
+    }
+
+    #[test]
+    fn previewed_assignment_replays_as_fixed_assignments() {
+        // The parity contract behind reroll_roles() → launch(): a role assignment
+        // drawn off a throwaway game must replay verbatim as fixed `assignments`, so
+        // the launched game shows exactly the roles the operator picked models for.
+        let names: Vec<String> = (0..7).map(|i| format!("P{i}")).collect();
+        let created = Game::create(names.clone(), 42).unwrap();
+        let mut preview = created.game;
+        preview
+            .start_game(&created.host_token, StartOpts::default())
+            .unwrap();
+        let roles: Vec<RoleAssignment> = preview
+            .seats
+            .iter()
+            .map(|s| RoleAssignment {
+                seat: s.id,
+                true_character: s.true_character.unwrap(),
+                believed_character: s.believed_character,
+            })
+            .collect();
+
+        // A legal Trouble Brewing bag: exactly one Imp, and a face iff Drunk.
+        assert_eq!(
+            roles
+                .iter()
+                .filter(|a| a.true_character == Character::Imp)
+                .count(),
+            1
+        );
+        for a in &roles {
+            assert_eq!(
+                a.believed_character.is_some(),
+                a.true_character == Character::Drunk
+            );
+        }
+
+        // Different seed — proves the launched roles come from the fixed assignments,
+        // not a fresh random bag.
+        let launched = Game::create(names, 999).unwrap();
+        let mut g = launched.game;
+        g.start_game(
+            &launched.host_token,
+            StartOpts {
+                assignments: Some(roles.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (s, a) in g.seats.iter().zip(&roles) {
+            assert_eq!(s.true_character, Some(a.true_character));
+            assert_eq!(s.believed_character, a.believed_character);
+        }
+    }
+
+    #[test]
+    fn role_label_and_style_surface_team_and_drunk_face() {
+        let imp = RoleAssignment::normal(SeatId(0), Character::Imp);
+        assert_eq!(role_label(&imp), "Imp");
+        assert_eq!(role_style(Character::Imp).fg, Some(Color::Red));
+
+        // Drunk shows both its true role and the Townsfolk it believes it is.
+        let drunk = RoleAssignment::drunk(SeatId(1), Character::Chef).unwrap();
+        assert_eq!(role_label(&drunk), "Drunk (as Chef)");
+        // …but is coloured as the Outsider it truly is, not as its face.
+        assert_eq!(role_style(drunk.true_character).fg, Some(Color::Yellow));
+
+        assert_eq!(role_style(Character::Empath).fg, Some(Color::Green));
+        assert_eq!(role_style(Character::Poisoner).fg, Some(Color::Red));
     }
 }
