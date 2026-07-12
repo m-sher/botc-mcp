@@ -885,9 +885,13 @@ fn stage_key_of(g: &Game) -> String {
 /// Readable one-line rendering of a public event (for agent prompts, not Debug).
 fn fmt_public_event(e: &crate::comms::PublicEvent) -> String {
     use crate::comms::PublicEvent::*;
+    // Each event MUST be a single line: the snapshot lists one event per line, so a
+    // message with embedded newlines would blur where one speaker ends and the next
+    // begins — which makes agents think a message was "cut off" or reorder events.
+    let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     match e {
-        Chat { seat, text, .. } => format!("P{}: {text}", seat.0),
-        StorytellerAnnounce { text } => format!("Storyteller: {text}"),
+        Chat { seat, text, .. } => format!("P{}: {}", seat.0, one_line(text)),
+        StorytellerAnnounce { text } => format!("Storyteller: {}", one_line(text)),
         Nominated { by, target } => format!("P{} nominated P{}", by.0, target.0),
         VoteCast {
             seat,
