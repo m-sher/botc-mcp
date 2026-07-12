@@ -41,8 +41,19 @@ state. Never wait or poll for other players inside a turn.
 2. Read the rules for your face role if needed.
 3. Talk publicly with `say` **during the day** when woken to speak; at night, only submit your
    `night_action` when woken for it.
-4. Bluff freely in chat; never claim tool access you don't have.
-5. Do not try to become host or use host tools.
+4. Never claim tool access you don't have. Do not try to become host or use host tools.
+
+## Table talk (important)
+Nothing forces you to name your character. This is an information game — **what** you reveal and
+**when** matters as much as what you know.
+- Announcing a role that sounds hard to kill (Soldier, Mayor, etc.) can read as self-protection —
+  evil players want to survive, so a convenient “don't kill me” claim often draws suspicion.
+- Announcing a powerful good role can put a night-kill target on your back.
+- Holding information can look evasive; dumping everything early can hand evil a map of who to
+  kill or who to frame. Soft claims, partial reads, and silence are all legal tools.
+- Before you `say` anything, ask what others will *do* with it: who they nominate, who the demon
+  kills, what story they build. Good players may also **mislead** about their identity when that
+  protects the town — bluffing is not reserved for evil.
 
 Start now: read your private role and the rules for it, and plan how you'll play. This is a
 setup-only turn — the first night is starting, so there is no talking. If your character acts
@@ -252,7 +263,13 @@ pub fn player_task_tick(
                 "It is **day — open discussion**, and it is **your turn to speak** (talk round \
                  {n}{last}). Players speak one at a time around the table; everything said so far \
                  is in the snapshot below. When the table is done talking, the day moves to \
-                 nominations and an execution vote.",
+                 nominations and an execution vote.\n\n\
+                 You are **not** required to claim a role. Choose what (if anything) to reveal with \
+                 timing in mind: a “safe” claim can look like someone dodging death; a strong town \
+                 claim can paint a target; holding out can look shady if the table needs your read. \
+                 Weigh what others will do with your words — nominations, night kills, who they trust. \
+                 Soft claims, partial info, redirects, and even a deliberate misclaim are all on the \
+                 table when they serve your win condition.",
                 n = round + 1,
                 last = if *last_round {
                     ", the FINAL talk round — after this the day moves on"
@@ -261,8 +278,9 @@ pub fn player_task_tick(
                 }
             ),
             "- `say` `{\"game_id\": {gid}, \"text\": \"<what you tell the table>\"}` — **required this \
-             turn**: share a read, claim or dispute a role, answer questions, react. Say something \
-             concrete; don't just observe.\n\
+             turn**: advance the social game (press a contradiction, float a theory, answer a question, \
+             drop a careful read, or deliberately stay vague). Be concrete about *someone or something* \
+             — not a content-free filler line — but do **not** treat a full role claim as mandatory.\n\
              - `nominate` `{\"game_id\": {gid}, \"target\": <seat number>}` — optional: if you already \
              want someone executed, this immediately opens the vote on them (once per day)."
                 .to_string(),
@@ -290,16 +308,17 @@ pub fn player_task_tick(
             ),
             if *can_pass {
                 "- `vote` `{\"game_id\": {gid}, \"nominee\": <seat number>, \"support\": true|false}` — \
-                 cast your vote. You are dead: voting YES spends your single ghost vote for the rest \
-                 of the game.\n\
+                 cast your **one** vote on this nomination. You are dead: voting YES spends your \
+                 single ghost vote for the rest of the game.\n\
                  - OR `pass_vote` `{\"game_id\": {gid}}` — abstain WITHOUT spending your ghost vote \
                  (usually right unless this execution really matters to you).\n\
-                 Do exactly one. You may `say` one short line first to explain your vote."
+                 Do exactly one — a second vote/pass on the **same** nomination is rejected. You may \
+                 `say` one short line first to explain your vote."
                     .to_string()
             } else {
                 "- `vote` `{\"game_id\": {gid}, \"nominee\": <seat number>, \"support\": true|false}` — \
-                 cast your vote now. You are alive, so you must vote yes or no — `pass_vote` is for \
-                 dead players only and will be rejected.\n\
+                 cast your **one** vote now (yes or no). A second vote on this nomination is rejected. \
+                 You are alive, so you must vote — `pass_vote` is for dead players only.\n\
                  You may `say` one short line first to explain your vote."
                     .to_string()
             },
@@ -391,6 +410,15 @@ mod tests {
         );
         assert_guardrails(&talk);
         assert!(talk.contains("FINAL talk round"));
+        // Discussion should not pressure a mandatory role claim.
+        assert!(
+            talk.to_lowercase().contains("not") && talk.to_lowercase().contains("required"),
+            "discuss should discourage mandatory claims: {talk}"
+        );
+        assert!(
+            !talk.contains("claim or dispute a role"),
+            "old claim-push wording should be gone: {talk}"
+        );
 
         let wake = player_task_tick(
             "P3",
@@ -415,5 +443,13 @@ mod tests {
         let from_noms = host_task_tick(7, &HostTask::EndDay { in_discussion: false }, "s", "h");
         assert!(from_noms.contains("end_nominations"));
         assert!(!from_noms.contains("Call `open_nominations`"));
+    }
+
+    #[test]
+    fn player_kickoff_covers_info_hygiene() {
+        let p = player_kickoff("P0", SeatId(0), 1, 5);
+        assert!(p.contains("## Table talk"), "{p}");
+        assert!(p.to_lowercase().contains("nothing forces"), "{p}");
+        assert!(p.to_lowercase().contains("mislead") || p.to_lowercase().contains("bluff"), "{p}");
     }
 }

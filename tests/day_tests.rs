@@ -252,6 +252,60 @@ fn butler_yes_requires_master_yes() {
 }
 
 #[test]
+fn cannot_vote_twice_on_same_nomination() {
+    let lobby = Game::create(names(5), 16).unwrap();
+    let host = lobby.host_token.clone();
+    let tokens = lobby.player_tokens.clone();
+    let mut g = lobby.game;
+    g.start_game(
+        &host,
+        StartOpts {
+            assignments: Some(vec![
+                RoleAssignment::normal(SeatId(0), Character::Soldier),
+                RoleAssignment::normal(SeatId(1), Character::Chef),
+                RoleAssignment::normal(SeatId(2), Character::Empath),
+                RoleAssignment::normal(SeatId(3), Character::Poisoner),
+                RoleAssignment::normal(SeatId(4), Character::Imp),
+            ]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    to_day1(&mut g, &host);
+    open_nominations(&mut g, &host).unwrap();
+    nominate(&mut g, &tokens[0], SeatId(3)).unwrap();
+
+    vote(&mut g, &tokens[1], SeatId(3), true).unwrap();
+    let err = vote(&mut g, &tokens[1], SeatId(3), false).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("already voted") || msg.contains("one vote"),
+        "expected double-vote rejection, got {err:?}"
+    );
+    // First ballot still the only one recorded (cannot flip yes→no).
+    let open = g.current_nomination.as_ref().expect("vote still open");
+    let mine: Vec<_> = open
+        .votes
+        .iter()
+        .filter(|(s, _)| *s == SeatId(1))
+        .collect();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].1, true);
+
+    // A different nomination later in the day still allows a new ballot.
+    close_vote(&mut g, &host).unwrap();
+    nominate(&mut g, &tokens[1], SeatId(4)).unwrap();
+    vote(&mut g, &tokens[1], SeatId(4), false).unwrap();
+    assert!(g
+        .current_nomination
+        .as_ref()
+        .unwrap()
+        .votes
+        .iter()
+        .any(|(s, y)| *s == SeatId(1) && !*y));
+}
+
+#[test]
 fn host_close_vote_without_all_living() {
     let lobby = Game::create(names(5), 15).unwrap();
     let host = lobby.host_token.clone();

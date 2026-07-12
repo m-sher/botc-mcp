@@ -38,7 +38,8 @@ pub struct ActionEntry {
     pub secs: u64,
     pub actor: ActorLabel,
     pub tool: String,
-    /// Short human summary of the salient args (e.g. `→P1 YES`).
+    /// Human summary of the salient args (e.g. `→P1 YES`, or the full `say` text).
+    /// May be long; the TUI truncates when collapsed and shows the full string when expanded.
     pub summary: String,
     pub kind: ActionKind,
     pub ok: bool,
@@ -196,24 +197,26 @@ fn seatp(v: Option<&Value>) -> Option<String> {
     v.and_then(|x| x.as_u64()).map(|n| format!("P{n}"))
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    let s = s.trim().replace('\n', " ");
-    if s.chars().count() <= max {
-        s
-    } else {
-        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{cut}…")
-    }
+/// Flatten whitespace for a summary line (newlines → space). Full length is kept:
+/// `say` / `st_announce` are never clipped in the TUI (they wrap instead).
+fn flatten_text(s: &str) -> String {
+    s.trim()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-/// Short, readable summary of the salient args for a tool call.
+/// Readable summary of the salient args for a tool call.
+///
+/// For `say` / `st_announce` this is the **full** spoken text (quoted) — never
+/// truncated here; the feed always shows it complete (wrapping if needed).
 pub fn summarize(tool: &str, args: &Value) -> String {
     let payload = args.get("payload").unwrap_or(args);
     match tool {
         "say" | "st_announce" => args
             .get("text")
             .and_then(|v| v.as_str())
-            .map(|t| format!("“{}”", truncate(t, 44)))
+            .map(|t| format!("“{}”", flatten_text(t)))
             .unwrap_or_default(),
         "nominate" => seatp(args.get("target"))
             .map(|s| format!("→{s}"))
@@ -283,6 +286,11 @@ mod tests {
             "P4"
         );
         assert_eq!(summarize("say", &json!({"text": "hi"})), "“hi”");
+        // Full text is stored (TUI truncates only when the feed row is collapsed).
+        let long = "x".repeat(80);
+        let s = summarize("say", &json!({"text": long.clone()}));
+        assert!(s.contains(&long), "summary must keep full say text: {s}");
+        assert!(!s.contains('…'), "summary itself must not truncate: {s}");
         assert_eq!(summarize("get_public_state", &json!({})), "");
     }
 
