@@ -115,6 +115,12 @@ struct App {
     feed_scroll: usize,
     /// Which actions the feed shows (all vs game-only).
     feed_filter: FeedFilter,
+    /// Stable id for this TUI process (stamped on every results-log line).
+    run_id: String,
+    /// Public-log cursor already drained into the ranking results log.
+    results_public_cursor: u64,
+    /// True after `game_end` or `game_abort` has been written for the current game.
+    results_terminal_logged: bool,
 }
 
 impl App {
@@ -179,6 +185,9 @@ impl App {
             last_targets: Vec::new(),
             feed_scroll: 0,
             feed_filter: FeedFilter::All,
+            run_id: uuid::Uuid::new_v4().to_string(),
+            results_public_cursor: 0,
+            results_terminal_logged: false,
         };
         // Draw an initial role assignment so the setup screen shows roles immediately.
         app.reroll_roles();
@@ -591,30 +600,92 @@ impl App {
         }
 
         match AgentPool::prepare(&self.cfg, configs) {
-            Ok(mut pool) => match pool.kickoff_all(self.player_count) {
-                Ok(spawned) => {
-                    self.status = format!(
-                        "Game {game_id} · kicked {spawned}/{} · Space=tick · click stream=think · wheel=scroll · q=quit",
-                        self.player_count + 1
-                    );
-                    self.auto_tick = true;
-                    self.last_tick = Instant::now();
-                    self.focus = Focus::Monitor;
-                    self.scroll_from_bottom = 0;
-                    self.agents = Some(pool);
-                    crate::dlog!("LAUNCH kickoff spawned {spawned}/{}", self.player_count + 1);
+            Ok(mut pool) => {
+                // Ranking corpus: log the full seat↔model↔role table once at start.
+                {
+                    let st = self.store.lock().unwrap();
+                    if let Some(g) = st.get(GameId(game_id)) {
+                        let agent_cfgs: Vec<_> =
+                            pool.agents.iter().map(|a| a.config.clone()).collect();
+                        crate::harness::results_log::log_game_start(
+                            &self.run_id,
+                            game_id,
+                            g,
+                            &agent_cfgs,
+                            seed,
+                            &self.cfg.st_choice_mode,
+                        );
+                        // Catch any public events already emitted during start_game.
+                        self.results_public_cursor =
+                            crate::harness::results_log::drain_public_events(
+                                &self.run_id,
+                                game_id,
+                                g,
+                                &agent_cfgs,
+                                0,
+                            );
+                    }
                 }
-                Err(e) => {
-                    // Partial pool still owns workdirs — keep it so shutdown/stop_all cleans up.
-                    self.status = format!("kickoff: {e}");
-                    self.agents = Some(pool);
-                    crate::dlog!("LAUNCH kickoff ERROR {e}");
+                self.results_terminal_logged = false;
+                match pool.kickoff_all(self.player_count) {
+                    Ok(spawned) => {
+                        self.status = format!(
+                            "Game {game_id} · kicked {spawned}/{} · Space=tick · click stream=think · wheel=scroll · q=quit",
+                            self.player_count + 1
+                        );
+                        self.auto_tick = true;
+                        self.last_tick = Instant::now();
+                        self.focus = Focus::Monitor;
+                        self.scroll_from_bottom = 0;
+                        self.agents = Some(pool);
+                        crate::dlog!("LAUNCH kickoff spawned {spawned}/{}", self.player_count + 1);
+                    }
+                    Err(e) => {
+                        // Partial pool still owns workdirs — keep it so shutdown/stop_all cleans up.
+                        self.status = format!("kickoff: {e}");
+                        self.agents = Some(pool);
+                        crate::dlog!("LAUNCH kickoff ERROR {e}");
+                    }
                 }
-            },
+            }
             Err(e) => {
                 self.status = format!("prepare: {e}");
                 // #55/#58: socket + partial work_root without agents.
                 self.abort_partial_launch();
+            }
+        }
+    }
+
+    /// Agent configs for results logging (empty if no pool).
+    fn agent_configs_for_results(&self) -> Vec<AgentConfig> {
+        self.agents
+            .as_ref()
+            .map(|p| p.agents.iter().map(|a| a.config.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Drain ranking-relevant public events; if the game just ended, write `game_end` once.
+    fn results_poll(&mut self) {
+        let Some(gid) = self.game_id else {
+            return;
+        };
+        let agent_cfgs = self.agent_configs_for_results();
+        let st = self.store.lock().unwrap();
+        let Some(g) = st.get(GameId(gid)) else {
+            return;
+        };
+        self.results_public_cursor = crate::harness::results_log::drain_public_events(
+            &self.run_id,
+            gid,
+            g,
+            &agent_cfgs,
+            self.results_public_cursor,
+        );
+        if !self.results_terminal_logged {
+            if matches!(g.phase, Phase::Ended { .. }) {
+                crate::harness::results_log::log_game_end(&self.run_id, gid, g, &agent_cfgs);
+                self.results_terminal_logged = true;
+                crate::dlog!("RESULTS game_end logged run_id={}", self.run_id);
             }
         }
     }
@@ -690,6 +761,9 @@ impl App {
             state_dbg,
             plan_dbg.join(", ")
         );
+
+        // Always drain ranking events (deaths / noms) even on the end tick.
+        self.results_poll();
 
         if ended {
             self.auto_tick = false;
@@ -907,6 +981,53 @@ impl App {
     }
 
     fn shutdown(&mut self) {
+        // Ranking: if the game never reached Ended, record an abort before we
+        // tear down the store/pool (so we still have models + grimoire).
+        if let Some(gid) = self.game_id {
+            if !self.results_terminal_logged {
+                let agent_cfgs = self.agent_configs_for_results();
+                let st = self.store.lock().unwrap();
+                let g = st.get(GameId(gid));
+                // Final drain of any unlogged public events.
+                if let Some(game) = g {
+                    self.results_public_cursor =
+                        crate::harness::results_log::drain_public_events(
+                            &self.run_id,
+                            gid,
+                            game,
+                            &agent_cfgs,
+                            self.results_public_cursor,
+                        );
+                    if matches!(game.phase, Phase::Ended { .. }) {
+                        crate::harness::results_log::log_game_end(
+                            &self.run_id,
+                            gid,
+                            game,
+                            &agent_cfgs,
+                        );
+                    } else {
+                        crate::harness::results_log::log_game_abort(
+                            &self.run_id,
+                            gid,
+                            Some(game),
+                            &agent_cfgs,
+                            "tui_quit",
+                        );
+                    }
+                } else {
+                    crate::harness::results_log::log_game_abort(
+                        &self.run_id,
+                        gid,
+                        None,
+                        &agent_cfgs,
+                        "tui_quit",
+                    );
+                }
+                self.results_terminal_logged = true;
+                crate::dlog!("RESULTS terminal event logged on shutdown run_id={}", self.run_id);
+            }
+        }
+
         // Stop agents first (kills children + removes work root with tokens).
         if let Some(mut pool) = self.agents.take() {
             pool.stop_all();
@@ -1327,15 +1448,21 @@ fn install_panic_hook() {
 pub fn run_tui() -> io::Result<()> {
     let log_path = crate::harness::debug_log::log_path();
     crate::harness::debug_log::init(&log_path);
+    let results_path = crate::harness::results_log::init();
     install_panic_hook();
     let mut guard = TerminalGuard::enter()?;
     let mut app = App::new();
-    app.status = format!("{}  · debug log: {log_path}", app.status);
+    app.status = format!(
+        "{}  · debug: {log_path}  · results: {}",
+        app.status,
+        results_path.display()
+    );
     crate::dlog!(
-        "run_tui: grok={} model={} agent_mcp={}",
+        "run_tui: grok={} model={} agent_mcp={} results={}",
         app.cfg.grok_bin.display(),
         app.cfg.model,
-        app.cfg.agent_mcp_bin.display()
+        app.cfg.agent_mcp_bin.display(),
+        results_path.display()
     );
 
     let result = loop {
@@ -1347,6 +1474,10 @@ pub fn run_tui() -> io::Result<()> {
         // idle (a running agent is never skipped; there is no fixed timer).
         if app.auto_tick && app.agents.is_some() && !app.any_agent_running() {
             app.do_tick();
+        } else if app.agents.is_some() && app.game_id.is_some() && !app.any_agent_running() {
+            // Between turns (manual mode / idle), still drain deaths & noms into
+            // the ranking log without spawning agents.
+            app.results_poll();
         }
         // Drain the whole queue so scroll floods don't lag behind real keys.
         while event::poll(Duration::from_millis(0))? {

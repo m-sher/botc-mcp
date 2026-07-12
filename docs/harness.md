@@ -140,6 +140,22 @@ The one-time **kickoff** still fans out to every agent (orientation only — the
 no talking); ongoing play is one turn at a time, so every speaker sees everything said before
 them and votes are cast in clockwise order like the tabletop game.
 
+## Results log (ranking corpus)
+
+Alongside the debug log, the TUI **appends** ranking-relevant outcomes to a JSONL file
+(default `botc-results.jsonl` at the repo root, override with `BOTC_RESULTS_LOG`). One JSON object per
+line, schema field `v` (currently `1`). Survives quit; not under the deleted work root.
+
+| `event` | When | Useful for |
+| --- | --- | --- |
+| `game_start` | After launch | Per-seat `model`, `true_character`, `team`, seed, host model |
+| `death` | Exec / night / day kill | Survival metrics (`cause`: `executed` \| `night` \| `day`) |
+| `nomination` | Someone is put on the block | Social targeting later |
+| `game_end` | Engine `Ended` | `winner`, `reason`, per-seat `won` |
+| `game_abort` | Quit before end | Filter incomplete runs |
+
+Chat and full tool traces are **not** in this file (see the debug log / action feed for those).
+
 ## Debug log
 
 The TUI writes a **verbose, timestamped** trace to a file (the full-screen UI can't use

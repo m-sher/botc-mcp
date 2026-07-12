@@ -12,6 +12,7 @@ pub mod agents;
 pub mod debug_log;
 pub mod prompts;
 pub mod proxy_acl;
+pub mod results_log;
 pub mod scheduler;
 pub mod socket;
 pub mod tui;
