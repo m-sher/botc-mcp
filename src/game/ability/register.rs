@@ -4,17 +4,17 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 
 use crate::game::ids::SeatId;
-use crate::game::state::Game;
 use crate::game::st_policy::RegistrationMode;
+use crate::game::state::Game;
 use crate::roles::{
     all_demons, all_minions, all_outsiders, all_townsfolk, Character, CharacterType, Team,
 };
 
 /// Whether this detection takes the Spy/Recluse misregister/hide branch.
 ///
-/// - [`RegistrationMode::Random`]: p=0.5
-/// - [`RegistrationMode::AlwaysTrue`]: never
-/// - [`RegistrationMode::AlwaysMisreg`]: always
+/// - [`RegistrationMode::Random`][]: p=0.5
+/// - [`RegistrationMode::AlwaysTrue`][]: never
+/// - [`RegistrationMode::AlwaysMisreg`][]: always
 fn misreg_branch(game: &Game, event_label: &str) -> bool {
     match game.registration_mode {
         RegistrationMode::Random => {
@@ -266,8 +266,7 @@ fn other_true_type_count(
             if acting_seat == Some(s.id) {
                 return false;
             }
-            s.true_character
-                .is_some_and(|c| c.character_type() == ty)
+            s.true_character.is_some_and(|c| c.character_type() == ty)
         })
         .count()
 }
@@ -465,7 +464,10 @@ mod tests {
                 Some(other) => panic!("Spy true minion owner should be Spy or None, got {other:?}"),
             }
         }
-        assert!(saw_some && saw_none, "Spy should flip hide ~50% as minion owner");
+        assert!(
+            saw_some && saw_none,
+            "Spy should flip hide ~50% as minion owner"
+        );
     }
 
     #[test]

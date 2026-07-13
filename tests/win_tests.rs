@@ -73,8 +73,8 @@ fn starpass_does_not_end_game_when_minion_becomes_imp() {
                 RoleAssignment::normal(SeatId(3), Character::Chef),
                 RoleAssignment::normal(SeatId(4), Character::Empath),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     while g.pending_night.is_some() || g.pending_host.is_some() {
@@ -119,8 +119,8 @@ fn imp_death_with_no_living_minion_good_wins() {
                 RoleAssignment::normal(SeatId(3), Character::Chef),
                 RoleAssignment::normal(SeatId(4), Character::Empath),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     while g.pending_night.is_some() || g.pending_host.is_some() {
@@ -162,8 +162,8 @@ fn execute_imp_good_wins() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -200,8 +200,8 @@ fn sw_converts_when_alive_before_ge_5() {
                 RoleAssignment::normal(SeatId(3), Character::ScarletWoman),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -234,8 +234,8 @@ fn sw_no_convert_at_4_alive_before() {
                 RoleAssignment::normal(SeatId(3), Character::ScarletWoman),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -273,8 +273,8 @@ fn saint_executed_evil_wins() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -309,8 +309,8 @@ fn mayor_three_no_exec_good_wins() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -324,7 +324,11 @@ fn mayor_three_no_exec_good_wins() {
     clear_all_poisons(&mut g);
     end_nominations(&mut g, &host).unwrap();
 
-    assert!(g.public_log.since(0).iter().any(|(_, e)| matches!(e, PublicEvent::NoExecution)));
+    assert!(g
+        .public_log
+        .since(0)
+        .iter()
+        .any(|(_, e)| matches!(e, PublicEvent::NoExecution)));
     assert_eq!(g.winner, Some(Winner::Good));
     assert!(matches!(
         g.phase,
@@ -351,8 +355,8 @@ fn two_living_with_imp_evil_wins() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -396,8 +400,8 @@ fn simultaneous_imp_death_and_two_alive_good_wins() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -435,8 +439,8 @@ fn slayer_hits_imp() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -482,8 +486,8 @@ fn slayer_miss_spends_and_continues() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     to_day1(&mut g, &host);

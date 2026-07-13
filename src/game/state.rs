@@ -145,7 +145,7 @@ impl Game {
         secret_salt: u64,
     ) -> Result<CreateGameResult, GameError> {
         let n = player_names.len();
-        if n < MIN_PLAYERS || n > MAX_PLAYERS {
+        if !(MIN_PLAYERS..=MAX_PLAYERS).contains(&n) {
             return Err(GameError::BadRequest(
                 "player count must be between 5 and 15 inclusive",
             ));
@@ -228,9 +228,8 @@ impl Game {
     }
 
     pub fn st_announce(&mut self, text: impl Into<String>) {
-        self.public_log.push(PublicEvent::StorytellerAnnounce {
-            text: text.into(),
-        });
+        self.public_log
+            .push(PublicEvent::StorytellerAnnounce { text: text.into() });
     }
 
     /// Deliver Storyteller private info to one seat only.
@@ -273,12 +272,8 @@ impl Game {
         if let Some(faces) = opts.drunk_faces {
             apply_drunk_face_overrides(&mut assignments, &bag_set, &faces)?;
             // Auto-generated bluffs may collide with overridden faces — re-filter.
-            demon_bluffs = refilter_demon_bluffs_for_faces(
-                &self.rng,
-                &bag_set,
-                &assignments,
-                demon_bluffs,
-            );
+            demon_bluffs =
+                refilter_demon_bluffs_for_faces(&self.rng, &bag_set, &assignments, demon_bluffs);
         }
 
         if let Some(rh) = opts.red_herring {
@@ -299,10 +294,7 @@ impl Game {
     /// Assign characters and push private `YouAre` using **player-facing** identity only.
     ///
     /// Does not require host token (used by tests and as the final step of [`Self::start_game`]).
-    pub fn start_game_assign(
-        &mut self,
-        assignments: Vec<RoleAssignment>,
-    ) -> Result<(), GameError> {
+    pub fn start_game_assign(&mut self, assignments: Vec<RoleAssignment>) -> Result<(), GameError> {
         for a in &assignments {
             if a.true_character == Character::Drunk {
                 let face = a.believed_character.ok_or(GameError::IllegalAction(
@@ -439,10 +431,7 @@ impl Game {
         Ok(())
     }
 
-    pub(crate) fn apply_host_decision(
-        &mut self,
-        decision: HostDecision,
-    ) -> Result<(), GameError> {
+    pub(crate) fn apply_host_decision(&mut self, decision: HostDecision) -> Result<(), GameError> {
         let pending = self
             .pending_host
             .clone()
@@ -458,10 +447,7 @@ impl Game {
                 Ok(())
             }
             (
-                PendingHostDecision::StarpassPick {
-                    minions,
-                    dead_imp,
-                },
+                PendingHostDecision::StarpassPick { minions, dead_imp },
                 HostDecision::StarpassPick { minion },
             ) => {
                 if !minions.contains(&minion) {
@@ -474,10 +460,7 @@ impl Game {
                 self.advance_after_host_decision();
                 Ok(())
             }
-            (
-                PendingHostDecision::NightInfo { seat, .. },
-                HostDecision::NightInfo { text },
-            ) => {
+            (PendingHostDecision::NightInfo { seat, .. }, HostDecision::NightInfo { text }) => {
                 self.pending_host = None;
                 let msg = PrivateMessage::NightResult { text: text.clone() };
                 self.private_inboxes.push(seat, msg);
@@ -531,11 +514,7 @@ impl Game {
                         crate::game::night::NightActionPayload::PickOne { target }
                     }
                 });
-                crate::game::ability::resolve_night_step(
-                    self,
-                    step,
-                    night_payload.as_ref(),
-                )?;
+                crate::game::ability::resolve_night_step(self, step, night_payload.as_ref())?;
                 self.advance_after_host_decision();
                 Ok(())
             }
@@ -607,9 +586,7 @@ fn validate_red_herring_override(
         .find(|a| a.seat == rh)
         .ok_or(GameError::NoSuchSeat)?;
     if a.true_character.team() != Team::Good {
-        return Err(GameError::IllegalAction(
-            "red_herring must be a good seat",
-        ));
+        return Err(GameError::IllegalAction("red_herring must be a good seat"));
     }
     Ok(rh)
 }

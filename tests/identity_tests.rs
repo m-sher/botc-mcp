@@ -28,8 +28,8 @@ fn fixture_assigned_drunk() -> Game {
                 RoleAssignment::normal(SeatId(3), Character::Chef),
                 RoleAssignment::normal(SeatId(4), Character::Soldier),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .expect("start_game with fixed assignments");
     g
@@ -182,8 +182,8 @@ fn start_game_scripted_choice_role_pending_first_night() {
                 RoleAssignment::normal(SeatId(3), Character::Chef),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     assert!(
@@ -192,5 +192,9 @@ fn start_game_scripted_choice_role_pending_first_night() {
         g.phase
     );
     let pending = g.pending_night.as_ref().expect("pending wake required");
-    assert_eq!(pending.seat, SeatId(0), "Poisoner should be first choice wake");
+    assert_eq!(
+        pending.seat,
+        SeatId(0),
+        "Poisoner should be first choice wake"
+    );
 }

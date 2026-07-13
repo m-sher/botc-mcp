@@ -161,8 +161,18 @@ mod tests {
     #[test]
     fn private_inbox_is_per_seat() {
         let mut boxes = PrivateInboxes::default();
-        boxes.push(SeatId(0), PrivateMessage::System { text: "only-0".into() });
-        boxes.push(SeatId(1), PrivateMessage::System { text: "only-1".into() });
+        boxes.push(
+            SeatId(0),
+            PrivateMessage::System {
+                text: "only-0".into(),
+            },
+        );
+        boxes.push(
+            SeatId(1),
+            PrivateMessage::System {
+                text: "only-1".into(),
+            },
+        );
         assert_eq!(boxes.since(SeatId(0), 0).len(), 1);
         assert!(format!("{:?}", boxes.since(SeatId(0), 0)[0].1).contains("only-0"));
         assert!(!format!("{:?}", boxes.since(SeatId(1), 0)[0].1).contains("only-0"));
@@ -236,9 +246,7 @@ mod tests {
             PublicEvent::PhaseChanged {
                 summary: "Day 1 Discussion".into(),
             },
-            PublicEvent::GameEnded {
-                winner: Team::Good,
-            },
+            PublicEvent::GameEnded { winner: Team::Good },
         ];
         let mut log = PublicLog::default();
         for e in samples {
@@ -265,12 +273,7 @@ mod tests {
                 text: "Choose two players.".into(),
             },
         );
-        boxes.push(
-            SeatId(0),
-            PrivateMessage::NightResult {
-                text: "1".into(),
-            },
-        );
+        boxes.push(SeatId(0), PrivateMessage::NightResult { text: "1".into() });
         boxes.push(
             SeatId(0),
             PrivateMessage::EvilBriefing {

@@ -29,8 +29,8 @@ fn start_scripted(
         &host,
         StartOpts {
             assignments: Some(assignments),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     (g, host, tokens)
@@ -73,7 +73,9 @@ fn washerwoman_pair_excludes_acting_seat() {
     let text = msgs
         .iter()
         .find_map(|(_, m)| match m {
-            botc_mcp::comms::PrivateMessage::NightResult { text } if text.contains("Washerwoman") => {
+            botc_mcp::comms::PrivateMessage::NightResult { text }
+                if text.contains("Washerwoman") =>
+            {
                 Some(text.clone())
             }
             _ => None,
@@ -231,7 +233,10 @@ fn mayor_bounce_can_kill_minion() {
         s.poisoned = false;
     }
     g.night_cursor = 1;
-    g.phase = Phase::Night { night: 2, cursor: 1 };
+    g.phase = Phase::Night {
+        night: 2,
+        cursor: 1,
+    };
     assert_eq!(
         try_demon_kill(&mut g, SeatId(4), SeatId(0)),
         KillResult::NeedsHost
@@ -239,9 +244,7 @@ fn mayor_bounce_can_kill_minion() {
     g.host_decide(
         &host,
         HostDecision::MayorRedirect {
-            choice: MayorRedirectChoice::KillOther {
-                target: SeatId(2),
-            },
+            choice: MayorRedirectChoice::KillOther { target: SeatId(2) },
         },
     )
     .unwrap();
@@ -252,8 +255,7 @@ fn mayor_bounce_can_kill_minion() {
 /// #8 Slayer kills Recluse when registration_mode forces misreg as Demon.
 #[test]
 fn slayer_can_kill_recluse_registering_as_demon() {
-    let lobby =
-        botc_mcp::game::Game::create_with_salt(names(5), 104, 0).unwrap();
+    let lobby = botc_mcp::game::Game::create_with_salt(names(5), 104, 0).unwrap();
     let host = lobby.host_token.clone();
     let tokens = lobby.player_tokens.clone();
     let mut g = lobby.game;
@@ -328,8 +330,7 @@ fn other_night_queue_omits_prelisted_ravenkeeper() {
     g.deaths_tonight = vec![SeatId(0)];
     let q = build_other_night_queue(&g);
     assert!(
-        !q.iter()
-            .any(|s| matches!(s, NightStep::Ravenkeeper { .. })),
+        !q.iter().any(|s| matches!(s, NightStep::Ravenkeeper { .. })),
         "RK must not be pre-queued from deaths_tonight: {q:?}"
     );
 }
@@ -517,7 +518,12 @@ fn poisoned_spy_register_character_always_spy() {
         );
         assert!(register::register_evil(&g, SeatId(1), &format!("pe:{i}")));
         assert_eq!(
-            register::register_as_type_owner(&g, SeatId(1), CharacterType::Townsfolk, &format!("pt:{i}")),
+            register::register_as_type_owner(
+                &g,
+                SeatId(1),
+                CharacterType::Townsfolk,
+                &format!("pt:{i}")
+            ),
             None
         );
     }
@@ -610,9 +616,7 @@ fn ravenkeeper_resolve_excludes_own_token_from_spy() {
         resolve_night_step(
             &mut g,
             NightStep::Ravenkeeper { seat: SeatId(0) },
-            Some(&NightActionPayload::PickOne {
-                target: SeatId(1),
-            }),
+            Some(&NightActionPayload::PickOne { target: SeatId(1) }),
         )
         .unwrap();
         let msgs = g.private_inboxes.since(SeatId(0), 0);

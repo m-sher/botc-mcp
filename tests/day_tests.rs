@@ -1,13 +1,13 @@
 //! Day nominations / voting / Virgin / Butler / ghost vote (Task 10).
 
 use botc_mcp::comms::PublicEvent;
+use botc_mcp::game::NightActionPayload;
 use botc_mcp::game::{
     meets_threshold, DayStage, Game, Phase, RoleAssignment, SeatId, StartOpts, Winner,
 };
 use botc_mcp::roles::Character;
-use botc_mcp::game::NightActionPayload;
 use botc_mcp::tools::{
-    close_vote, end_nominations, nominate, night_action, open_nominations, pass_vote,
+    close_vote, end_nominations, night_action, nominate, open_nominations, pass_vote,
     skip_night_action, vote,
 };
 
@@ -21,7 +21,13 @@ fn to_day1(g: &mut Game, host: &botc_mcp::auth::Token) {
         skip_night_action(g, host).unwrap();
     }
     assert!(
-        matches!(g.phase, Phase::Day { day: 1, stage: DayStage::Discussion }),
+        matches!(
+            g.phase,
+            Phase::Day {
+                day: 1,
+                stage: DayStage::Discussion
+            }
+        ),
         "expected Day 1 Discussion, got {:?}",
         g.phase
     );
@@ -47,8 +53,8 @@ fn vote_threshold_six_living_needs_three() {
                 RoleAssignment::normal(SeatId(4), Character::Poisoner),
                 RoleAssignment::normal(SeatId(5), Character::Imp),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -60,8 +66,8 @@ fn vote_threshold_six_living_needs_three() {
     vote(&mut g, &tokens[0], SeatId(5), true).unwrap();
     vote(&mut g, &tokens[1], SeatId(5), true).unwrap();
     // Others no
-    for i in 2..6 {
-        vote(&mut g, &tokens[i], SeatId(5), false).unwrap();
+    for tok in tokens.iter().take(6).skip(2) {
+        vote(&mut g, tok, SeatId(5), false).unwrap();
     }
     // Auto-closed when all living voted
     assert!(g.current_nomination.is_none());
@@ -74,8 +80,8 @@ fn vote_threshold_six_living_needs_three() {
     vote(&mut g, &tokens[0], SeatId(4), true).unwrap();
     vote(&mut g, &tokens[1], SeatId(4), true).unwrap();
     vote(&mut g, &tokens[2], SeatId(4), true).unwrap();
-    for i in 3..6 {
-        vote(&mut g, &tokens[i], SeatId(4), false).unwrap();
+    for tok in tokens.iter().take(6).skip(3) {
+        vote(&mut g, tok, SeatId(4), false).unwrap();
     }
     assert_eq!(g.closed_nominations.last().unwrap().yes_votes, 3);
     assert!(meets_threshold(3, 6));
@@ -104,8 +110,8 @@ fn virgin_kills_townsfolk_nominator() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -119,10 +125,11 @@ fn virgin_kills_townsfolk_nominator() {
     assert!(g.seats[1].virgin_ability_used);
     assert_eq!(g.executed_today, Some(SeatId(0)));
     assert!(g.current_nomination.is_none());
-    assert!(g.public_log.since(0).iter().any(|(_, e)| matches!(
-        e,
-        PublicEvent::Executed { seat: SeatId(0) }
-    )));
+    assert!(g
+        .public_log
+        .since(0)
+        .iter()
+        .any(|(_, e)| matches!(e, PublicEvent::Executed { seat: SeatId(0) })));
 }
 
 #[test]
@@ -142,8 +149,8 @@ fn drunk_nominator_does_not_trigger_virgin() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -174,8 +181,8 @@ fn ghost_yes_only_once() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -226,8 +233,8 @@ fn butler_yes_requires_master_yes() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -284,13 +291,9 @@ fn cannot_vote_twice_on_same_nomination() {
     );
     // First ballot still the only one recorded (cannot flip yes→no).
     let open = g.current_nomination.as_ref().expect("vote still open");
-    let mine: Vec<_> = open
-        .votes
-        .iter()
-        .filter(|(s, _)| *s == SeatId(1))
-        .collect();
+    let mine: Vec<_> = open.votes.iter().filter(|(s, _)| *s == SeatId(1)).collect();
     assert_eq!(mine.len(), 1);
-    assert_eq!(mine[0].1, true);
+    assert!(mine[0].1);
 
     // A different nomination later in the day still allows a new ballot.
     close_vote(&mut g, &host).unwrap();
@@ -321,8 +324,8 @@ fn host_close_vote_without_all_living() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     to_day1(&mut g, &host);
@@ -338,7 +341,11 @@ fn host_close_vote_without_all_living() {
     assert!(g.seats.iter().all(|s| s.alive) || g.winner == Some(Winner::Good));
     // Without execution of imp, night should start with all still alive
     assert!(matches!(g.phase, Phase::Night { night: 2, .. }));
-    assert!(g.public_log.since(0).iter().any(|(_, e)| matches!(e, PublicEvent::NoExecution)));
+    assert!(g
+        .public_log
+        .since(0)
+        .iter()
+        .any(|(_, e)| matches!(e, PublicEvent::NoExecution)));
 }
 
 #[test]
@@ -357,8 +364,8 @@ fn poisoner_executed_clears_active_poison() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     // N1: Poisoner poisons Soldier (seat 0).
@@ -407,8 +414,8 @@ fn dead_pass_vote_keeps_ghost_and_allows_auto_close() {
                 RoleAssignment::normal(SeatId(3), Character::Poisoner),
                 RoleAssignment::normal(SeatId(4), Character::Imp),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     to_day1(&mut g, &host);

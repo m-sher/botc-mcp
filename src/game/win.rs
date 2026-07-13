@@ -69,10 +69,7 @@ pub fn apply_demon_death(game: &mut Game, _dead_imp: SeatId, alive_before: u32) 
     }
 
     let sw_id = game.seats.iter().find_map(|s| {
-        if s.alive
-            && s.true_character == Some(Character::ScarletWoman)
-            && !s.ability_disabled()
-        {
+        if s.alive && s.true_character == Some(Character::ScarletWoman) && !s.ability_disabled() {
             Some(s.id)
         } else {
             None

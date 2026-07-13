@@ -18,20 +18,20 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
-use crate::game::{Game, GameId, Phase, RoleAssignment, SeatId, StartOpts, StChoiceMode};
-use crate::roles::{Character, CharacterType};
+use crate::game::{Game, GameId, Phase, RoleAssignment, SeatId, StChoiceMode, StartOpts};
 use crate::harness::action_log::{ActionKind, ActionLog, ActorLabel};
-use crate::harness::scheduler::{plan_ticks, wait_signature, SchedTarget};
 use crate::harness::agents::{
     agent_mcp_bin_ok, cycle_in_list, find_agent_mcp_bin, find_grok,
-    resolve_agent_mcp_bin_for_display, AgentConfig, AgentPool, AgentRole, HarnessConfig,
-    LineKind, LogLine,
+    resolve_agent_mcp_bin_for_display, AgentConfig, AgentPool, AgentRole, HarnessConfig, LineKind,
+    LogLine,
 };
+use crate::harness::scheduler::{plan_ticks, wait_signature, SchedTarget};
 use crate::harness::socket::SocketServer;
 use crate::mcp_server::{self, SharedStore};
+use crate::roles::{Character, CharacterType};
 use crate::tools;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,10 +96,10 @@ struct App {
     host_plan_repeats: usize,
     /// Agent indices whose stream shows full `[think]` blocks (default: collapsed).
     thinking_expanded: HashSet<usize>,
-    /// Last drawn hit targets for mouse (agents list + stream pane).
+    /// Last drawn hit targets for mouse (board / stream / feed).
     hit_agents: Rect,
     hit_stream: Rect,
-    /// Hit target of the action-feed pane (zero when the grimoire is shown).
+    /// Hit target of the action-feed pane.
     hit_feed: Rect,
     /// seq of the feed entry rendered on each visible feed row (for click-expand).
     feed_rows: Vec<Option<u64>>,
@@ -107,8 +107,9 @@ struct App {
     feed_expanded: HashSet<u64>,
     /// Central feed of every agent tool RPC (shared with the socket server) (#UI).
     action_log: Arc<ActionLog>,
-    /// Center pane shows the grimoire (true) or the action feed (false).
-    show_grimoire: bool,
+    /// Per visible row of the left board pane: agent index to select on click
+    /// (`None` = header / nom tracker / spacer — not clickable for selection).
+    board_agent_rows: Vec<Option<usize>>,
     /// Labels of the agents targeted by the most recent scheduled tick (for the status bar).
     last_targets: Vec<String>,
     /// Rows scrolled up from the tail of the action feed (0 = live).
@@ -125,12 +126,15 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let mut cfg = HarnessConfig::default();
-        cfg.grok_bin = find_grok();
-        cfg.agent_mcp_bin = find_agent_mcp_bin();
         let id = uuid::Uuid::new_v4();
-        cfg.work_root = PathBuf::from(format!("/tmp/botc-harness-{id}"));
-        cfg.socket_path = cfg.work_root.join("engine.sock");
+        let work_root = PathBuf::from(format!("/tmp/botc-harness-{id}"));
+        let mut cfg = HarnessConfig {
+            grok_bin: find_grok(),
+            agent_mcp_bin: find_agent_mcp_bin(),
+            work_root: work_root.clone(),
+            socket_path: work_root.join("engine.sock"),
+            ..Default::default()
+        };
         // Populate the setup picker from `grok models` (CLI default becomes selected).
         let models_note = cfg.load_models_from_grok();
         let mcp_ok = agent_mcp_bin_ok(&cfg);
@@ -181,7 +185,7 @@ impl App {
             feed_rows: Vec::new(),
             feed_expanded: HashSet::new(),
             action_log: Arc::new(ActionLog::default()),
-            show_grimoire: false,
+            board_agent_rows: Vec::new(),
             last_targets: Vec::new(),
             feed_scroll: 0,
             feed_filter: FeedFilter::All,
@@ -251,13 +255,9 @@ impl App {
             return;
         }
         if delta > 0 {
-            self.scroll_from_bottom = self
-                .scroll_from_bottom
-                .saturating_add(delta as usize);
+            self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(delta as usize);
         } else {
-            self.scroll_from_bottom = self
-                .scroll_from_bottom
-                .saturating_sub((-delta) as usize);
+            self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub((-delta) as usize);
         }
     }
 
@@ -278,22 +278,15 @@ impl App {
             MouseEventKind::ScrollDown if point_in_rect(self.hit_feed, x, y) => {
                 self.feed_scroll = self.feed_scroll.saturating_sub(3);
             }
-            // Left click: select agent, expand a feed action, or toggle thinking.
+            // Left click: select agent (board row), expand a feed action, or toggle thinking.
             MouseEventKind::Down(MouseButton::Left) => {
                 if point_in_rect(self.hit_agents, x, y) {
-                    if let Some(pool) = self.agents.as_ref() {
-                        let n = pool.agents.len();
-                        if n == 0 {
-                            return;
-                        }
-                        // Row under the top border → agent index.
-                        let inner_y = y.saturating_sub(self.hit_agents.y.saturating_add(1));
-                        let idx = inner_y as usize;
-                        if idx < n {
-                            self.selected_agent = idx;
-                            self.scroll_from_bottom = 0;
-                            self.status = format!("selected agent {idx}");
-                        }
+                    // Row under the top border → board_agent_rows mapping (multi-line board).
+                    let inner_y = y.saturating_sub(self.hit_agents.y.saturating_add(1)) as usize;
+                    if let Some(Some(idx)) = self.board_agent_rows.get(inner_y).copied() {
+                        self.selected_agent = idx;
+                        self.scroll_from_bottom = 0;
+                        self.status = format!("selected agent {idx}");
                     }
                 } else if point_in_rect(self.hit_feed, x, y) {
                     // Row under the top border → visible feed row → entry seq.
@@ -406,22 +399,12 @@ impl App {
                 self.auto_tick = !self.auto_tick;
                 self.status = format!("auto_tick={}", self.auto_tick);
             }
-            // Toggle the center pane between the action feed and the host grimoire.
-            KeyCode::Char('g') if self.agents.is_some() => {
-                self.show_grimoire = !self.show_grimoire;
-                self.status = if self.show_grimoire {
-                    "center: grimoire (g = action feed)".into()
-                } else {
-                    "center: action feed (g = grimoire)".into()
-                };
-            }
             // Toggle the feed filter: all actions ↔ game-only.
             KeyCode::Char('f') if self.agents.is_some() => {
                 self.feed_filter = match self.feed_filter {
                     FeedFilter::All => FeedFilter::GameOnly,
                     FeedFilter::GameOnly => FeedFilter::All,
                 };
-                self.show_grimoire = false;
                 self.status = match self.feed_filter {
                     FeedFilter::All => "feed: all actions (f = game-only)".into(),
                     FeedFilter::GameOnly => "feed: game actions only (f = all)".into(),
@@ -664,12 +647,30 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Per-agent usage snapshot for results log / game_end.
+    fn agent_usage_for_results(&self) -> Vec<(String, crate::harness::agents::AgentUsage)> {
+        let Some(pool) = self.agents.as_ref() else {
+            return Vec::new();
+        };
+        pool.agents
+            .iter()
+            .map(|a| {
+                let label = match a.config.role {
+                    AgentRole::Host => "Host".to_string(),
+                    AgentRole::Player { seat } => format!("P{}", seat.0),
+                };
+                (label, a.usage.lock().unwrap().clone())
+            })
+            .collect()
+    }
+
     /// Drain ranking-relevant public events; if the game just ended, write `game_end` once.
     fn results_poll(&mut self) {
         let Some(gid) = self.game_id else {
             return;
         };
         let agent_cfgs = self.agent_configs_for_results();
+        let usage = self.agent_usage_for_results();
         let st = self.store.lock().unwrap();
         let Some(g) = st.get(GameId(gid)) else {
             return;
@@ -681,12 +682,10 @@ impl App {
             &agent_cfgs,
             self.results_public_cursor,
         );
-        if !self.results_terminal_logged {
-            if matches!(g.phase, Phase::Ended { .. }) {
-                crate::harness::results_log::log_game_end(&self.run_id, gid, g, &agent_cfgs);
-                self.results_terminal_logged = true;
-                crate::dlog!("RESULTS game_end logged run_id={}", self.run_id);
-            }
+        if !self.results_terminal_logged && matches!(g.phase, Phase::Ended { .. }) {
+            crate::harness::results_log::log_game_end(&self.run_id, gid, g, &agent_cfgs, &usage);
+            self.results_terminal_logged = true;
+            crate::dlog!("RESULTS game_end logged run_id={}", self.run_id);
         }
     }
 
@@ -767,7 +766,8 @@ impl App {
 
         if ended {
             self.auto_tick = false;
-            self.status = "Game ended — agents idle. Press q to quit or Tab to review streams.".into();
+            self.status =
+                "Game ended — agents idle. Press q to quit or Tab to review streams.".into();
             crate::dlog!("TICK -> game ended, auto_tick off");
             return;
         }
@@ -775,9 +775,7 @@ impl App {
         // Host-retry brake: a host-only fallback plan that repeats with no state
         // change means the host agent runs but never makes the required call.
         // Without a cap, event-driven auto would re-spawn it forever (token burn).
-        let host_only = plan
-            .iter()
-            .all(|t| matches!(t, SchedTarget::Host(_)));
+        let host_only = plan.iter().all(|t| matches!(t, SchedTarget::Host(_)));
         let plan_key = format!("{}|{sig:?}", plan_dbg.join(","));
         if host_only && plan_key == self.last_plan_key {
             self.host_plan_repeats += 1;
@@ -792,7 +790,9 @@ impl App {
                 "auto-advance stopped: host repeated '{}' {HOST_RETRY_CAP}x without progress (see debug log). t=resume",
                 self.last_targets.join(",")
             );
-            crate::dlog!("TICK -> host plan repeated {HOST_RETRY_CAP}x with no progress, auto_tick disabled");
+            crate::dlog!(
+                "TICK -> host plan repeated {HOST_RETRY_CAP}x with no progress, auto_tick disabled"
+            );
             return;
         }
 
@@ -895,7 +895,9 @@ impl App {
         let mut spans = vec![
             Span::styled(
                 format!(" {phase} "),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("· turn "),
             Span::styled(format!("{turn} "), Style::default().fg(Color::Yellow)),
@@ -918,50 +920,12 @@ impl App {
         } else {
             spans.push(Span::styled(
                 format!("▶ running: {}", running.join(",")),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             ));
         }
         spans
-    }
-
-    fn snapshot_host(&self) -> String {
-        let Some(gid) = self.game_id else {
-            return "No game.".into();
-        };
-        let Some(host) = self.host_token.as_ref() else {
-            return "No host token.".into();
-        };
-        let st = self.store.lock().unwrap();
-        let Some(g) = st.get(GameId(gid)) else {
-            return "Missing game.".into();
-        };
-        match tools::get_host_state(g, host) {
-            Ok(v) => {
-                let mut lines = vec![
-                    format!("phase {}", v.phase),
-                    format!("seed {}  salt {}", v.seed, v.secret_salt),
-                    format!(
-                        "pending_host {:?}",
-                        v.pending_host.as_ref().map(|p| &p.kind)
-                    ),
-                    format!("st_choice {}", v.st_choice_mode),
-                    "seats:".into(),
-                ];
-                for s in &v.seats {
-                    lines.push(format!(
-                        "  #{} {:8} alive={:5} true={:?} face={:?} poison={}",
-                        s.seat_id.0,
-                        s.name,
-                        s.alive,
-                        s.true_character,
-                        s.believed_character,
-                        s.poisoned
-                    ));
-                }
-                lines.join("\n")
-            }
-            Err(e) => format!("host_state err: {e}"),
-        }
     }
 
     /// Agent stream for the selected seat: thinking collapsed by default so game
@@ -986,24 +950,25 @@ impl App {
         if let Some(gid) = self.game_id {
             if !self.results_terminal_logged {
                 let agent_cfgs = self.agent_configs_for_results();
+                let usage = self.agent_usage_for_results();
                 let st = self.store.lock().unwrap();
                 let g = st.get(GameId(gid));
                 // Final drain of any unlogged public events.
                 if let Some(game) = g {
-                    self.results_public_cursor =
-                        crate::harness::results_log::drain_public_events(
-                            &self.run_id,
-                            gid,
-                            game,
-                            &agent_cfgs,
-                            self.results_public_cursor,
-                        );
+                    self.results_public_cursor = crate::harness::results_log::drain_public_events(
+                        &self.run_id,
+                        gid,
+                        game,
+                        &agent_cfgs,
+                        self.results_public_cursor,
+                    );
                     if matches!(game.phase, Phase::Ended { .. }) {
                         crate::harness::results_log::log_game_end(
                             &self.run_id,
                             gid,
                             game,
                             &agent_cfgs,
+                            &usage,
                         );
                     } else {
                         crate::harness::results_log::log_game_abort(
@@ -1012,6 +977,7 @@ impl App {
                             Some(game),
                             &agent_cfgs,
                             "tui_quit",
+                            &usage,
                         );
                     }
                 } else {
@@ -1021,10 +987,14 @@ impl App {
                         None,
                         &agent_cfgs,
                         "tui_quit",
+                        &usage,
                     );
                 }
                 self.results_terminal_logged = true;
-                crate::dlog!("RESULTS terminal event logged on shutdown run_id={}", self.run_id);
+                crate::dlog!(
+                    "RESULTS terminal event logged on shutdown run_id={}",
+                    self.run_id
+                );
             }
         }
 
@@ -1102,7 +1072,10 @@ fn fmt_public_event(e: &crate::comms::PublicEvent) -> String {
         }
         PlayerDied { seat } => format!("P{} died", seat.0),
         SlayerMiss { slayer, target } => {
-            format!("P{} tried to slay P{} — nothing happened", slayer.0, target.0)
+            format!(
+                "P{} tried to slay P{} — nothing happened",
+                slayer.0, target.0
+            )
         }
         PhaseChanged { summary } => summary.clone(),
         GameEnded { winner } => format!("Game over — {winner:?} wins"),
@@ -1131,7 +1104,7 @@ fn game_summary_and_hint(g: &Game) -> (String, String) {
         .into_iter()
         .rev()
         .take(16)
-        .map(|(_, e)| fmt_public_event(&e))
+        .map(|(_, e)| fmt_public_event(e))
         .collect();
     let recent: Vec<_> = recent.into_iter().rev().collect();
     let recent_str = if recent.is_empty() {
@@ -1217,14 +1190,19 @@ fn feed_line(e: &crate::harness::action_log::ActionEntry) -> Line<'static> {
     let ac = actor_color(e.actor.is_host, e.actor.seat);
     let (tool_style, marker) = match e.kind {
         ActionKind::Game => (
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
             "▶ ",
         ),
         ActionKind::Info => (Style::default().fg(Color::DarkGray), "  "),
         ActionKind::Meta => (Style::default().fg(Color::Gray), "  "),
     };
     let mut spans = vec![
-        Span::styled(format!("{:>4}s ", e.secs), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:>4}s ", e.secs),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::styled(
             format!("{:<5}", e.actor.name),
             Style::default().fg(ac).add_modifier(Modifier::BOLD),
@@ -1365,9 +1343,13 @@ fn draw_action_feed(f: &mut Frame, area: Rect, app: &mut App) {
         FeedFilter::All => "all",
         FeedFilter::GameOnly => "game-only",
     };
-    let tail = if app.feed_scroll == 0 { "·live" } else { "·scroll" };
+    let tail = if app.feed_scroll == 0 {
+        "·live"
+    } else {
+        "·scroll"
+    };
     let title = format!(
-        "actions · {filt} · {} total · click=expand f=filter g=grimoire {tail}",
+        "actions · {filt} · {} total · click=expand f=filter {tail}",
         app.action_log.len()
     );
     let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
@@ -1452,6 +1434,7 @@ pub fn run_tui() -> io::Result<()> {
     install_panic_hook();
     let mut guard = TerminalGuard::enter()?;
     let mut app = App::new();
+    crate::harness::results_log::set_run_id(&app.run_id);
     app.status = format!(
         "{}  · debug: {log_path}  · results: {}",
         app.status,
@@ -1489,10 +1472,7 @@ pub fn run_tui() -> io::Result<()> {
                     }
                 }
                 Event::Mouse(m) => app.on_mouse(m),
-                Event::Resize(_, _)
-                | Event::FocusGained
-                | Event::FocusLost
-                | Event::Paste(_) => {}
+                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
             }
         }
         // Idle wait so we don't busy-spin when the queue is empty.
@@ -1604,7 +1584,11 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
             app.player_count,
             app.player_count + 1
         ),
-        if app.setup_row == 0 { focused } else { Style::default() },
+        if app.setup_row == 0 {
+            focused
+        } else {
+            Style::default()
+        },
     )));
     lines.push(Line::raw(""));
 
@@ -1629,7 +1613,11 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
         let mark = if app.setup_row == row { "▶ " } else { "  " };
         let mut spans = vec![Span::styled(
             format!("{mark}{who:<5} "),
-            if app.setup_row == row { focused } else { Style::default() },
+            if app.setup_row == row {
+                focused
+            } else {
+                Style::default()
+            },
         )];
         // Role column: Host runs the game; players show their previewed character.
         let (role_text, role_st) = if slot == 0 {
@@ -1667,9 +1655,18 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
         dim,
     )));
     lines.push(Line::raw(""));
-    lines.push(Line::raw(format!("  Grok binary: {}", app.cfg.grok_bin.display())));
-    lines.push(Line::raw(format!("  Agent MCP:   {}  ({mcp_note})", mcp.display())));
-    lines.push(Line::raw(format!("  Work root:   {}", app.cfg.work_root.display())));
+    lines.push(Line::raw(format!(
+        "  Grok binary: {}",
+        app.cfg.grok_bin.display()
+    )));
+    lines.push(Line::raw(format!(
+        "  Agent MCP:   {}  ({mcp_note})",
+        mcp.display()
+    )));
+    lines.push(Line::raw(format!(
+        "  Work root:   {}",
+        app.cfg.work_root.display()
+    )));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "  Controls:  ↑/↓ focus row · ←/→ change (count / model) · a model→all · r reroll roles",
@@ -1695,87 +1692,429 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 }
 
+/// Left monitor pane: agents + grimoire fused per seat, plus a live nomination tracker.
+///
+/// Each agent is 1–2 lines (identity/status on the first, markers on the second).
+/// Clickable rows map through `app.board_agent_rows` (agent index or `None`).
+fn draw_board_panel(f: &mut Frame, area: Rect, app: &mut App) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut row_map: Vec<Option<usize>> = Vec::new();
+
+    let push = |lines: &mut Vec<Line<'static>>,
+                row_map: &mut Vec<Option<usize>>,
+                line: Line<'static>,
+                agent: Option<usize>| {
+        lines.push(line);
+        row_map.push(agent);
+    };
+
+    // Snapshot grimoire + noms under a short store lock (display only).
+    let board = board_snapshot(app);
+
+    if let Some(pool) = app.agents.as_ref() {
+        for (i, a) in pool.agents.iter().enumerate() {
+            let running = *a.running.lock().unwrap();
+            let (glyph, gstyle) = if running {
+                (
+                    "●",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("○", dim)
+            };
+            let selected = i == app.selected_agent;
+            let mark = if selected { "▶" } else { " " };
+            let model = crate::harness::action_log::clip_chars(&a.config.model, 12);
+            let (usage_short, usage_style) = {
+                let u = a.usage.lock().unwrap();
+                let short = u.board_short();
+                let pct = u.context.as_ref().map(|c| c.usage_pct).unwrap_or(0);
+                let style = if pct >= 80 {
+                    Style::default().fg(Color::Red)
+                } else if pct >= 50 {
+                    Style::default().fg(Color::Yellow)
+                } else if pct > 0 || u.game_total.total_tokens > 0 {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    dim
+                };
+                (short, style)
+            };
+
+            match a.config.role {
+                AgentRole::Host => {
+                    let name_st = if selected {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Magenta)
+                    };
+                    push(
+                        &mut lines,
+                        &mut row_map,
+                        Line::from(vec![
+                            Span::styled(glyph, gstyle),
+                            Span::raw(" "),
+                            Span::styled(format!("{mark} Host"), name_st),
+                            Span::styled("  Storyteller", dim),
+                            Span::styled(format!(" · {model}"), dim),
+                        ]),
+                        Some(i),
+                    );
+                    // Host second line: phase + pending waits (ST-only).
+                    let mut detail = String::new();
+                    if let Some(ref b) = board {
+                        detail.push_str(&b.phase_short);
+                        if let Some(ref ph) = b.pending_host {
+                            detail.push_str(&format!(" · host:{ph}"));
+                        }
+                        if let Some(seat) = b.pending_night {
+                            detail.push_str(&format!(" · wake:P{seat}"));
+                        }
+                        if b.pending_host.is_none() && b.pending_night.is_none() {
+                            detail.push_str(" · idle");
+                        }
+                    } else {
+                        detail.push('—');
+                    }
+                    push(
+                        &mut lines,
+                        &mut row_map,
+                        Line::from(Span::styled(format!("    {detail}"), dim)),
+                        Some(i),
+                    );
+                    push(
+                        &mut lines,
+                        &mut row_map,
+                        Line::from(Span::styled(format!("    {usage_short}"), usage_style)),
+                        Some(i),
+                    );
+                }
+                AgentRole::Player { seat } => {
+                    let seat_n = seat.0;
+                    let seat_info = board
+                        .as_ref()
+                        .and_then(|b| b.seats.iter().find(|s| s.seat == seat_n));
+                    let (role_text, role_st) = match seat_info {
+                        Some(s) => {
+                            let label = if s.is_drunk_outsider {
+                                match s.believed.as_deref() {
+                                    Some(face) => format!("Drunk (as {face})"),
+                                    None => "Drunk".into(),
+                                }
+                            } else {
+                                s.true_role.clone().unwrap_or_else(|| "?".into())
+                            };
+                            let st = s
+                                .true_char
+                                .map(role_style)
+                                .unwrap_or(Style::default().fg(Color::White));
+                            (label, st)
+                        }
+                        None => ("—".into(), dim),
+                    };
+                    let name_st = if selected {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(actor_color(false, Some(seat_n)))
+                    };
+                    push(
+                        &mut lines,
+                        &mut row_map,
+                        Line::from(vec![
+                            Span::styled(glyph, gstyle),
+                            Span::raw(" "),
+                            Span::styled(format!("{mark} P{seat_n}"), name_st),
+                            Span::raw(" "),
+                            Span::styled(role_text, role_st),
+                            Span::styled(format!(" · {model}"), dim),
+                        ]),
+                        Some(i),
+                    );
+                    // Markers: life, poison, monk, butler, ghost.
+                    let mut marks: Vec<Span<'static>> = vec![Span::raw("    ")];
+                    if let Some(s) = seat_info {
+                        if s.alive {
+                            marks.push(Span::styled("alive", Style::default().fg(Color::Green)));
+                        } else {
+                            marks.push(Span::styled(
+                                "DEAD",
+                                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                            ));
+                        }
+                        if let Some(team) = s.team.as_deref() {
+                            let tsty = if team == "Evil" {
+                                Style::default().fg(Color::Red)
+                            } else {
+                                Style::default().fg(Color::Green)
+                            };
+                            marks.push(Span::styled(format!(" · {team}"), tsty));
+                        }
+                        if s.poisoned {
+                            marks.push(Span::styled(
+                                " · poison",
+                                Style::default().fg(Color::Magenta),
+                            ));
+                        }
+                        if s.monk_protected {
+                            marks.push(Span::styled(" · monk", Style::default().fg(Color::Cyan)));
+                        }
+                        if let Some(m) = s.butler_master {
+                            marks.push(Span::styled(
+                                format!(" · butler→P{m}"),
+                                Style::default().fg(Color::Yellow),
+                            ));
+                        }
+                        if !s.alive && s.ghost_vote_available {
+                            marks.push(Span::styled(" · ghost✓", dim));
+                        } else if !s.alive && !s.ghost_vote_available {
+                            marks.push(Span::styled(" · ghost✗", dim));
+                        }
+                        if s.slayer_used {
+                            marks.push(Span::styled(" · slayer✓", dim));
+                        }
+                        if s.virgin_used {
+                            marks.push(Span::styled(" · virgin✓", dim));
+                        }
+                    } else {
+                        marks.push(Span::styled("—", dim));
+                    }
+                    push(&mut lines, &mut row_map, Line::from(marks), Some(i));
+                    push(
+                        &mut lines,
+                        &mut row_map,
+                        Line::from(Span::styled(format!("    {usage_short}"), usage_style)),
+                        Some(i),
+                    );
+                }
+            }
+        }
+    } else {
+        push(
+            &mut lines,
+            &mut row_map,
+            Line::from(Span::styled("no agents", dim)),
+            None,
+        );
+    }
+
+    // ── live nomination tracker ──────────────────────────────────────────
+    push(&mut lines, &mut row_map, Line::from(Span::raw("")), None);
+    push(
+        &mut lines,
+        &mut row_map,
+        Line::from(Span::styled("── noms ──", dim)),
+        None,
+    );
+    if let Some(ref b) = board {
+        if b.closed_noms.is_empty() && b.open_nom.is_none() {
+            push(
+                &mut lines,
+                &mut row_map,
+                Line::from(Span::styled("  (none today)", dim)),
+                None,
+            );
+        }
+        for c in &b.closed_noms {
+            let thr = if c.meets_threshold {
+                Style::default().fg(Color::Cyan)
+            } else {
+                dim
+            };
+            push(
+                &mut lines,
+                &mut row_map,
+                Line::from(vec![
+                    Span::raw(format!("  P{}→P{}  ", c.by, c.target)),
+                    Span::styled("closed", dim),
+                    Span::styled(format!("  {} yes", c.yes), thr),
+                    if c.meets_threshold {
+                        Span::styled("  ≥½", thr)
+                    } else {
+                        Span::raw("")
+                    },
+                ]),
+                None,
+            );
+        }
+        if let Some(ref o) = b.open_nom {
+            let mut vote_bits: Vec<String> = o
+                .votes
+                .iter()
+                .map(|(s, yes)| format!("P{s}{}", if *yes { "✓" } else { "✗" }))
+                .collect();
+            for s in &o.passes {
+                vote_bits.push(format!("P{s}–"));
+            }
+            let votes = if vote_bits.is_empty() {
+                "no votes yet".into()
+            } else {
+                vote_bits.join(" ")
+            };
+            push(
+                &mut lines,
+                &mut row_map,
+                Line::from(vec![
+                    Span::raw(format!("  P{}→P{}  ", o.by, o.target)),
+                    Span::styled(
+                        "OPEN",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("  {votes}"), Style::default().fg(Color::White)),
+                ]),
+                None,
+            );
+        }
+    } else {
+        push(
+            &mut lines,
+            &mut row_map,
+            Line::from(Span::styled("  (no game)", dim)),
+            None,
+        );
+    }
+
+    app.board_agent_rows = row_map;
+    let title = if let Some(ref b) = board {
+        format!("board · {} · ●=run", b.phase_short)
+    } else {
+        "board · ●=run".into()
+    };
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
+/// Host-only board snapshot for the left pane (grimoire + noms). Display only.
+struct BoardSnapshot {
+    phase_short: String,
+    pending_host: Option<String>,
+    pending_night: Option<u8>,
+    seats: Vec<BoardSeat>,
+    closed_noms: Vec<BoardClosedNom>,
+    open_nom: Option<BoardOpenNom>,
+}
+
+struct BoardSeat {
+    seat: u8,
+    alive: bool,
+    true_role: Option<String>,
+    believed: Option<String>,
+    true_char: Option<Character>,
+    team: Option<String>,
+    poisoned: bool,
+    is_drunk_outsider: bool,
+    monk_protected: bool,
+    butler_master: Option<u8>,
+    ghost_vote_available: bool,
+    slayer_used: bool,
+    virgin_used: bool,
+}
+
+struct BoardClosedNom {
+    by: u8,
+    target: u8,
+    yes: u32,
+    meets_threshold: bool,
+}
+
+struct BoardOpenNom {
+    by: u8,
+    target: u8,
+    votes: Vec<(u8, bool)>,
+    passes: Vec<u8>,
+}
+
+fn board_snapshot(app: &App) -> Option<BoardSnapshot> {
+    let gid = app.game_id?;
+    let st = app.store.lock().unwrap();
+    let g = st.get(GameId(gid))?;
+    let living = g.seats.iter().filter(|s| s.alive).count() as u32;
+    let phase_short = match &g.phase {
+        Phase::Lobby => "lobby".into(),
+        Phase::FirstNight { .. } => "N1".into(),
+        Phase::Night { night, .. } => format!("N{night}"),
+        Phase::Day { day, stage } => format!(
+            "D{day}·{}",
+            match stage {
+                crate::game::DayStage::Discussion => "disc",
+                crate::game::DayStage::Nominations => "noms",
+            }
+        ),
+        Phase::Ended { winner, .. } => format!("end:{winner:?}"),
+    };
+    let seats = g
+        .seats
+        .iter()
+        .map(|s| BoardSeat {
+            seat: s.id.0,
+            alive: s.alive,
+            true_role: s.true_character.map(|c| c.display_name().to_string()),
+            believed: s.believed_character.map(|c| c.display_name().to_string()),
+            true_char: s.true_character,
+            team: s.true_character.map(|c| format!("{:?}", c.team())),
+            poisoned: s.poisoned,
+            is_drunk_outsider: s.is_drunk_outsider,
+            monk_protected: s.monk_protected_tonight,
+            butler_master: s.butler_master.map(|m| m.0),
+            ghost_vote_available: s.ghost_vote_available,
+            slayer_used: s.slayer_used,
+            virgin_used: s.virgin_ability_used,
+        })
+        .collect();
+    let closed_noms = g
+        .closed_nominations
+        .iter()
+        .map(|c| BoardClosedNom {
+            by: c.by.0,
+            target: c.target.0,
+            yes: c.yes_votes,
+            meets_threshold: crate::game::meets_threshold(c.yes_votes, living),
+        })
+        .collect();
+    let open_nom = g.current_nomination.as_ref().map(|o| BoardOpenNom {
+        by: o.by.0,
+        target: o.target.0,
+        votes: o.votes.iter().map(|(s, y)| (s.0, *y)).collect(),
+        passes: o.passes.iter().map(|s| s.0).collect(),
+    });
+    Some(BoardSnapshot {
+        phase_short,
+        pending_host: g.pending_host.as_ref().map(|p| p.kind_str().to_string()),
+        pending_night: g.pending_night.as_ref().map(|w| w.seat.0),
+        seats,
+        closed_noms,
+        open_nom,
+    })
+}
+
 fn draw_monitor(f: &mut Frame, area: Rect, app: &mut App) {
+    // Left board is denser (grimoire + noms + agent status) — give it more width;
+    // center is always the action feed (no grimoire toggle).
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(22),
-            Constraint::Percentage(38),
-            Constraint::Percentage(40),
+            Constraint::Percentage(32),
+            Constraint::Percentage(33),
+            Constraint::Percentage(35),
         ])
         .split(area);
 
-    // Mouse hit targets (click agents / click-or-scroll stream).
+    // Mouse hit targets (click board / click-or-scroll stream / feed).
     app.hit_agents = cols[0];
     app.hit_stream = cols[2];
 
-    // Agents list with a live status glyph: ● running (green) / ○ idle (grey).
-    let items: Vec<ListItem> = if let Some(pool) = app.agents.as_ref() {
-        pool.agents
-            .iter()
-            .enumerate()
-            .map(|(i, a)| {
-                let (label, seat) = match a.config.role {
-                    AgentRole::Host => ("Host".to_string(), None),
-                    AgentRole::Player { seat } => {
-                        (format!("P{} {}", seat.0, a.config.display_name), Some(seat.0))
-                    }
-                };
-                let running = *a.running.lock().unwrap();
-                let (glyph, gstyle) = if running {
-                    ("●", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
-                } else {
-                    ("○", Style::default().fg(Color::DarkGray))
-                };
-                let selected = i == app.selected_agent;
-                let label_style = if selected {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(actor_color(seat.is_none(), seat))
-                };
-                let mark = if selected { "▶ " } else { "  " };
-                ListItem::new(Line::from(vec![
-                    Span::styled(glyph, gstyle),
-                    Span::raw(" "),
-                    Span::styled(mark, label_style),
-                    Span::styled(label, label_style),
-                    // Per-agent model (they can differ now) — dimmed, clipped.
-                    Span::styled(
-                        format!(
-                            " · {}",
-                            crate::harness::action_log::clip_chars(&a.config.model, 14)
-                        ),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]))
-            })
-            .collect()
-    } else {
-        vec![ListItem::new("no agents")]
-    };
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("agents · ●=running"),
-    );
-    f.render_widget(list, cols[0]);
-
-    // Center: action feed by default, host grimoire on `g`.
-    if app.show_grimoire {
-        let host_p = Paragraph::new(app.snapshot_host())
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("grimoire (host) · g=feed"),
-            )
-            .wrap(Wrap { trim: false });
-        f.render_widget(host_p, cols[1]);
-        // Feed not visible: kill its click/scroll targets.
-        app.hit_feed = Rect::default();
-        app.feed_rows.clear();
-    } else {
-        draw_action_feed(f, cols[1], app);
-    }
+    draw_board_panel(f, cols[0], app);
+    draw_action_feed(f, cols[1], app);
 
     let agent_title = app
         .agents
@@ -1788,13 +2127,17 @@ fn draw_monitor(f: &mut Frame, area: Rect, app: &mut App) {
         .unwrap_or_else(|| "stream".into());
 
     // #45/#53: tail-anchor in *wrapped visual rows* (Paragraph::scroll unit), not
-    // logical lines — long Grok prose wraps in the ~40% stream column constantly.
+    // logical lines — long Grok prose wraps in the stream column constantly.
     let log_lines = app.agent_log_lines();
     let inner_w = cols[2].width.saturating_sub(2);
     let view_h = cols[2].height.saturating_sub(2) as usize;
     let para = Paragraph::new(log_lines).wrap(Wrap { trim: false });
     // Wrapped-row count for the exact rendered width (tail-anchor scroll, #53).
-    let row_count = if inner_w == 0 { 0 } else { para.line_count(inner_w) };
+    let row_count = if inner_w == 0 {
+        0
+    } else {
+        para.line_count(inner_w)
+    };
     // scroll_from_bottom=0 → show the end; larger → look further up (row units).
     let scroll_y = stream_scroll_y(row_count, view_h, app.scroll_from_bottom);
     let scroll_y_u16 = u16::try_from(scroll_y).unwrap_or(u16::MAX);
@@ -1809,11 +2152,9 @@ fn draw_monitor(f: &mut Frame, area: Rect, app: &mut App) {
         "·think▾"
     };
     let log_p = para
-        .block(
-            Block::default().borders(Borders::ALL).title(format!(
-                "{agent_title} {tail_mark} {think_mark}  click·h  wheel·scroll"
-            )),
-        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            "{agent_title} {tail_mark} {think_mark}  click·h  wheel·scroll"
+        )))
         .scroll((scroll_y_u16, 0));
     f.render_widget(log_p, cols[2]);
 }
@@ -1846,7 +2187,11 @@ fn think_summary(n: usize, preview: &str) -> Line<'static> {
         String::new()
     } else {
         let s: String = preview.trim().chars().take(48).collect();
-        let ell = if preview.trim().chars().count() > 48 { "…" } else { "" };
+        let ell = if preview.trim().chars().count() > 48 {
+            "…"
+        } else {
+            ""
+        };
         format!(" “{s}{ell}”")
     };
     Line::from(Span::styled(
@@ -1953,7 +2298,10 @@ mod tests {
             lk(LineKind::Text, "Calling night_action on seat 2"),
             lk(LineKind::System, "— turn end —"),
         ];
-        let texts: Vec<String> = stream_lines(&entries, false).iter().map(line_text).collect();
+        let texts: Vec<String> = stream_lines(&entries, false)
+            .iter()
+            .map(line_text)
+            .collect();
         assert_eq!(
             texts.iter().filter(|t| t.contains("thinking…")).count(),
             1,
@@ -1964,7 +2312,9 @@ mod tests {
             !texts.iter().any(|t| t.contains("maybe seat 2")),
             "collapsed must not dump think bodies: {texts:?}"
         );
-        assert!(texts.iter().any(|t| t.contains("Calling night_action on seat 2")));
+        assert!(texts
+            .iter()
+            .any(|t| t.contains("Calling night_action on seat 2")));
         assert!(texts.iter().any(|t| t.contains("turn end")));
 
         let etexts: Vec<String> = stream_lines(&entries, true).iter().map(line_text).collect();
@@ -1982,7 +2332,10 @@ mod tests {
             lk(LineKind::Thought, "second"),
             lk(LineKind::Text, "action B"),
         ];
-        let texts: Vec<String> = stream_lines(&entries, false).iter().map(line_text).collect();
+        let texts: Vec<String> = stream_lines(&entries, false)
+            .iter()
+            .map(line_text)
+            .collect();
         assert_eq!(texts.len(), 4, "got {texts:?}");
         assert!(texts[0].contains("thinking… 1 line"));
         assert_eq!(texts[1], "action A");

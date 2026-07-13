@@ -184,10 +184,14 @@ pub fn classify(tool: &str) -> ActionKind {
         "say" | "st_announce" | "night_action" | "day_action" | "nominate" | "vote"
         | "pass_vote" | "open_nominations" | "close_vote" | "end_nominations"
         | "skip_night_action" | "host_decide" | "host_queue_lie" | "start_game" => ActionKind::Game,
-        "get_public_state" | "get_public_log" | "get_private_state" | "get_host_state"
-        | "get_character_rules" | "list_characters" | "list_rules_topics" | "get_rules_topic" => {
-            ActionKind::Info
-        }
+        "get_public_state"
+        | "get_public_log"
+        | "get_private_state"
+        | "get_host_state"
+        | "get_character_rules"
+        | "list_characters"
+        | "list_rules_topics"
+        | "get_rules_topic" => ActionKind::Info,
         _ => ActionKind::Meta,
     }
 }
@@ -200,10 +204,7 @@ fn seatp(v: Option<&Value>) -> Option<String> {
 /// Flatten whitespace for a summary line (newlines → space). Full length is kept:
 /// `say` / `st_announce` are never clipped in the TUI (they wrap instead).
 fn flatten_text(s: &str) -> String {
-    s.trim()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Readable summary of the salient args for a tool call.
@@ -223,7 +224,10 @@ pub fn summarize(tool: &str, args: &Value) -> String {
             .unwrap_or_default(),
         "vote" => {
             let who = seatp(args.get("nominee").or_else(|| args.get("target"))).unwrap_or_default();
-            let yes = args.get("support").and_then(|v| v.as_bool()).unwrap_or(false);
+            let yes = args
+                .get("support")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             format!("→{who} {}", if yes { "YES" } else { "no" })
         }
         "pass_vote" => "abstain".into(),
@@ -277,8 +281,14 @@ mod tests {
 
     #[test]
     fn summarizes_key_actions() {
-        assert_eq!(summarize("vote", &json!({"nominee": 1, "support": true})), "→P1 YES");
-        assert_eq!(summarize("vote", &json!({"nominee": 2, "support": false})), "→P2 no");
+        assert_eq!(
+            summarize("vote", &json!({"nominee": 1, "support": true})),
+            "→P1 YES"
+        );
+        assert_eq!(
+            summarize("vote", &json!({"nominee": 2, "support": false})),
+            "→P2 no"
+        );
         assert_eq!(summarize("nominate", &json!({"target": 3})), "→P3");
         assert_eq!(summarize("pass_vote", &json!({})), "abstain");
         assert_eq!(
@@ -300,11 +310,19 @@ mod tests {
         let mut labels = HashMap::new();
         labels.insert(
             "tok-host".to_string(),
-            ActorLabel { name: "Host".into(), seat: None, is_host: true },
+            ActorLabel {
+                name: "Host".into(),
+                seat: None,
+                is_host: true,
+            },
         );
         labels.insert(
             "tok-p1".to_string(),
-            ActorLabel { name: "P1".into(), seat: Some(1), is_host: false },
+            ActorLabel {
+                name: "P1".into(),
+                seat: Some(1),
+                is_host: false,
+            },
         );
         log.set_labels(labels);
         log.record_rpc(
@@ -329,7 +347,14 @@ mod tests {
         assert_eq!(r[1].actor.name, "Host");
         // ring buffer cap
         for _ in 0..10 {
-            log.record_rpc(Some("tok-p1"), "get_public_state", &json!({}), true, None, None);
+            log.record_rpc(
+                Some("tok-p1"),
+                "get_public_state",
+                &json!({}),
+                true,
+                None,
+                None,
+            );
         }
         assert!(log.len() <= 4);
     }

@@ -33,8 +33,8 @@ pub fn new_shared_store() -> SharedStore {
 pub fn run_stdio(store: SharedStore) -> io::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
-    let mut lines = stdin.lock().lines();
-    while let Some(line) = lines.next() {
+    let lines = stdin.lock().lines();
+    for line in lines {
         let line = line?;
         let line = line.trim();
         if line.is_empty() {
@@ -66,24 +66,20 @@ pub fn handle_line(store: &SharedStore, line: &str) -> Option<String> {
         }
     };
 
-    let id = req.get("id").cloned();
     // JSON-RPC notification: no id → no response.
-    if id.is_none() {
-        // Still process initialize-style notifications if ever needed; ignore body.
-        return None;
-    }
-    let id = id.unwrap_or(Value::Null);
+    let id = req.get("id").cloned()?;
 
-    let method = req
-        .get("method")
-        .and_then(|m| m.as_str())
-        .unwrap_or("");
+    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
 
     let result = dispatch_method(store, method, params);
     Some(match result {
         Ok(value) => json!({ "jsonrpc": "2.0", "id": id, "result": value }).to_string(),
-        Err(RpcError { code, message, data }) => {
+        Err(RpcError {
+            code,
+            message,
+            data,
+        }) => {
             let mut err = json!({ "code": code, "message": message });
             if let Some(d) = data {
                 err["data"] = d;
@@ -497,18 +493,19 @@ fn with_store_mut<F, R>(store: &SharedStore, f: F) -> Result<R, RpcError>
 where
     F: FnOnce(&mut GameStore) -> Result<R, RpcError>,
 {
-    let mut guard = store
-        .lock()
-        .map_err(|_| RpcError {
-            code: -32000,
-            message: "store lock poisoned".into(),
-            data: None,
-        })?;
+    let mut guard = store.lock().map_err(|_| RpcError {
+        code: -32000,
+        message: "store lock poisoned".into(),
+        data: None,
+    })?;
     f(&mut guard)
 }
 
 fn parse_character(name: &str) -> Result<Character, RpcError> {
-    let norm = name.trim().to_ascii_lowercase().replace([' ', '_', '-'], "");
+    let norm = name
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '_', '-'], "");
     use Character::*;
     let c = match norm.as_str() {
         "washerwoman" => Washerwoman,
@@ -601,7 +598,9 @@ fn tool_start_game(store: &SharedStore, args: Value) -> Result<Value, RpcError> 
                 .transpose()?;
             let ra = if true_c == Character::Drunk {
                 let face = believed.ok_or_else(|| {
-                    invalid_params("Drunk assignment requires believed/believed_character Townsfolk face")
+                    invalid_params(
+                        "Drunk assignment requires believed/believed_character Townsfolk face",
+                    )
                 })?;
                 RoleAssignment::drunk(seat, face).map_err(|e| tool_err(ToolError::from(e)))?
             } else {
@@ -650,10 +649,7 @@ fn tool_start_game(store: &SharedStore, args: Value) -> Result<Value, RpcError> 
         None
     };
 
-    let red_herring = args
-        .get("red_herring")
-        .map(seat_id)
-        .transpose()?;
+    let red_herring = args.get("red_herring").map(seat_id).transpose()?;
 
     let demon_bluffs = if let Some(arr) = args.get("demon_bluffs").and_then(|v| v.as_array()) {
         let mut out = Vec::new();
@@ -928,7 +924,11 @@ fn tool_night_action(store: &SharedStore, args: Value) -> Result<Value, RpcError
 fn parse_night_payload(args: &Value) -> Result<NightActionPayload, RpcError> {
     // Nested `payload` object or flat fields.
     let p = args.get("payload").unwrap_or(args);
-    if let Some(kind) = p.get("kind").or_else(|| p.get("type")).and_then(|v| v.as_str()) {
+    if let Some(kind) = p
+        .get("kind")
+        .or_else(|| p.get("type"))
+        .and_then(|v| v.as_str())
+    {
         return match kind {
             "ack" | "Ack" => Ok(NightActionPayload::Ack),
             "pick_one" | "PickOne" => {
@@ -963,7 +963,9 @@ fn parse_night_payload(args: &Value) -> Result<NightActionPayload, RpcError> {
                     name: name.to_string(),
                 })
             }
-            other => Err(invalid_params(format!("unknown night payload kind: {other}"))),
+            other => Err(invalid_params(format!(
+                "unknown night payload kind: {other}"
+            ))),
         };
     }
     if p.get("ack").and_then(|v| v.as_bool()) == Some(true)
@@ -1157,11 +1159,7 @@ fn tool_host_decide(store: &SharedStore, args: Value) -> Result<Value, RpcError>
                         }
                     }
                 }
-                other => {
-                    return Err(invalid_params(format!(
-                        "unknown mayor choice: {other}"
-                    )))
-                }
+                other => return Err(invalid_params(format!("unknown mayor choice: {other}"))),
             };
             HostDecision::MayorRedirect { choice }
         }
@@ -1183,11 +1181,7 @@ fn tool_host_decide(store: &SharedStore, args: Value) -> Result<Value, RpcError>
                 .to_string();
             HostDecision::NightInfo { text }
         }
-        other => {
-            return Err(invalid_params(format!(
-                "unknown host_decide type: {other}"
-            )))
-        }
+        other => return Err(invalid_params(format!("unknown host_decide type: {other}"))),
     };
     with_store_mut(store, |st| {
         let game = st
@@ -1407,10 +1401,7 @@ mod tests {
             );
             // Every property must carry a type and a description.
             for (field, spec) in props {
-                assert!(
-                    spec.get("type").is_some(),
-                    "{name}.{field}: missing type"
-                );
+                assert!(spec.get("type").is_some(), "{name}.{field}: missing type");
                 assert!(
                     spec.get("description").is_some(),
                     "{name}.{field}: missing description"

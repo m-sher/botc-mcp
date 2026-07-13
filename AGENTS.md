@@ -56,6 +56,7 @@ If you add a feature that can leak true identity to a Drunk seat (logs, errors, 
 - Transport is line-delimited JSON-RPC on stdio (`docs/mcp.md`); keep handlers in `tools`, not in the transport layer.
 - Keep player responses free of other seats’ secrets.
 - Tests should cover at least: public chat shared; private roles isolated; **Drunk face on private state**.
+- Before commit: `cargo fmt --all` and `cargo clippy --all-targets -- -D warnings` (enforced by `.githooks/pre-commit` when `git config core.hooksPath .githooks`).
 
 ## Don’t
 

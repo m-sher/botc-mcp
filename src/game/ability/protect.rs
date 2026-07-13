@@ -18,11 +18,7 @@ pub fn is_soldier_immune(game: &Game, seat: SeatId) -> bool {
     game.seats
         .iter()
         .find(|s| s.id == seat)
-        .map(|s| {
-            s.alive
-                && s.true_character == Some(Character::Soldier)
-                && !s.ability_disabled()
-        })
+        .map(|s| s.alive && s.true_character == Some(Character::Soldier) && !s.ability_disabled())
         .unwrap_or(false)
 }
 

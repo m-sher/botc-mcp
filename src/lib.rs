@@ -7,10 +7,10 @@ pub mod comms;
 pub mod error;
 pub mod game;
 pub mod harness;
+pub mod mcp_server;
 pub mod rng;
 pub mod roles;
 pub mod store;
 pub mod tools;
-pub mod mcp_server;
 
 pub use error::{GameError, ToolError};

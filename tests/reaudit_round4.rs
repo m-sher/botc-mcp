@@ -6,9 +6,7 @@ use botc_mcp::game::{
     RoleAssignment, SeatId, StartOpts,
 };
 use botc_mcp::roles::{Character, CharacterType};
-use botc_mcp::tools::{
-    host_decide, host_queue_lie, nominate, open_nominations, skip_night_action,
-};
+use botc_mcp::tools::{host_decide, host_queue_lie, nominate, open_nominations, skip_night_action};
 
 fn names(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("P{i}")).collect()
@@ -185,7 +183,10 @@ fn starpass_pending_host_pick() {
     )
     .unwrap();
     // #27: Imp stays publicly alive during host starpass pause.
-    assert!(g.seats[1].alive, "Imp must stay alive until host resolves starpass");
+    assert!(
+        g.seats[1].alive,
+        "Imp must stay alive until host resolves starpass"
+    );
     match g.pending_host.clone().expect("starpass pending") {
         botc_mcp::game::PendingHostDecision::StarpassPick { minions, .. } => {
             assert!(minions.contains(&SeatId(2)) && minions.contains(&SeatId(3)));
@@ -195,9 +196,7 @@ fn starpass_pending_host_pick() {
     host_decide(
         &mut g,
         &host,
-        HostDecision::StarpassPick {
-            minion: SeatId(3),
-        },
+        HostDecision::StarpassPick { minion: SeatId(3) },
     )
     .unwrap();
     assert!(!g.seats[1].alive, "Imp dies when starpass completes");

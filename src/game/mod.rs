@@ -16,11 +16,9 @@ pub use day::{
     close_vote, day_action_slay, end_nominations, execution_leader, meets_threshold, nominate,
     open_nominations, pass_vote, resolve_execution, vote, ClosedNomination, OpenNomination,
 };
-pub use win::{apply_demon_death, end_game, living_count as count_living, win_check};
 pub use ids::{GameId, SeatId};
 pub use night::{
-    build_first_night_queue, build_other_night_queue, ChoiceSchema, NightActionPayload,
-    PendingWake,
+    build_first_night_queue, build_other_night_queue, ChoiceSchema, NightActionPayload, PendingWake,
 };
 pub use phase::{DayStage, EndReason, NightStep, Phase, Winner};
 pub use seat::Seat;
@@ -32,3 +30,4 @@ pub use st_policy::{
 pub use state::{
     CreateGameResult, Game, Lobby, PublicSeatView, RoleAssignment, MAX_PLAYERS, MIN_PLAYERS,
 };
+pub use win::{apply_demon_death, end_game, living_count as count_living, win_check};

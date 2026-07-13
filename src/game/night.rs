@@ -5,8 +5,8 @@ use crate::comms::{PrivateMessage, PublicEvent};
 use crate::error::GameError;
 use crate::game::ids::SeatId;
 use crate::game::phase::{DayStage, NightStep, Phase};
-use crate::game::state::Game;
 use crate::game::st_policy::{NightInfoPayload, PendingHostDecision, StChoiceMode};
+use crate::game::state::Game;
 use crate::roles::night_order::{
     FirstNightSlot, OtherNightSlot, FIRST_NIGHT_CHARACTER_ORDER, OTHER_NIGHT_CHARACTER_ORDER,
 };
@@ -239,10 +239,7 @@ impl Game {
     ) -> Result<(), GameError> {
         // While a host ST decision is outstanding, players cannot advance the night (#36–#38).
         self.require_no_pending_host()?;
-        let pending = self
-            .pending_night
-            .clone()
-            .ok_or(GameError::NotYourWake)?;
+        let pending = self.pending_night.clone().ok_or(GameError::NotYourWake)?;
         if pending.seat != seat {
             return Err(GameError::NotYourWake);
         }
@@ -475,8 +472,7 @@ impl Game {
         } else {
             bluffs.join(", ")
         };
-        let text =
-            format!("Your Minions: {minion_text}. Not-in-play bluffs: {bluff_text}.");
+        let text = format!("Your Minions: {minion_text}. Not-in-play bluffs: {bluff_text}.");
 
         for s in &self.seats {
             if s.true_character
@@ -715,10 +711,7 @@ fn night_info_meta(step: NightStep, game: &Game, seat: SeatId) -> (&'static str,
 }
 
 impl Game {
-    fn default_payload_for(
-        &self,
-        pending: &PendingWake,
-    ) -> Result<NightActionPayload, GameError> {
+    fn default_payload_for(&self, pending: &PendingWake) -> Result<NightActionPayload, GameError> {
         match &pending.schema {
             ChoiceSchema::Ack => Ok(NightActionPayload::Ack),
             ChoiceSchema::PickOne {
@@ -749,11 +742,7 @@ impl Game {
                     .first()
                     .map(|s| s.id)
                     .ok_or(GameError::IllegalAction("no seats"))?;
-                let b = self
-                    .seats
-                    .get(1)
-                    .map(|s| s.id)
-                    .unwrap_or(a);
+                let b = self.seats.get(1).map(|s| s.id).unwrap_or(a);
                 Ok(NightActionPayload::PickTwo { a, b })
             }
         }
@@ -821,13 +810,7 @@ mod unit_tests {
     use crate::roles::Character;
 
     fn tiny_game() -> Game {
-        let names = vec![
-            "A".into(),
-            "B".into(),
-            "C".into(),
-            "D".into(),
-            "E".into(),
-        ];
+        let names = vec!["A".into(), "B".into(), "C".into(), "D".into(), "E".into()];
         let lobby = Game::create(names, 1).unwrap();
         let host = lobby.host_token.clone();
         let mut g = lobby.game;

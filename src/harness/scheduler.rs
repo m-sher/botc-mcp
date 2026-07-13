@@ -284,7 +284,10 @@ fn tally_desc(game: &Game, nom: &OpenNomination) -> String {
     if parts.is_empty() {
         format!("no votes yet — {eligible} eligible voters")
     } else {
-        format!("{} — {acted} of {eligible} eligible have acted", parts.join(", "))
+        format!(
+            "{} — {acted} of {eligible} eligible have acted",
+            parts.join(", ")
+        )
     }
 }
 
@@ -390,7 +393,10 @@ mod tests {
         });
         let plan = plan_ticks(&g, 0, 0);
         assert_eq!(plan.len(), 1);
-        assert!(matches!(plan[0], SchedTarget::Host(HostTask::ResolveDecision { .. })));
+        assert!(matches!(
+            plan[0],
+            SchedTarget::Host(HostTask::ResolveDecision { .. })
+        ));
     }
 
     #[test]
@@ -472,7 +478,9 @@ mod tests {
         let done = plan_ticks(&g, 7 * DISCUSSION_ROUNDS, 0);
         assert_eq!(
             done,
-            vec![SchedTarget::Host(HostTask::EndDay { in_discussion: true })]
+            vec![SchedTarget::Host(HostTask::EndDay {
+                in_discussion: true
+            })]
         );
         // Dead players don't get speaking turns.
         g.seats[2].alive = false;
@@ -498,7 +506,10 @@ mod tests {
         assert_eq!(p.len(), 1);
         assert!(matches!(
             p[0],
-            SchedTarget::Player { task: PlayerTask::Nominate, .. }
+            SchedTarget::Player {
+                task: PlayerTask::Nominate,
+                ..
+            }
         ));
         // Someone who already nominated today is skipped.
         g.day_nominators.push(SeatId(0));
@@ -513,7 +524,9 @@ mod tests {
         let done = plan_ticks(&g, 0, 6);
         assert_eq!(
             done,
-            vec![SchedTarget::Host(HostTask::EndDay { in_discussion: false })]
+            vec![SchedTarget::Host(HostTask::EndDay {
+                in_discussion: false
+            })]
         );
     }
 
@@ -569,8 +582,8 @@ mod tests {
     #[test]
     fn stalled_vote_offers_next_voters_then_host_closes_alone() {
         let g = open_vote_game(); // P0 nominated P1; P0 voted; pending = P2..P6,P1 (6 voters)
-        // Each stalled cycle offers the NEXT pending voter (a stuck voter must
-        // not block the queue): stall 0 → P2, stall 1 → P3, …
+                                  // Each stalled cycle offers the NEXT pending voter (a stuck voter must
+                                  // not block the queue): stall 0 → P2, stall 1 → P3, …
         for (stall, expect) in [(0usize, 2u8), (1, 3), (2, 4), (3, 5), (4, 6), (5, 1)] {
             let plan = plan_ticks(&g, 0, stall);
             assert_eq!(voter_seats(&plan), vec![expect], "stall={stall}");
@@ -621,7 +634,9 @@ mod tests {
         let at = plan_ticks(&g, 0, STALL_ESCALATE);
         assert_eq!(
             at,
-            vec![SchedTarget::Host(HostTask::SkipStuckWake { seat: SeatId(3) })],
+            vec![SchedTarget::Host(HostTask::SkipStuckWake {
+                seat: SeatId(3)
+            })],
             "escalation tick must be host-only"
         );
     }
@@ -639,7 +654,11 @@ mod tests {
         // changes the signature, resetting the stall counter.
         let mut gv = open_vote_game();
         assert_eq!(wait_signature(&gv).as_deref(), Some("vote:0-1:1:7"));
-        gv.current_nomination.as_mut().unwrap().votes.push((SeatId(2), false));
+        gv.current_nomination
+            .as_mut()
+            .unwrap()
+            .votes
+            .push((SeatId(2), false));
         assert_eq!(wait_signature(&gv).as_deref(), Some("vote:0-1:2:7"));
         // A mid-stage death (Slayer) changes the roster → signature changes →
         // the fairness window restarts.

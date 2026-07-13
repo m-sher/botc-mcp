@@ -5,9 +5,7 @@ mod info;
 pub mod protect;
 pub mod register;
 
-pub use evil::{
-    apply_poison, clear_poisons, on_poisoner_left_play, try_demon_kill, KillResult,
-};
+pub use evil::{apply_poison, clear_poisons, on_poisoner_left_play, try_demon_kill, KillResult};
 
 use crate::comms::PrivateMessage;
 use crate::error::GameError;

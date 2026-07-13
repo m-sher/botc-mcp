@@ -277,18 +277,13 @@ pub fn cycle_in_list(current: &str, list: &[String], delta: i32) -> String {
 /// Critical: **never** hold the slot mutex across a blocking `Child::wait()`.
 /// The waiter uses `try_wait` + short sleeps; `take_and_kill` must be able to
 /// acquire the lock while a child is still running and deliver SIGKILL.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 enum ChildState {
+    #[default]
     Empty,
     Running(Child),
     /// Reaped by kill or natural exit; waiter may still consume the status.
     Exited(std::process::ExitStatus),
-}
-
-impl Default for ChildState {
-    fn default() -> Self {
-        Self::Empty
-    }
 }
 
 #[derive(Debug, Default)]
@@ -344,6 +339,216 @@ impl ChildSlot {
     }
 }
 
+/// Token spend for one headless tick, from streaming-json `end.usage`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TickUsage {
+    pub input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    /// Full prompt+output including cache (per Grok headless docs).
+    pub total_tokens: u64,
+    pub num_turns: Option<u32>,
+}
+
+impl TickUsage {
+    pub fn accumulate(&mut self, other: &TickUsage) {
+        self.input_tokens += other.input_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
+        self.total_tokens += other.total_tokens;
+        // num_turns: sum tool-loop rounds across ticks.
+        self.num_turns = match (self.num_turns, other.num_turns) {
+            (Some(a), Some(b)) => Some(a.saturating_add(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+    }
+}
+
+/// Context window fill from session `signals.json` (post-tick).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextWindow {
+    pub tokens_used: u64,
+    pub window_tokens: u64,
+    /// Integer percent from Grok (`contextWindowUsage`), 0–100.
+    pub usage_pct: u32,
+}
+
+impl ContextWindow {
+    pub fn short(&self) -> String {
+        if self.window_tokens > 0 {
+            format!(
+                "ctx {}% ({} / {})",
+                self.usage_pct,
+                format_token_count(self.tokens_used),
+                format_token_count(self.window_tokens)
+            )
+        } else {
+            format!("ctx {}%", self.usage_pct)
+        }
+    }
+}
+
+/// Per-agent cumulative spend + latest context window for UI / ranking.
+#[derive(Debug, Clone, Default)]
+pub struct AgentUsage {
+    pub last_tick: Option<TickUsage>,
+    /// Sum of per-tick totals over the whole game.
+    pub game_total: TickUsage,
+    pub ticks_with_usage: u32,
+    pub context: Option<ContextWindow>,
+}
+
+impl AgentUsage {
+    pub fn record_tick(&mut self, tick: TickUsage) {
+        self.game_total.accumulate(&tick);
+        self.ticks_with_usage = self.ticks_with_usage.saturating_add(1);
+        self.last_tick = Some(tick);
+    }
+
+    /// Compact board line: `Σ48k · last 12k · ctx 7% (36k/512k)`.
+    pub fn board_short(&self) -> String {
+        let mut parts = Vec::new();
+        if self.game_total.total_tokens > 0 {
+            parts.push(format!(
+                "Σ{}",
+                format_token_count(self.game_total.total_tokens)
+            ));
+        }
+        if let Some(t) = &self.last_tick {
+            if t.total_tokens > 0 {
+                parts.push(format!("last {}", format_token_count(t.total_tokens)));
+            }
+        }
+        if let Some(c) = &self.context {
+            parts.push(c.short());
+        }
+        if parts.is_empty() {
+            "—".into()
+        } else {
+            parts.join(" · ")
+        }
+    }
+}
+
+/// Human token count: `940`, `12k`, `1.2M`.
+pub fn format_token_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 10_000 {
+        format!("{}k", (n + 500) / 1_000)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Parse `usage` (+ optional `num_turns`) from a streaming-json `end` / result object.
+pub fn parse_tick_usage(v: &Value) -> Option<TickUsage> {
+    let usage = v.get("usage")?;
+    let u64_field = |key: &str| -> u64 {
+        usage
+            .get(key)
+            .and_then(|x| x.as_u64().or_else(|| x.as_f64().map(|f| f as u64)))
+            .unwrap_or(0)
+    };
+    let total = u64_field("total_tokens");
+    let input = u64_field("input_tokens");
+    let cache = u64_field("cache_read_input_tokens");
+    let output = u64_field("output_tokens");
+    let reasoning = u64_field("reasoning_tokens");
+    // Some payloads omit total_tokens — reconstruct.
+    let total = if total > 0 {
+        total
+    } else {
+        input.saturating_add(cache).saturating_add(output)
+    };
+    if total == 0 && input == 0 && output == 0 {
+        return None;
+    }
+    let num_turns = v
+        .get("num_turns")
+        .and_then(|x| x.as_u64())
+        .map(|n| n as u32);
+    Some(TickUsage {
+        input_tokens: input,
+        cache_read_input_tokens: cache,
+        output_tokens: output,
+        reasoning_tokens: reasoning,
+        total_tokens: total,
+        num_turns,
+    })
+}
+
+/// Parse usage from one streaming-json stdout line (`type: end` preferred).
+pub fn parse_stream_line_usage(line: &str) -> Option<TickUsage> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line).ok()?;
+    let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    // `end` is the documented spend carrier; also accept a bare result-shaped line.
+    if matches!(ty, "end" | "max_turns_reached" | "result" | "") {
+        return parse_tick_usage(&v);
+    }
+    // Nested usage under some wrappers.
+    if let Some(inner) = v.get("result") {
+        return parse_tick_usage(inner);
+    }
+    None
+}
+
+/// Read context-window fill from Grok's session `signals.json` for this workdir + id.
+pub fn read_session_context(workdir: &Path, session_id: &str) -> Option<ContextWindow> {
+    let path = grok_session_signals_path(workdir, session_id)?;
+    let text = fs::read_to_string(&path).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let tokens_used = v
+        .get("contextTokensUsed")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let window_tokens = v
+        .get("contextWindowTokens")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let usage_pct = v
+        .get("contextWindowUsage")
+        .and_then(|x| x.as_u64().or_else(|| x.as_f64().map(|f| f as u64)))
+        .unwrap_or(0) as u32;
+    if tokens_used == 0 && window_tokens == 0 && usage_pct == 0 {
+        return None;
+    }
+    Some(ContextWindow {
+        tokens_used,
+        window_tokens,
+        usage_pct,
+    })
+}
+
+/// `~/.grok/sessions/{url-encoded-abs-cwd}/{session_id}/signals.json`
+fn grok_session_signals_path(workdir: &Path, session_id: &str) -> Option<PathBuf> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let abs = workdir
+        .canonicalize()
+        .unwrap_or_else(|_| workdir.to_path_buf());
+    let encoded = abs.to_string_lossy().replace('/', "%2F");
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join(".grok/sessions")
+            .join(encoded)
+            .join(session_id)
+            .join("signals.json"),
+    )
+}
+
 #[derive(Debug)]
 pub struct LiveAgent {
     pub config: AgentConfig,
@@ -356,6 +561,8 @@ pub struct LiveAgent {
     pub running: Arc<Mutex<bool>>,
     /// True only after a **successful** first headless run (#47).
     pub session_started: Arc<Mutex<bool>>,
+    /// Token spend + context window (updated each tick).
+    pub usage: Arc<Mutex<AgentUsage>>,
     child: Arc<ChildSlot>,
 }
 
@@ -391,6 +598,7 @@ impl AgentPool {
                 log: Arc::new(Mutex::new(Vec::new())),
                 running: Arc::new(Mutex::new(false)),
                 session_started: Arc::new(Mutex::new(false)),
+                usage: Arc::new(Mutex::new(AgentUsage::default())),
                 child: Arc::new(ChildSlot::default()),
             });
         }
@@ -406,11 +614,9 @@ impl AgentPool {
         let mut last_err: Option<std::io::Error> = None;
         for agent in &mut self.agents {
             let prompt = match agent.config.role {
-                AgentRole::Host => prompts::host_kickoff(
-                    agent.config.game_id,
-                    n_players,
-                    &self.cfg.st_choice_mode,
-                ),
+                AgentRole::Host => {
+                    prompts::host_kickoff(agent.config.game_id, n_players, &self.cfg.st_choice_mode)
+                }
                 AgentRole::Player { seat } => prompts::player_kickoff(
                     &agent.config.display_name,
                     seat,
@@ -481,9 +687,9 @@ impl AgentPool {
                     .position(|a| matches!(a.config.role, AgentRole::Host)),
                 SchedTarget::Player { seat, .. } => {
                     let seat = *seat;
-                    self.agents
-                        .iter()
-                        .position(|a| matches!(a.config.role, AgentRole::Player { seat: s } if s == seat))
+                    self.agents.iter().position(
+                        |a| matches!(a.config.role, AgentRole::Player { seat: s } if s == seat),
+                    )
                 }
             };
             let Some(idx) = idx else { continue };
@@ -691,7 +897,12 @@ fn spawn_grok_tick(
     let running_flag = Arc::clone(&agent.running);
     let session_started_flag = Arc::clone(&agent.session_started);
     let session_id_slot = Arc::clone(&agent.session_id);
+    let usage_slot = Arc::clone(&agent.usage);
+    let workdir = agent.workdir.clone();
     let child_slot = Arc::clone(&agent.child);
+    let game_id = agent.config.game_id;
+    let model = agent.config.model.clone();
+    let agent_role_label = label.clone();
     // #56: grok exits 1 on normal --max-turns; gate resume on stream evidence of a
     // real session (end / max_turns_reached), not process exit code.
     let session_established = Arc::new(AtomicBool::new(false));
@@ -699,14 +910,35 @@ fn spawn_grok_tick(
 
     if let Some(stdout) = child.stdout.take() {
         let log = Arc::clone(&log);
+        let usage_slot = Arc::clone(&usage_slot);
         let established = Arc::clone(&session_established);
         thread::spawn(move || {
             use std::io::BufRead;
             let reader = std::io::BufReader::new(stdout);
-            // Process each streaming-json event as it arrives → live display.
-            for line in reader.lines().flatten() {
+            // Process each streaming-json event as it arrives → live display + usage.
+            for line in reader.lines().map_while(Result::ok) {
                 if stream_line_establishes_session(&line) {
                     established.store(true, Ordering::SeqCst);
+                }
+                if let Some(tick) = parse_stream_line_usage(&line) {
+                    let mut u = usage_slot.lock().unwrap();
+                    u.record_tick(tick.clone());
+                    crate::dlog!(
+                        "USAGE {agent_role_label} tick_total={} Σ={} turns={:?}",
+                        tick.total_tokens,
+                        u.game_total.total_tokens,
+                        tick.num_turns
+                    );
+                    // Ranking corpus: one line per spend-bearing tick.
+                    crate::harness::results_log::log_tick_usage(
+                        game_id,
+                        &agent_role_label,
+                        &model,
+                        &tick,
+                        u.context.as_ref(),
+                        &u.game_total,
+                        u.ticks_with_usage,
+                    );
                 }
                 apply_stream_event(&log, &line);
             }
@@ -717,7 +949,7 @@ fn spawn_grok_tick(
         thread::spawn(move || {
             use std::io::BufRead;
             let reader = std::io::BufReader::new(stderr);
-            for line in reader.lines().flatten() {
+            for line in reader.lines().map_while(Result::ok) {
                 let mut g = log.lock().unwrap();
                 push_full_line(&mut g, LineKind::Stderr, line);
             }
@@ -729,6 +961,8 @@ fn spawn_grok_tick(
     // Waiter: session_started from stream evidence (#47/#56), not exit code alone.
     let child_slot_w = Arc::clone(&child_slot);
     let exit_label = label.clone();
+    let usage_slot_w = Arc::clone(&usage_slot);
+    let session_id_for_ctx = Arc::clone(&session_id_slot);
     thread::spawn(move || {
         let status = child_slot_w.wait_exit();
         // stdout reader may still be finishing; give it a brief moment.
@@ -737,6 +971,17 @@ fn spawn_grok_tick(
                 break;
             }
             thread::sleep(Duration::from_millis(10));
+        }
+        // Context window: read signals.json after the process exits (file is final).
+        let sid = session_id_for_ctx.lock().unwrap().clone();
+        if let Some(ctx) = read_session_context(&workdir, &sid) {
+            usage_slot_w.lock().unwrap().context = Some(ctx.clone());
+            crate::dlog!(
+                "CTX {exit_label} {}% used={} window={}",
+                ctx.usage_pct,
+                ctx.tokens_used,
+                ctx.window_tokens
+            );
         }
         let established = session_established.load(Ordering::SeqCst);
         let was_started = *session_started_flag.lock().unwrap();
@@ -883,9 +1128,17 @@ pub fn apply_stream_event(log: &Mutex<Vec<LogLine>>, line: &str) {
     match v.get("type").and_then(|t| t.as_str()) {
         Some("text") => append_chunk(&mut guard, LineKind::Text, &data(&v)),
         Some("thought") => append_chunk(&mut guard, LineKind::Thought, &data(&v)),
-        Some("end") => push_full_line(&mut guard, LineKind::System, "— turn end —".into()),
+        Some("end") => {
+            let note = parse_tick_usage(&v)
+                .map(|u| format!("— turn end · {} tok —", format_token_count(u.total_tokens)))
+                .unwrap_or_else(|| "— turn end —".into());
+            push_full_line(&mut guard, LineKind::System, note);
+        }
         Some("max_turns_reached") => {
-            push_full_line(&mut guard, LineKind::System, "— max turns reached —".into())
+            let note = parse_tick_usage(&v)
+                .map(|u| format!("— max turns · {} tok —", format_token_count(u.total_tokens)))
+                .unwrap_or_else(|| "— max turns reached —".into());
+            push_full_line(&mut guard, LineKind::System, note);
         }
         Some("error") => {
             let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("?");
@@ -966,6 +1219,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_tick_usage_from_end_event() {
+        let line = r#"{"type":"end","stopReason":"EndTurn","usage":{"input_tokens":100,"cache_read_input_tokens":900,"output_tokens":50,"reasoning_tokens":10,"total_tokens":1050},"num_turns":3}"#;
+        let u = parse_stream_line_usage(line).expect("usage");
+        assert_eq!(u.input_tokens, 100);
+        assert_eq!(u.cache_read_input_tokens, 900);
+        assert_eq!(u.output_tokens, 50);
+        assert_eq!(u.reasoning_tokens, 10);
+        assert_eq!(u.total_tokens, 1050);
+        assert_eq!(u.num_turns, Some(3));
+        // Reconstruct total when omitted.
+        let bare = r#"{"type":"end","usage":{"input_tokens":10,"cache_read_input_tokens":5,"output_tokens":2}}"#;
+        let u2 = parse_stream_line_usage(bare).unwrap();
+        assert_eq!(u2.total_tokens, 17);
+        assert!(parse_stream_line_usage(r#"{"type":"text","data":"hi"}"#).is_none());
+    }
+
+    #[test]
+    fn agent_usage_accumulates_and_formats_board() {
+        let mut u = AgentUsage::default();
+        assert_eq!(u.board_short(), "—");
+        u.record_tick(TickUsage {
+            total_tokens: 12_000,
+            input_tokens: 10_000,
+            output_tokens: 2_000,
+            ..Default::default()
+        });
+        u.record_tick(TickUsage {
+            total_tokens: 3_500,
+            ..Default::default()
+        });
+        assert_eq!(u.ticks_with_usage, 2);
+        assert_eq!(u.game_total.total_tokens, 15_500);
+        u.context = Some(ContextWindow {
+            tokens_used: 35_586,
+            window_tokens: 512_000,
+            usage_pct: 6,
+        });
+        let s = u.board_short();
+        assert!(s.contains('Σ'), "{s}");
+        assert!(s.contains("ctx 6%"), "{s}");
+        assert!(s.contains("last"), "{s}");
+    }
+
+    #[test]
+    fn format_token_count_scales() {
+        assert_eq!(format_token_count(940), "940");
+        assert_eq!(format_token_count(1_500), "1.5k");
+        assert_eq!(format_token_count(12_400), "12k");
+    }
+
+    #[test]
     fn parse_grok_models_output_reads_list_and_default() {
         let sample = r#"
 You are logged in with grok.com.
@@ -995,13 +1299,11 @@ Available models:
 
     #[test]
     fn cycle_model_wraps_and_recovers_from_custom() {
-        let mut cfg = HarnessConfig::default();
-        cfg.available_models = vec![
-            "grok-build".into(),
-            "v9-stickynote".into(),
-            "other".into(),
-        ];
-        cfg.model = "grok-build".into();
+        let mut cfg = HarnessConfig {
+            available_models: vec!["grok-build".into(), "v9-stickynote".into(), "other".into()],
+            model: "grok-build".into(),
+            ..Default::default()
+        };
         cfg.cycle_model(1);
         assert_eq!(cfg.model, "v9-stickynote");
         cfg.cycle_model(-1);
@@ -1040,8 +1342,10 @@ Available models:
     fn grok_args_use_the_per_agent_model() {
         // Models are picked per seat: the argv must carry the CALLER's model,
         // not the config default.
-        let mut cfg = HarnessConfig::default();
-        cfg.model = "config-default-model".into();
+        let cfg = HarnessConfig {
+            model: "config-default-model".into(),
+            ..Default::default()
+        };
         for model in ["host-model-a", "seat-model-b"] {
             let args = build_grok_tick_args(
                 &cfg,
@@ -1096,7 +1400,10 @@ Available models:
         assert!(!list.contains("use_tool"));
         // Global coding context dropped + filesystem sandboxed.
         assert!(args.contains(&"--no-memory".into()));
-        let sb = args.iter().position(|a| a == "--sandbox").expect("--sandbox");
+        let sb = args
+            .iter()
+            .position(|a| a == "--sandbox")
+            .expect("--sandbox");
         assert_eq!(args[sb + 1], "workspace");
     }
 
@@ -1114,7 +1421,10 @@ Available models:
         let yolo_count = args.iter().filter(|a| *a == "--yolo").count();
         let always = args.iter().filter(|a| *a == "--always-approve").count();
         assert_eq!(yolo_count, 1, "expected single --yolo: {args:?}");
-        assert_eq!(always, 0, "must not pass --always-approve (alias): {args:?}");
+        assert_eq!(
+            always, 0,
+            "must not pass --always-approve (alias): {args:?}"
+        );
         assert!(args.contains(&"--session-id".into()));
         assert!(!args.contains(&"--resume".into()));
     }
@@ -1231,9 +1541,11 @@ Available models:
     fn stop_all_removes_work_root() {
         let id = uuid::Uuid::new_v4();
         let root = std::env::temp_dir().join(format!("botc-stop-test-{id}"));
-        let mut cfg = HarnessConfig::default();
-        cfg.work_root = root.clone();
-        cfg.socket_path = root.join("engine.sock");
+        let cfg = HarnessConfig {
+            work_root: root.clone(),
+            socket_path: root.join("engine.sock"),
+            ..Default::default()
+        };
         let pool = AgentPool::prepare(
             &cfg,
             vec![AgentConfig {
@@ -1291,9 +1603,11 @@ Available models:
     fn stop_all_with_running_child_returns_quickly() {
         let id = uuid::Uuid::new_v4();
         let root = std::env::temp_dir().join(format!("botc-stop-run-{id}"));
-        let mut cfg = HarnessConfig::default();
-        cfg.work_root = root.clone();
-        cfg.socket_path = root.join("engine.sock");
+        let cfg = HarnessConfig {
+            work_root: root.clone(),
+            socket_path: root.join("engine.sock"),
+            ..Default::default()
+        };
         let mut pool = AgentPool::prepare(
             &cfg,
             vec![AgentConfig {

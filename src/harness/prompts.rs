@@ -3,12 +3,7 @@
 use crate::game::SeatId;
 use crate::harness::scheduler::{HostTask, PlayerTask};
 
-pub fn player_kickoff(
-    display_name: &str,
-    seat: SeatId,
-    game_id: u64,
-    n_players: usize,
-) -> String {
+pub fn player_kickoff(display_name: &str, seat: SeatId, game_id: u64, n_players: usize) -> String {
     format!(
         r#"You are playing Blood on the Clocktower: Trouble Brewing as an agent.
 
@@ -46,6 +41,11 @@ state. Never wait or poll for other players inside a turn.
 ## Table talk (important)
 Nothing forces you to name your character. This is an information game — **what** you reveal and
 **when** matters as much as what you know.
+- **Anyone may lie** in public chat — good and evil. Treat private Storyteller messages as your
+  own facts; treat *other seats' claims* as unproven.
+- Lies work best where **no one can check**. Example: “I was never woken last night” proves
+  nothing — night wakes are private, so that claim cannot be verified and may be false. Same for
+  invented reads, fake bluffs, or a role that only you would know you “have.”
 - Announcing a role that sounds hard to kill (Soldier, Mayor, etc.) can read as self-protection —
   evil players want to survive, so a convenient “don't kill me” claim often draws suspicion.
 - Announcing a powerful good role can put a night-kill target on your back.
@@ -269,7 +269,11 @@ pub fn player_task_tick(
                  claim can paint a target; holding out can look shady if the table needs your read. \
                  Weigh what others will do with your words — nominations, night kills, who they trust. \
                  Soft claims, partial info, redirects, and even a deliberate misclaim are all on the \
-                 table when they serve your win condition.",
+                 table when they serve your win condition.\n\n\
+                 **Everyone can lie**, especially about things the table cannot audit. A seat saying \
+                 they were never woken at night is free to invent that — night contact is private, so \
+                 no one else can confirm or deny it. Do not treat unverifiable claims as hard fact; \
+                 you may also use such claims yourself when it helps your team.",
                 n = round + 1,
                 last = if *last_round {
                     ", the FINAL talk round — after this the day moves on"
@@ -359,13 +363,25 @@ mod tests {
     fn assert_guardrails(p: &str) {
         // The four guardrail sections every turn prompt must carry (#turn-order).
         assert!(p.contains("## Why you were woken"), "missing why: {p}");
-        assert!(p.contains("## How to check the state"), "missing state: {p}");
-        assert!(p.contains("## Actions you may take this turn"), "missing actions: {p}");
-        assert!(p.contains("## What ends your turn"), "missing turn-end: {p}");
+        assert!(
+            p.contains("## How to check the state"),
+            "missing state: {p}"
+        );
+        assert!(
+            p.contains("## Actions you may take this turn"),
+            "missing actions: {p}"
+        );
+        assert!(
+            p.contains("## What ends your turn"),
+            "missing turn-end: {p}"
+        );
         // JSON examples render with single braces and a substituted game id.
         assert!(!p.contains("{{"), "doubled braces leaked: {p}");
         assert!(!p.contains("{gid}"), "gid placeholder not substituted: {p}");
-        assert!(p.contains("\"game_id\": 7"), "example missing real game_id: {p}");
+        assert!(
+            p.contains("\"game_id\": 7"),
+            "example missing real game_id: {p}"
+        );
     }
 
     #[test]
@@ -398,14 +414,20 @@ mod tests {
             },
             "phase: Day",
         );
-        assert!(ghost.contains("pass_vote"), "dead voters may abstain: {ghost}");
+        assert!(
+            ghost.contains("pass_vote"),
+            "dead voters may abstain: {ghost}"
+        );
         assert!(ghost.contains("ghost vote"));
 
         let talk = player_task_tick(
             "P1",
             SeatId(1),
             7,
-            &PlayerTask::Discuss { round: 1, last_round: true },
+            &PlayerTask::Discuss {
+                round: 1,
+                last_round: true,
+            },
             "phase: Day",
         );
         assert_guardrails(&talk);
@@ -424,7 +446,9 @@ mod tests {
             "P3",
             SeatId(3),
             7,
-            &PlayerTask::NightWake { prompt: "Choose a player to poison".into() },
+            &PlayerTask::NightWake {
+                prompt: "Choose a player to poison".into(),
+            },
             "phase: Night",
         );
         assert_guardrails(&wake);
@@ -437,10 +461,24 @@ mod tests {
 
     #[test]
     fn host_end_day_prompt_matches_stage() {
-        let from_disc = host_task_tick(7, &HostTask::EndDay { in_discussion: true }, "s", "h");
+        let from_disc = host_task_tick(
+            7,
+            &HostTask::EndDay {
+                in_discussion: true,
+            },
+            "s",
+            "h",
+        );
         assert!(from_disc.contains("open_nominations"), "{from_disc}");
         assert!(from_disc.contains("end_nominations"));
-        let from_noms = host_task_tick(7, &HostTask::EndDay { in_discussion: false }, "s", "h");
+        let from_noms = host_task_tick(
+            7,
+            &HostTask::EndDay {
+                in_discussion: false,
+            },
+            "s",
+            "h",
+        );
         assert!(from_noms.contains("end_nominations"));
         assert!(!from_noms.contains("Call `open_nominations`"));
     }
@@ -450,6 +488,30 @@ mod tests {
         let p = player_kickoff("P0", SeatId(0), 1, 5);
         assert!(p.contains("## Table talk"), "{p}");
         assert!(p.to_lowercase().contains("nothing forces"), "{p}");
-        assert!(p.to_lowercase().contains("mislead") || p.to_lowercase().contains("bluff"), "{p}");
+        assert!(
+            p.to_lowercase().contains("mislead") || p.to_lowercase().contains("bluff"),
+            "{p}"
+        );
+        assert!(p.to_lowercase().contains("anyone may lie"), "{p}");
+        assert!(
+            p.to_lowercase().contains("never woken") || p.to_lowercase().contains("never"),
+            "kickoff should mention unverifiable night-wake claims: {p}"
+        );
+    }
+
+    #[test]
+    fn discuss_prompt_warns_unverifiable_lies() {
+        let talk = player_task_tick(
+            "P1",
+            SeatId(1),
+            7,
+            &PlayerTask::Discuss {
+                round: 0,
+                last_round: false,
+            },
+            "phase: Day",
+        );
+        assert!(talk.to_lowercase().contains("everyone can lie"), "{talk}");
+        assert!(talk.to_lowercase().contains("never woken"), "{talk}");
     }
 }

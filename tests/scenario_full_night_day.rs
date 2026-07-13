@@ -3,9 +3,7 @@
 mod common;
 
 use botc_mcp::comms::{PrivateMessage, PublicEvent};
-use botc_mcp::game::{
-    DayStage, NightActionPayload, NightStep, Phase, RoleAssignment, SeatId,
-};
+use botc_mcp::game::{DayStage, NightActionPayload, NightStep, Phase, RoleAssignment, SeatId};
 use botc_mcp::roles::Character;
 use botc_mcp::tools::{
     get_private_state, get_public_log, get_public_state, night_action, say, skip_night_action,
@@ -100,7 +98,9 @@ fn scenario_full_n1_info_day_vote_n2_kill() {
     // Seat1 Empath neighbors 0 and 2 → both good → 0 evil.
     let empath_results = night_results(&g, SeatId(1));
     assert!(
-        empath_results.iter().any(|t| t.contains("0 of") || t.contains("that 0")),
+        empath_results
+            .iter()
+            .any(|t| t.contains("0 of") || t.contains("that 0")),
         "Empath should learn 0 evil neighbors: {empath_results:?}"
     );
 

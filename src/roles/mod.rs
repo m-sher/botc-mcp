@@ -16,10 +16,8 @@ impl Character {
     pub fn character_type(self) -> CharacterType {
         use Character::*;
         match self {
-            Washerwoman | Librarian | Investigator | Chef | Empath | FortuneTeller
-            | Undertaker | Monk | Ravenkeeper | Virgin | Slayer | Soldier | Mayor => {
-                CharacterType::Townsfolk
-            }
+            Washerwoman | Librarian | Investigator | Chef | Empath | FortuneTeller | Undertaker
+            | Monk | Ravenkeeper | Virgin | Slayer | Soldier | Mayor => CharacterType::Townsfolk,
             Butler | Drunk | Recluse | Saint => CharacterType::Outsider,
             Poisoner | Spy | ScarletWoman | Baron => CharacterType::Minion,
             Imp => CharacterType::Demon,

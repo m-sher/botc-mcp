@@ -8,8 +8,8 @@ mod rules_text;
 mod views;
 
 pub use rules_docs::{
-    list_characters as list_character_pool, list_rules_topics, load_rules_topic, CharacterListEntry,
-    RulesTopic,
+    list_characters as list_character_pool, list_rules_topics, load_rules_topic,
+    CharacterListEntry, RulesTopic,
 };
 pub use rules_text::{load_character_rules_text, rules_markdown_path};
 pub use views::{
@@ -231,11 +231,7 @@ pub fn get_host_state(game: &Game, token: &Token) -> Result<HostStateView, ToolE
         st_choice_mode: format!("{:?}", game.st_choice_mode),
         host_lie_queue_len: game.host_lie_queue.len(),
         red_herring: game.red_herring,
-        demon_bluffs: game
-            .demon_bluffs
-            .iter()
-            .map(|c| c.display_name())
-            .collect(),
+        demon_bluffs: game.demon_bluffs.iter().map(|c| c.display_name()).collect(),
         winner: game.winner,
     })
 }
@@ -252,7 +248,12 @@ pub fn say(game: &mut Game, token: &Token, text: String) -> Result<EventId, Tool
         }
     };
     game.say(seat, text).map_err(ToolError::Game)?;
-    Ok(game.public_log.since(0).last().map(|(id, _)| *id).unwrap_or(0))
+    Ok(game
+        .public_log
+        .since(0)
+        .last()
+        .map(|(id, _)| *id)
+        .unwrap_or(0))
 }
 
 /// Host: public storyteller announcement.
@@ -262,7 +263,12 @@ pub fn st_announce(game: &mut Game, host: &Token, text: String) -> Result<EventI
         _ => return Err(ToolError::Unauthorized),
     }
     game.st_announce(text);
-    Ok(game.public_log.since(0).last().map(|(id, _)| *id).unwrap_or(0))
+    Ok(game
+        .public_log
+        .since(0)
+        .last()
+        .map(|(id, _)| *id)
+        .unwrap_or(0))
 }
 
 /// Public character sheet entry (ability text loaded from docs). Not secret.
@@ -306,11 +312,7 @@ pub fn skip_night_action(game: &mut Game, host: &Token) -> Result<(), ToolError>
 }
 
 /// Host only: resolve Mayor bounce / starpass pick.
-pub fn host_decide(
-    game: &mut Game,
-    host: &Token,
-    decision: HostDecision,
-) -> Result<(), ToolError> {
+pub fn host_decide(game: &mut Game, host: &Token, decision: HostDecision) -> Result<(), ToolError> {
     game.host_decide(host, decision).map_err(ToolError::from)
 }
 
@@ -387,8 +389,8 @@ pub fn day_action(
         Actor::Host => return Err(ToolError::BadRequest("host cannot use day_action")),
     };
     match payload {
-        DayActionPayload::Slay { target } => game
-            .day_action_slay(seat, target)
-            .map_err(ToolError::from),
+        DayActionPayload::Slay { target } => {
+            game.day_action_slay(seat, target).map_err(ToolError::from)
+        }
     }
 }

@@ -23,7 +23,7 @@ spec linked below.
 
 ## Development
 
-Requires a recent stable Rust toolchain.
+Requires a recent stable Rust toolchain (`rustfmt` + `clippy` components).
 
 ```bash
 # Build library + binaries
@@ -32,12 +32,27 @@ cargo build --bins
 # Unit + integration tests (scenarios under tests/)
 cargo test
 
+# Format + lint (same checks as pre-commit)
+cargo fmt --all
+cargo clippy --all-targets -- -D warnings
+
 # MCP server on stdin/stdout (line-delimited JSON-RPC 2.0)
 cargo run --bin botc-mcp
 
 # Multi-agent monitoring TUI (spawns headless Grok sessions)
 cargo run --bin botc-tui
 ```
+
+### Pre-commit hook
+
+Hooks live in [`.githooks/`](.githooks/) (tracked). Enable once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+On each commit, the hook runs `cargo fmt --all -- --check` and
+`cargo clippy --all-targets -- -D warnings` (fails the commit if either fails).
 
 See [`docs/harness.md`](docs/harness.md) for the multi-agent harness architecture.
 

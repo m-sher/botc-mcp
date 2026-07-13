@@ -233,10 +233,7 @@ fn host_lie_queued_during_day_survives_enter_night() {
     while g.pending_night.is_some() || g.pending_host.is_some() {
         skip_night_action(&mut g, &host).unwrap();
     }
-    assert!(
-        g.host_lie_queue.is_empty(),
-        "unused lie must clear at dawn"
-    );
+    assert!(g.host_lie_queue.is_empty(), "unused lie must clear at dawn");
 }
 
 /// #34 / #28: last closed nomination with no majority → NoExecution.
@@ -262,7 +259,13 @@ fn auto_end_last_nom_all_no_is_no_execution() {
             if g.current_nomination.is_none() {
                 break;
             }
-            if !matches!(g.phase, Phase::Day { day: 1, stage: DayStage::Nominations }) {
+            if !matches!(
+                g.phase,
+                Phase::Day {
+                    day: 1,
+                    stage: DayStage::Nominations
+                }
+            ) {
                 break;
             }
             let _ = vote(&mut g, t, SeatId(target), false);
