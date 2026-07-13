@@ -24,17 +24,26 @@ Typical tools:
 - night_action / day_action / nominate / vote / pass_vote — when it is legal for you
 - Actions are **state-gated** by the engine: it rejects anything illegal for the current phase.
 
-## How turns work (READ THIS)
-The harness runs the table **one turn at a time** and wakes you only when it is YOUR turn, with
-instructions saying exactly why you were woken (your night action / your turn to speak / your turn
-to nominate / your turn to vote) and which actions are legal. Take the requested action(s), then
-stop responding — your turn ends when you stop calling tools, and you'll be woken again with fresh
-state. Never wait or poll for other players inside a turn.
+## How turns work (READ THIS) — continuous session
+You stay in **this process for the whole game**. Do **not** end by chatting without tools and
+waiting. The only correct idle is the MCP tool **`await_turn`**.
+
+Loop for the entire game:
+1. Call `await_turn` with `game_id={game_id}` (optional `since_seq` from the last result).
+2. If `status` is **`wake`**: read `prompt` (why you were woken + legal actions). Do those
+   actions (`night_action` / `say` / `nominate` / `vote` / …), then call `await_turn` again.
+3. If `status` is **`idle`**: immediately call `await_turn` again (server poll budget ended;
+   this is normal, not a failure).
+4. If `await_turn` **errors or times out**: call `await_turn` again with the same `since_seq`.
+   Wakes are durable — you cannot miss a turn by timing out; the same `wake_id` may redeliver.
+5. If `status` is **`game_over`**: stop.
+
+Never busy-poll with get_public_state instead of `await_turn`. Never invent other seats' private info.
 
 ## How to play
-1. Call get_private_state and get_public_state.
+1. Call get_private_state and get_public_state once at setup.
 2. Read the rules for your face role if needed.
-3. Talk publicly with `say` **during the day** when woken to speak; at night, only submit your
+3. Then enter the `await_turn` loop. Talk with `say` only when a wake says so; at night only
    `night_action` when woken for it.
 4. Never claim tool access you don't have. Do not try to become host or use host tools.
 
@@ -55,10 +64,8 @@ Nothing forces you to name your character. This is an information game — **wha
   kills, what story they build. Good players may also **mislead** about their identity when that
   protects the town — bluffing is not reserved for evil.
 
-Start now: read your private role and the rules for it, and plan how you'll play. This is a
-setup-only turn — the first night is starting, so there is no talking. If your character acts
-tonight, you will be woken for it in a separate turn right after this one; do not submit a
-night_action now. Finish by briefly noting (to yourself) your strategy, then stop.
+Start now: read your private role and the rules for it, plan how you'll play (no night_action yet),
+then call **`await_turn`** and stay in that loop until `game_over`.
 "#,
         display_name = display_name,
         seat = seat.0,
@@ -89,28 +96,24 @@ Key tools:
 - open_nominations / close_vote / end_nominations — day pacing when needed
 - st_announce — public ST announcements
 
-## How the game is driven (READ THIS)
-The engine runs the game and the harness wakes agents one at a time, each with instructions.
-**You are only woken when a genuine Storyteller decision is needed** — you do not pace the day,
-players' nominations auto-open voting, votes auto-close, and the day auto-ends into night. At any
-moment `get_host_state` shows **at most one** thing waiting on you: either `pending_host` (a
-Storyteller decision — e.g. what a player learns tonight) or a `pending` player wake. **Your entire
-job each turn is to resolve that one item**, then stop — the harness calls you again when you're
-next needed. You do **not** run the night order yourself, and you do **not** need to read or search
-for any game source code / files — the MCP tools are the whole interface.
+## How the game is driven (READ THIS) — continuous session
+You stay in **this process for the whole game**. Idle **only** via MCP **`await_turn`**.
 
-- `pending_host` = night_info → the named player must learn something tonight. Author it with
-  `host_decide`, or `skip_night_action` to let the engine pick valid default info. **If unsure, skip.**
-- `pending_host` = mayor_redirect / starpass_pick → make the choice with `host_decide` (or skip).
-- a `pending` player wake that's stuck → `skip_night_action` after a reasonable wait.
-- Reading rules (`get_rules_topic`, `get_character_rules`) is fine, but **do not spend the turn only
-  reading** — finish by calling a host tool that changes the game.
-- Never leak grimoire contents in `st_announce` or public chat.
+**You are only woken when a genuine Storyteller decision (or stall fallback) is needed** — you do
+not pace the day; nominations/votes/day-end are engine-driven. When `await_turn` returns
+`status=wake`, resolve that one item, then call `await_turn` again.
 
-## This turn
-1. `start_game` if still in lobby.
-2. `get_host_state`; resolve the single pending item (`host_decide` or `skip_night_action`).
-3. Stop. The harness will call you for the next step.
+Loop:
+1. `await_turn` → on `idle`/timeout/error, call `await_turn` again; on `game_over`, stop.
+2. On `wake`: follow `prompt` (usually `get_host_state` then `host_decide` / `skip_night_action` /
+   `open_nominations` / `end_nominations` / `close_vote` as specified).
+3. Never leak the grimoire in `st_announce`. Do not search the filesystem for game source.
+
+If unsure on night_info, `skip_night_action` is fine.
+
+## This session start
+1. `start_game` if still in lobby (the TUI may already have started).
+2. Enter the `await_turn` loop and stay there until `game_over`.
 "#,
         game_id = game_id,
         n_players = n_players,
@@ -149,6 +152,22 @@ Call get_host_state. Resolve pending_host / stuck wakes / stalled day. Advance t
         game_id = game_id,
         public_summary = public_summary,
         host_hint = host_hint,
+    )
+}
+
+/// After a headless process exits mid-game, resume with this prompt so the agent
+/// re-enters the `await_turn` loop (durable wakes redeliver).
+pub fn reconnect_await_loop(display_name: &str, game_id: u64) -> String {
+    format!(
+        r#"You are still {display_name} in Trouble Brewing game_id={game_id}. Your previous
+process ended; this is a resume of the same session.
+
+Immediately call **`await_turn`** with game_id={game_id} and stay in the await_turn loop:
+wake → act → await_turn; idle/timeout/error → await_turn again; game_over → stop.
+Do not re-do orientation; do not invent private info.
+"#,
+        display_name = display_name,
+        game_id = game_id,
     )
 }
 
@@ -218,10 +237,8 @@ pub fn host_task_tick(
 below is the public view. Reading rules (`get_rules_topic`, `get_character_rules`) is allowed.
 
 ## What ends your turn
-Make the host tool call(s) above, optionally `st_announce` one short public line, then stop
-responding. Your turn ends when you stop calling tools; the harness wakes you ONLY when the next
-Storyteller decision is needed — players and the engine drive everything else (nominations
-auto-open, votes auto-close, the day auto-ends). Do NOT narrate the day, do NOT wait or poll.
+Make the host tool call(s) above, optionally `st_announce` one short public line, then call
+**`await_turn` again**. Do NOT free-text conclude and sit idle; do NOT narrate the day.
 
 ## Public snapshot
 {public_summary}
@@ -344,9 +361,8 @@ The snapshot below usually has everything you need already.
 {actions}
 
 ## What ends your turn
-Take your action(s) above, then stop responding — your turn is over when you stop calling tools.
-Do NOT wait for, poll for, or try to respond to other players in this turn: the harness runs the
-table one turn at a time and will wake you again with fresh state when it is next your turn.
+Take your action(s) above, then call **`await_turn` again** — do not free-text conclude and sit idle.
+Do NOT poll for other players: `await_turn` blocks until your next wake (or soft-idles; re-call it).
 
 ## Public snapshot
 {public_summary}
