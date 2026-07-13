@@ -564,6 +564,8 @@ pub struct LiveAgent {
     pub session_started: Arc<Mutex<bool>>,
     /// Token spend + context window (updated each tick).
     pub usage: Arc<Mutex<AgentUsage>>,
+    /// How many times this seat was respawned after an unexpected exit.
+    pub reconnects: u32,
     child: Arc<ChildSlot>,
 }
 
@@ -600,6 +602,7 @@ impl AgentPool {
                 running: Arc::new(Mutex::new(false)),
                 session_started: Arc::new(Mutex::new(false)),
                 usage: Arc::new(Mutex::new(AgentUsage::default())),
+                reconnects: 0,
                 child: Arc::new(ChildSlot::default()),
             });
         }
@@ -737,23 +740,41 @@ impl AgentPool {
     }
 
     /// Respawn any agent whose headless process has exited so continuous
-    /// `await_turn` sessions can recover. Returns how many were respawned.
-    pub fn ensure_alive(&mut self) -> std::io::Result<usize> {
-        let mut n = 0;
+    /// `await_turn` sessions can recover.
+    ///
+    /// Caps respawns per agent so a crash-loop cannot burn tokens forever.
+    pub fn ensure_alive(&mut self) -> std::io::Result<EnsureAliveReport> {
+        const MAX_RECONNECTS: u32 = 8;
+        let mut report = EnsureAliveReport::default();
         for agent in &mut self.agents {
             if *agent.running.lock().unwrap() {
+                continue;
+            }
+            if agent.reconnects >= MAX_RECONNECTS {
+                report.capped.push(agent_label(&agent.config.role));
                 continue;
             }
             let prompt =
                 prompts::reconnect_await_loop(&agent.config.display_name, agent.config.game_id);
             match spawn_grok_tick(&self.cfg, agent, &prompt) {
-                Ok(TickOutcome::Spawned) => n += 1,
+                Ok(TickOutcome::Spawned) => {
+                    agent.reconnects = agent.reconnects.saturating_add(1);
+                    report.respawned += 1;
+                }
                 Ok(TickOutcome::SkippedStillRunning) => {}
                 Err(e) => return Err(e),
             }
         }
-        Ok(n)
+        Ok(report)
     }
+}
+
+/// Result of [`AgentPool::ensure_alive`].
+#[derive(Debug, Default, Clone)]
+pub struct EnsureAliveReport {
+    pub respawned: usize,
+    /// Agent labels that hit the reconnect cap and were not respawned.
+    pub capped: Vec<String>,
 }
 
 impl Drop for AgentPool {

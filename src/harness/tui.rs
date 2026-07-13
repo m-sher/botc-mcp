@@ -724,9 +724,25 @@ impl App {
         self.last_tick = Instant::now();
         if let Some(pool) = self.agents.as_mut() {
             match pool.ensure_alive() {
-                Ok(n) if n > 0 => {
-                    self.status = format!("Respawned {n} agent session(s) into await_turn loop.");
-                    crate::dlog!("MAINTAIN ensure_alive respawned {n}");
+                Ok(report) if !report.capped.is_empty() => {
+                    self.auto_tick = false;
+                    self.status = format!(
+                        "auto-respawn stopped: {} hit reconnect cap (t=resume). plan=[{}]",
+                        report.capped.join(","),
+                        plan_dbg.join(", ")
+                    );
+                    crate::dlog!(
+                        "MAINTAIN ensure_alive capped=[{}] respawned={}",
+                        report.capped.join(","),
+                        report.respawned
+                    );
+                }
+                Ok(report) if report.respawned > 0 => {
+                    self.status = format!(
+                        "Respawned {} agent session(s) into await_turn loop.",
+                        report.respawned
+                    );
+                    crate::dlog!("MAINTAIN ensure_alive respawned {}", report.respawned);
                 }
                 Ok(_) => {
                     let waiting = self.wake.waiting_labels();
