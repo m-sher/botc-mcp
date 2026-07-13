@@ -116,8 +116,7 @@ fn commit_nomination_public(game: &mut Game, by: SeatId, target: SeatId) {
     if !game.day_nominees.contains(&target) {
         game.day_nominees.push(target);
     }
-    game.public_log
-        .push(PublicEvent::Nominated { by, target });
+    game.public_log.push(PublicEvent::Nominated { by, target });
 }
 
 /// Player: open a nomination and start the vote window (or Virgin bounce).
@@ -214,7 +213,12 @@ pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameE
 }
 
 /// Player: cast yes/no on the current open nomination.
-pub fn vote(game: &mut Game, seat: SeatId, nominee: SeatId, support: bool) -> Result<(), GameError> {
+pub fn vote(
+    game: &mut Game,
+    seat: SeatId,
+    nominee: SeatId,
+    support: bool,
+) -> Result<(), GameError> {
     require_not_ended(game)?;
     game.require_no_pending_host()?;
     let (_day, stage) = day_stage(game)?;
@@ -226,7 +230,9 @@ pub fn vote(game: &mut Game, seat: SeatId, nominee: SeatId, support: bool) -> Re
         .as_ref()
         .ok_or(GameError::IllegalAction("no open nomination"))?;
     if open.target != nominee {
-        return Err(GameError::IllegalAction("nominee is not current nomination"));
+        return Err(GameError::IllegalAction(
+            "nominee is not current nomination",
+        ));
     }
     // One ballot per seat per open nomination (yes or no). Multiple nominations
     // per day are fine; re-voting the same open nom is not.
@@ -259,10 +265,7 @@ pub fn vote(game: &mut Game, seat: SeatId, nominee: SeatId, support: bool) -> Re
     if support && is_butler && alive && !butler_disabled {
         // Butler may only vote yes if master has already voted yes on this nom.
         let master_yes = match butler_master {
-            Some(m) => open
-                .votes
-                .iter()
-                .any(|(s, yes)| *s == m && *yes),
+            Some(m) => open.votes.iter().any(|(s, yes)| *s == m && *yes),
             None => false,
         };
         if !master_yes {
@@ -321,7 +324,9 @@ pub fn pass_vote(game: &mut Game, seat: SeatId) -> Result<(), GameError> {
 
     let voter = seat_ref(game, seat)?;
     if voter.alive {
-        return Err(GameError::IllegalAction("only dead players may pass a vote"));
+        return Err(GameError::IllegalAction(
+            "only dead players may pass a vote",
+        ));
     }
     if !voter.ghost_vote_available {
         return Err(GameError::IllegalAction("ghost vote already spent"));
@@ -567,9 +572,9 @@ fn mayor_three_no_exec_wins(game: &Game) -> bool {
     if living_count(game) != 3 {
         return false;
     }
-    game.seats.iter().any(|s| {
-        s.alive && s.true_character == Some(Character::Mayor) && !s.ability_disabled()
-    })
+    game.seats
+        .iter()
+        .any(|s| s.alive && s.true_character == Some(Character::Mayor) && !s.ability_disabled())
 }
 
 /// Mark seat dead via execution; Saint → Evil; Imp → SW / demon death; then [`win_check`].
@@ -689,7 +694,8 @@ fn apply_slayer_kill(game: &mut Game, target: SeatId, was_true_imp: bool) -> Res
         s.alive = false;
         s.ghost_vote_available = true;
     }
-    game.public_log.push(PublicEvent::PlayerDied { seat: target });
+    game.public_log
+        .push(PublicEvent::PlayerDied { seat: target });
     game.st_announce(format!("Seat {} dies.", target.0));
     if was_true_imp {
         apply_demon_death(game, target, alive_before);

@@ -291,9 +291,8 @@ fn resolve_pair_role(
     }
 
     // Disabled, or no owners and no zero path: lie (host queue already tried above).
-    let info = lie_pair_info(game, pool, seat, &mut rng).ok_or(GameError::IllegalAction(
-        "cannot generate pair info",
-    ))?;
+    let info = lie_pair_info(game, pool, seat, &mut rng)
+        .ok_or(GameError::IllegalAction("cannot generate pair info"))?;
     let text = pair_message(game, ability, &info);
     Ok(push_result(game, seat, text))
 }
@@ -610,10 +609,7 @@ fn resolve_butler(
     if let Some(s) = game.seats.iter_mut().find(|s| s.id == seat) {
         s.butler_master = Some(*target);
     }
-    let text = format!(
-        "Butler: your master is {}.",
-        format_seat(game, *target)
-    );
+    let text = format!("Butler: your master is {}.", format_seat(game, *target));
     Ok(push_result(game, seat, text))
 }
 
@@ -705,13 +701,7 @@ mod unit_tests {
         seed: u64,
     ) -> Game {
         let lobby = Game::create(
-            vec![
-                "A".into(),
-                "B".into(),
-                "C".into(),
-                "D".into(),
-                "E".into(),
-            ],
+            vec!["A".into(), "B".into(), "C".into(), "D".into(), "E".into()],
             seed,
         )
         .unwrap();

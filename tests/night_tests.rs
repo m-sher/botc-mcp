@@ -19,13 +19,7 @@ fn random_st() -> StartOpts {
 }
 
 fn five_names() -> Vec<String> {
-    vec![
-        "A".into(),
-        "B".into(),
-        "C".into(),
-        "D".into(),
-        "E".into(),
-    ]
+    vec!["A".into(), "B".into(), "C".into(), "D".into(), "E".into()]
 }
 
 /// seat0 Drunk face Empath, Imp, Poisoner, Chef, Soldier.
@@ -43,8 +37,8 @@ fn fixture_drunk_empath_face() -> Game {
                 RoleAssignment::normal(SeatId(3), Character::Chef),
                 RoleAssignment::normal(SeatId(4), Character::Soldier),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .expect("start_game");
     g
@@ -123,8 +117,8 @@ fn other_night_queue_has_demon_kill_and_monk_not_n1_setup() {
                 RoleAssignment::normal(SeatId(3), Character::Empath),
                 RoleAssignment::normal(SeatId(4), Character::Soldier),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     // Kill monk for eligibility checks later; queue uses alive seats.
@@ -145,7 +139,10 @@ fn other_night_queue_has_demon_kill_and_monk_not_n1_setup() {
         .iter()
         .position(|s| matches!(s, NightStep::Poisoner { .. }))
         .unwrap();
-    let monk = q.iter().position(|s| matches!(s, NightStep::Monk { .. })).unwrap();
+    let monk = q
+        .iter()
+        .position(|s| matches!(s, NightStep::Monk { .. }))
+        .unwrap();
     let kill = q
         .iter()
         .position(|s| matches!(s, NightStep::DemonKill { .. }))
@@ -171,14 +168,23 @@ fn seven_player_first_night_includes_briefings() {
                 RoleAssignment::normal(SeatId(5), Character::Imp),
                 RoleAssignment::normal(SeatId(6), Character::Soldier),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     let q = build_first_night_queue(&g);
-    let setup = q.iter().position(|s| matches!(s, NightStep::SetupMarkers)).unwrap();
-    let minion = q.iter().position(|s| matches!(s, NightStep::MinionBriefing)).unwrap();
-    let demon = q.iter().position(|s| matches!(s, NightStep::DemonBriefing)).unwrap();
+    let setup = q
+        .iter()
+        .position(|s| matches!(s, NightStep::SetupMarkers))
+        .unwrap();
+    let minion = q
+        .iter()
+        .position(|s| matches!(s, NightStep::MinionBriefing))
+        .unwrap();
+    let demon = q
+        .iter()
+        .position(|s| matches!(s, NightStep::DemonBriefing))
+        .unwrap();
     let poisoner = q
         .iter()
         .position(|s| matches!(s, NightStep::Poisoner { seat: SeatId(4) }))
@@ -230,8 +236,8 @@ fn fixture_7p_poisoner_imp() -> (Game, botc_mcp::auth::Token, Vec<botc_mcp::auth
                 RoleAssignment::normal(SeatId(5), Character::Imp),
                 RoleAssignment::normal(SeatId(6), Character::Soldier),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     (g, host, tokens)
@@ -442,7 +448,10 @@ fn fortune_teller_red_herring_pings_yes() {
         skip_night_action(&mut g, &host).unwrap();
     }
     let p = g.pending_night.as_ref().expect("FT pending");
-    assert!(matches!(p.step, NightStep::FortuneTeller { seat: SeatId(0) }));
+    assert!(matches!(
+        p.step,
+        NightStep::FortuneTeller { seat: SeatId(0) }
+    ));
     night_action(
         &mut g,
         &tokens[0],
@@ -478,8 +487,8 @@ fn librarian_zero_outsiders_reports_zero() {
                 RoleAssignment::normal(SeatId(3), Character::Chef),
                 RoleAssignment::normal(SeatId(4), Character::Soldier),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     // Poison someone other than the Librarian so info stays truthful.
@@ -507,15 +516,18 @@ use botc_mcp::comms::PublicEvent;
 use botc_mcp::game::DayStage;
 
 /// Finish first night via host skips, then enter night 2.
-fn finish_n1_enter_n2(
-    g: &mut Game,
-    host: &botc_mcp::auth::Token,
-) {
+fn finish_n1_enter_n2(g: &mut Game, host: &botc_mcp::auth::Token) {
     while g.pending_night.is_some() || g.pending_host.is_some() {
         skip_night_action(g, host).unwrap();
     }
     assert!(
-        matches!(g.phase, Phase::Day { day: 1, stage: DayStage::Discussion }),
+        matches!(
+            g.phase,
+            Phase::Day {
+                day: 1,
+                stage: DayStage::Discussion
+            }
+        ),
         "expected Day 1 Discussion, got {:?}",
         g.phase
     );
@@ -538,8 +550,8 @@ fn fixture_n2_monk_imp_soldier() -> (Game, botc_mcp::auth::Token, Vec<botc_mcp::
                 RoleAssignment::normal(SeatId(3), Character::Empath),
                 RoleAssignment::normal(SeatId(4), Character::Soldier),
             ]),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     finish_n1_enter_n2(&mut g, &host);
@@ -605,10 +617,7 @@ fn soldier_survives_imp() {
         NightActionPayload::PickOne { target: SeatId(4) },
     )
     .unwrap();
-    assert!(
-        g.seats[4].alive,
-        "Soldier must survive Imp kill"
-    );
+    assert!(g.seats[4].alive, "Soldier must survive Imp kill");
     assert!(
         !g.deaths_tonight.contains(&SeatId(4)),
         "Soldier must not be in deaths_tonight"
@@ -701,12 +710,14 @@ fn dawn_announces_deaths_publicly_not_roles() {
         skip_night_action(&mut g, &host).unwrap();
     }
     // If only auto steps left, night_tick should have dawned already after last skip.
-    while matches!(g.phase, Phase::Night { .. }) && g.pending_night.is_none() {
-        // stuck? shouldn't happen
-        break;
-    }
     assert!(
-        matches!(g.phase, Phase::Day { day: 2, stage: DayStage::Discussion }),
+        matches!(
+            g.phase,
+            Phase::Day {
+                day: 2,
+                stage: DayStage::Discussion
+            }
+        ),
         "expected Day 2 Discussion after dawn, got {:?}",
         g.phase
     );
@@ -776,7 +787,7 @@ fn spy_night_returns_true_grimoire_when_not_disabled() {
     let grimoire = results
         .iter()
         .find(|t| t.starts_with("Spy: Grimoire"))
-        .expect(&format!("Spy should receive grimoire: {results:?}"));
+        .unwrap_or_else(|| panic!("Spy should receive grimoire: {results:?}"));
     assert!(
         grimoire.contains("Imp") && grimoire.contains("Soldier") && grimoire.contains("Spy"),
         "true grimoire must list true roles: {grimoire}"
@@ -812,7 +823,10 @@ fn fortune_teller_rejects_same_seat_twice() {
         skip_night_action(&mut g, &host).unwrap();
     }
     let p = g.pending_night.as_ref().expect("FT pending");
-    assert!(matches!(p.step, NightStep::FortuneTeller { seat: SeatId(0) }));
+    assert!(matches!(
+        p.step,
+        NightStep::FortuneTeller { seat: SeatId(0) }
+    ));
     let err = night_action(
         &mut g,
         &tokens[0],

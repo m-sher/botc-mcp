@@ -4,18 +4,20 @@ use botc_mcp::comms::PrivateMessage;
 use botc_mcp::game::ability::{register, try_demon_kill, KillResult};
 use botc_mcp::game::night::build_first_night_queue;
 use botc_mcp::game::{
-    Game, NightActionPayload, NightStep, Phase, RoleAssignment, SeatId, StartOpts, DayStage,
+    DayStage, Game, NightActionPayload, NightStep, Phase, RoleAssignment, SeatId, StartOpts,
 };
 use botc_mcp::roles::Character;
-use botc_mcp::tools::{
-    close_vote, nominate, open_nominations, skip_night_action, vote,
-};
+use botc_mcp::tools::{close_vote, nominate, open_nominations, skip_night_action, vote};
 
 fn names(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("P{i}")).collect()
 }
 
-fn start_scripted(seed: u64, salt: u64, assignments: Vec<RoleAssignment>) -> (Game, botc_mcp::auth::Token, Vec<botc_mcp::auth::Token>) {
+fn start_scripted(
+    seed: u64,
+    salt: u64,
+    assignments: Vec<RoleAssignment>,
+) -> (Game, botc_mcp::auth::Token, Vec<botc_mcp::auth::Token>) {
     let lobby = Game::create_with_salt(names(assignments.len()), seed, salt).unwrap();
     let host = lobby.host_token.clone();
     let tokens = lobby.player_tokens.clone();
@@ -24,8 +26,8 @@ fn start_scripted(seed: u64, salt: u64, assignments: Vec<RoleAssignment>) -> (Ga
         &host,
         StartOpts {
             assignments: Some(assignments),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .unwrap();
     (g, host, tokens)
@@ -158,10 +160,7 @@ fn drunk_face_ravenkeeper_dies_at_night_wakes() {
     )
     .unwrap();
 
-    assert!(
-        !g.seats[0].alive,
-        "Drunk-face RK should have died to Imp"
-    );
+    assert!(!g.seats[0].alive, "Drunk-face RK should have died to Imp");
     let pending = g.pending_night.as_ref().expect("RK wake pending");
     assert!(
         matches!(pending.step, NightStep::Ravenkeeper { seat: SeatId(0) }),
@@ -233,8 +232,8 @@ fn poisoned_ravenkeeper_still_wakes_on_death() {
 /// 4. Mayor bounce never kills Imp; Minions are allowed (host kill_other).
 #[test]
 fn mayor_bounce_never_kills_imp() {
-    use botc_mcp::game::{HostDecision, MayorRedirectChoice};
     use botc_mcp::game::ability::protect::is_demon_killable;
+    use botc_mcp::game::{HostDecision, MayorRedirectChoice};
 
     // 5 seats: Mayor, Soldier, Chef, Poisoner, Imp — host bounce may hit good or Minion, never Imp.
     let (mut g, host, _tokens) = start_scripted(
@@ -252,7 +251,10 @@ fn mayor_bounce_never_kills_imp() {
         s.poisoned = false;
     }
     g.night_cursor = 3;
-    g.phase = Phase::Night { night: 2, cursor: 3 };
+    g.phase = Phase::Night {
+        night: 2,
+        cursor: 3,
+    };
     assert_eq!(
         try_demon_kill(&mut g, SeatId(4), SeatId(0)),
         KillResult::NeedsHost
@@ -261,13 +263,14 @@ fn mayor_bounce_never_kills_imp() {
     g.host_decide(
         &host,
         HostDecision::MayorRedirect {
-            choice: MayorRedirectChoice::KillOther {
-                target: SeatId(4),
-            },
+            choice: MayorRedirectChoice::KillOther { target: SeatId(4) },
         },
     )
     .unwrap();
-    assert!(g.seats[0].alive && g.seats[4].alive, "Imp target → survived");
+    assert!(
+        g.seats[0].alive && g.seats[4].alive,
+        "Imp target → survived"
+    );
 
     // Fresh attack → bounce onto minion.
     g.pending_host = None;
@@ -285,9 +288,7 @@ fn mayor_bounce_never_kills_imp() {
     g.host_decide(
         &host,
         HostDecision::MayorRedirect {
-            choice: MayorRedirectChoice::KillOther {
-                target: SeatId(3),
-            },
+            choice: MayorRedirectChoice::KillOther { target: SeatId(3) },
         },
     )
     .unwrap();
@@ -328,7 +329,10 @@ fn ghost_vote_not_auto_closed_when_only_living_voted() {
 
     // Dead casts no — now auto-close is allowed.
     vote(&mut g, &tokens[2], SeatId(4), false).unwrap();
-    assert!(g.current_nomination.is_none(), "should auto-close after ghost voted");
+    assert!(
+        g.current_nomination.is_none(),
+        "should auto-close after ghost voted"
+    );
 
     // Host can still force-close early on a fresh nom.
     nominate(&mut g, &tokens[1], SeatId(3)).unwrap();
@@ -358,8 +362,14 @@ fn poisoned_virgin_first_nom_spends_ability() {
     open_nominations(&mut g, &host).unwrap();
     nominate(&mut g, &tokens[0], SeatId(1)).unwrap();
 
-    assert!(g.seats[1].virgin_ability_used, "ability spent even when poisoned");
-    assert!(g.seats[0].alive, "nominator not executed while Virgin disabled");
+    assert!(
+        g.seats[1].virgin_ability_used,
+        "ability spent even when poisoned"
+    );
+    assert!(
+        g.seats[0].alive,
+        "nominator not executed while Virgin disabled"
+    );
     assert!(g.current_nomination.is_some());
     assert_eq!(g.executed_today, None);
 }

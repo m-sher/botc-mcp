@@ -45,7 +45,11 @@ fn to_day1(g: &mut Game, host: &botc_mcp::auth::Token) {
     ));
 }
 
-fn advance_to_imp_kill(g: &mut Game, host: &botc_mcp::auth::Token, tokens: &[botc_mcp::auth::Token]) {
+fn advance_to_imp_kill(
+    g: &mut Game,
+    host: &botc_mcp::auth::Token,
+    tokens: &[botc_mcp::auth::Token],
+) {
     loop {
         if g.pending_host.is_some() {
             skip_night_action(g, host).unwrap();
@@ -111,9 +115,7 @@ fn starpass_pause_imp_still_public_alive() {
     host_decide(
         &mut g,
         &host,
-        HostDecision::StarpassPick {
-            minion: SeatId(2),
-        },
+        HostDecision::StarpassPick { minion: SeatId(2) },
     )
     .unwrap();
     assert!(!g.seats[1].alive);
@@ -160,14 +162,26 @@ fn day_auto_ends_when_nominations_exhausted() {
     let chain = [(1u8, 2u8), (2, 3), (3, 4), (4, 0)];
     for (by, target) in chain {
         assert!(
-            matches!(g.phase, Phase::Day { day: 1, stage: DayStage::Nominations }),
+            matches!(
+                g.phase,
+                Phase::Day {
+                    day: 1,
+                    stage: DayStage::Nominations
+                }
+            ),
             "expected still day 1 noms before {by}->{target}, got {:?}",
             g.phase
         );
         nominate(&mut g, &tokens[by as usize], SeatId(target)).unwrap();
         for t in &tokens {
             // After last vote of last nom, day may already have advanced.
-            if !matches!(g.phase, Phase::Day { day: 1, stage: DayStage::Nominations }) {
+            if !matches!(
+                g.phase,
+                Phase::Day {
+                    day: 1,
+                    stage: DayStage::Nominations
+                }
+            ) {
                 break;
             }
             if g.current_nomination.is_none() {
@@ -243,8 +257,5 @@ fn host_lie_queue_cleared_at_dawn() {
     host_queue_lie(&mut g, &host, "unused lie for night 1".into()).unwrap();
     assert_eq!(g.host_lie_queue.len(), 1);
     to_day1(&mut g, &host);
-    assert!(
-        g.host_lie_queue.is_empty(),
-        "lie queue must clear at dawn"
-    );
+    assert!(g.host_lie_queue.is_empty(), "lie queue must clear at dawn");
 }

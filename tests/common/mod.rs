@@ -21,10 +21,7 @@ pub fn five_names() -> Vec<String> {
 }
 
 /// Create lobby + start with fixed role assignments. Returns (game, host, player_tokens).
-pub fn start_scripted(
-    seed: u64,
-    assignments: Vec<RoleAssignment>,
-) -> (Game, Token, Vec<Token>) {
+pub fn start_scripted(seed: u64, assignments: Vec<RoleAssignment>) -> (Game, Token, Vec<Token>) {
     let n = assignments.len();
     let CreateGameResult {
         mut game,
@@ -36,8 +33,8 @@ pub fn start_scripted(
         &host_token,
         StartOpts {
             assignments: Some(assignments),
-                ..Default::default()
-            },
+            ..Default::default()
+        },
     )
     .expect("start_game");
     (game, host_token, player_tokens)
@@ -118,7 +115,10 @@ pub fn advance_to_imp_kill(
             continue;
         }
         let Some(p) = g.pending_night.as_ref() else {
-            panic!("no pending night when waiting for Imp kill; phase={:?}", g.phase);
+            panic!(
+                "no pending night when waiting for Imp kill; phase={:?}",
+                g.phase
+            );
         };
         match p.step {
             NightStep::Poisoner { seat } => {

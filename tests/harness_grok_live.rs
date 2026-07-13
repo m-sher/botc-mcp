@@ -24,9 +24,7 @@ fn require_grok() -> PathBuf {
 
 fn which_exists(name: &str) -> bool {
     std::env::var_os("PATH")
-        .map(|p| {
-            std::env::split_paths(&p).any(|d| d.join(name).is_file())
-        })
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
         .unwrap_or(false)
 }
 
@@ -62,8 +60,7 @@ fn yolo_plus_always_approve_is_rejected() {
         output.status
     );
     assert!(
-        combined.contains("cannot be used multiple times")
-            || combined.contains("always-approve"),
+        combined.contains("cannot be used multiple times") || combined.contains("always-approve"),
         "expected clap duplicate-flag error, got:\n{combined}"
     );
 
@@ -96,7 +93,14 @@ fn harness_argv_returns_valid_json_response() {
     };
 
     // Build harness args, then swap streaming-json → json for a single assertable payload.
-    let mut args = build_grok_tick_args(&cfg, &cfg.model.clone(), &tmp, &prompt_file, &session_id, false);
+    let mut args = build_grok_tick_args(
+        &cfg,
+        &cfg.model.clone(),
+        &tmp,
+        &prompt_file,
+        &session_id,
+        false,
+    );
     if let Some(i) = args.iter().position(|a| a == "streaming-json") {
         args[i] = "json".into();
     }
@@ -131,10 +135,7 @@ fn harness_argv_returns_valid_json_response() {
         v.get("type").and_then(|t| t.as_str()) != Some("error"),
         "grok returned error object: {v}"
     );
-    let text = v
-        .get("text")
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
+    let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
     assert!(
         !text.is_empty(),
         "expected non-empty text field in response: {v}"
@@ -181,7 +182,14 @@ fn harness_argv_streaming_json_lines_are_valid() {
         max_turns_per_tick: 3,
         ..HarnessConfig::default()
     };
-    let args = build_grok_tick_args(&cfg, &cfg.model.clone(), &tmp, &prompt_file, &session_id, false);
+    let args = build_grok_tick_args(
+        &cfg,
+        &cfg.model.clone(),
+        &tmp,
+        &prompt_file,
+        &session_id,
+        false,
+    );
 
     let output = Command::new(&grok)
         .args(&args)
@@ -214,8 +222,10 @@ fn harness_argv_streaming_json_lines_are_valid() {
         });
         let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
         assert!(
-            matches!(ty, "text" | "thought" | "end" | "error" | "max_turns_reached")
-                || !ty.is_empty(),
+            matches!(
+                ty,
+                "text" | "thought" | "end" | "error" | "max_turns_reached"
+            ) || !ty.is_empty(),
             "unexpected event type {ty:?} in {line}"
         );
         if ty == "end" {
@@ -231,7 +241,10 @@ fn harness_argv_streaming_json_lines_are_valid() {
     }
 
     let g = log.lock().unwrap();
-    assert!(saw_end || saw_text, "no text/end events in stream:\n{stdout}");
+    assert!(
+        saw_end || saw_text,
+        "no text/end events in stream:\n{stdout}"
+    );
     // Consecutive same-kind chunks must coalesce, not become one line per token.
     let thought_lines = g.iter().filter(|l| l.kind == LineKind::Thought).count();
     assert!(
@@ -240,7 +253,8 @@ fn harness_argv_streaming_json_lines_are_valid() {
     );
     // No in-text tags — colour, not `[think]`/`[stderr]`.
     assert!(
-        !g.iter().any(|l| l.text.contains("[think]") || l.text.contains("[stderr]")),
+        !g.iter()
+            .any(|l| l.text.contains("[think]") || l.text.contains("[stderr]")),
         "stream lines still carry in-text tags: {g:?}"
     );
 

@@ -25,7 +25,9 @@ fn debug_log_writes_timestamped_lines() {
     assert!(!contents.contains("ignored-before-init"));
     // Timestamp prefix like "[HH:MM:SS.mmm +....ms]".
     assert!(
-        contents.lines().all(|l| l.starts_with('[') && l.contains("ms]")),
+        contents
+            .lines()
+            .all(|l| l.starts_with('[') && l.contains("ms]")),
         "missing timestamp prefix: {contents}"
     );
     let _ = std::fs::remove_file(&path);

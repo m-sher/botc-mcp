@@ -11,7 +11,10 @@ use botc_mcp::harness::socket::SocketClient;
 use botc_mcp::mcp_server;
 
 #[derive(Parser, Debug)]
-#[command(name = "botc-agent-mcp", about = "Token-scoped MCP proxy for botc-tui harness")]
+#[command(
+    name = "botc-agent-mcp",
+    about = "Token-scoped MCP proxy for botc-tui harness"
+)]
 struct Args {
     #[arg(long)]
     socket: PathBuf,
@@ -82,11 +85,7 @@ fn handle_line(
             );
         }
     };
-    let id = req.get("id").cloned();
-    if id.is_none() {
-        return None;
-    }
-    let id = id.unwrap_or(Value::Null);
+    let id = req.get("id").cloned()?;
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
 
@@ -110,23 +109,29 @@ fn handle_line(
         }
         "tools/call" => {
             let Some(name) = params.get("name").and_then(|n| n.as_str()) else {
-                return Some(json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": { "code": -32602, "message": "tools/call requires name" }
-                }).to_string());
+                return Some(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32602, "message": "tools/call requires name" }
+                    })
+                    .to_string(),
+                );
             };
             // Policy denial is Invalid params (-32602), not Method not found (-32601).
             // -32601 would let a strict client conclude tools/call itself is unsupported (#51).
             if !proxy_acl::tool_allowed(name, is_host) {
-                return Some(json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": proxy_acl::ACL_DENY_JSONRPC_CODE,
-                        "message": format!("tool not available for this agent role: {name}")
-                    }
-                }).to_string());
+                return Some(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": proxy_acl::ACL_DENY_JSONRPC_CODE,
+                            "message": format!("tool not available for this agent role: {name}")
+                        }
+                    })
+                    .to_string(),
+                );
             }
             let mut arguments = params
                 .get("arguments")

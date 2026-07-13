@@ -105,7 +105,9 @@ pub fn list_rules_topics() -> Vec<&'static RulesTopic> {
 
 pub fn find_rules_topic(id: &str) -> Option<&'static RulesTopic> {
     let key = id.trim().to_ascii_lowercase().replace('-', "_");
-    RULES_TOPICS.iter().find(|t| t.id == key || t.id.replace('_', "") == key.replace('_', ""))
+    RULES_TOPICS
+        .iter()
+        .find(|t| t.id == key || t.id.replace('_', "") == key.replace('_', ""))
 }
 
 fn docs_path(rel: &str) -> PathBuf {

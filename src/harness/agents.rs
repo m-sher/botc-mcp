@@ -277,18 +277,13 @@ pub fn cycle_in_list(current: &str, list: &[String], delta: i32) -> String {
 /// Critical: **never** hold the slot mutex across a blocking `Child::wait()`.
 /// The waiter uses `try_wait` + short sleeps; `take_and_kill` must be able to
 /// acquire the lock while a child is still running and deliver SIGKILL.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 enum ChildState {
+    #[default]
     Empty,
     Running(Child),
     /// Reaped by kill or natural exit; waiter may still consume the status.
     Exited(std::process::ExitStatus),
-}
-
-impl Default for ChildState {
-    fn default() -> Self {
-        Self::Empty
-    }
 }
 
 #[derive(Debug, Default)]
@@ -418,7 +413,10 @@ impl AgentUsage {
     pub fn board_short(&self) -> String {
         let mut parts = Vec::new();
         if self.game_total.total_tokens > 0 {
-            parts.push(format!("Σ{}", format_token_count(self.game_total.total_tokens)));
+            parts.push(format!(
+                "Σ{}",
+                format_token_count(self.game_total.total_tokens)
+            ));
         }
         if let Some(t) = &self.last_tick {
             if t.total_tokens > 0 {
@@ -616,11 +614,9 @@ impl AgentPool {
         let mut last_err: Option<std::io::Error> = None;
         for agent in &mut self.agents {
             let prompt = match agent.config.role {
-                AgentRole::Host => prompts::host_kickoff(
-                    agent.config.game_id,
-                    n_players,
-                    &self.cfg.st_choice_mode,
-                ),
+                AgentRole::Host => {
+                    prompts::host_kickoff(agent.config.game_id, n_players, &self.cfg.st_choice_mode)
+                }
                 AgentRole::Player { seat } => prompts::player_kickoff(
                     &agent.config.display_name,
                     seat,
@@ -691,9 +687,9 @@ impl AgentPool {
                     .position(|a| matches!(a.config.role, AgentRole::Host)),
                 SchedTarget::Player { seat, .. } => {
                     let seat = *seat;
-                    self.agents
-                        .iter()
-                        .position(|a| matches!(a.config.role, AgentRole::Player { seat: s } if s == seat))
+                    self.agents.iter().position(
+                        |a| matches!(a.config.role, AgentRole::Player { seat: s } if s == seat),
+                    )
                 }
             };
             let Some(idx) = idx else { continue };
@@ -920,7 +916,7 @@ fn spawn_grok_tick(
             use std::io::BufRead;
             let reader = std::io::BufReader::new(stdout);
             // Process each streaming-json event as it arrives → live display + usage.
-            for line in reader.lines().flatten() {
+            for line in reader.lines().map_while(Result::ok) {
                 if stream_line_establishes_session(&line) {
                     established.store(true, Ordering::SeqCst);
                 }
@@ -953,7 +949,7 @@ fn spawn_grok_tick(
         thread::spawn(move || {
             use std::io::BufRead;
             let reader = std::io::BufReader::new(stderr);
-            for line in reader.lines().flatten() {
+            for line in reader.lines().map_while(Result::ok) {
                 let mut g = log.lock().unwrap();
                 push_full_line(&mut g, LineKind::Stderr, line);
             }
@@ -1134,23 +1130,13 @@ pub fn apply_stream_event(log: &Mutex<Vec<LogLine>>, line: &str) {
         Some("thought") => append_chunk(&mut guard, LineKind::Thought, &data(&v)),
         Some("end") => {
             let note = parse_tick_usage(&v)
-                .map(|u| {
-                    format!(
-                        "— turn end · {} tok —",
-                        format_token_count(u.total_tokens)
-                    )
-                })
+                .map(|u| format!("— turn end · {} tok —", format_token_count(u.total_tokens)))
                 .unwrap_or_else(|| "— turn end —".into());
             push_full_line(&mut guard, LineKind::System, note);
         }
         Some("max_turns_reached") => {
             let note = parse_tick_usage(&v)
-                .map(|u| {
-                    format!(
-                        "— max turns · {} tok —",
-                        format_token_count(u.total_tokens)
-                    )
-                })
+                .map(|u| format!("— max turns · {} tok —", format_token_count(u.total_tokens)))
                 .unwrap_or_else(|| "— max turns reached —".into());
             push_full_line(&mut guard, LineKind::System, note);
         }
@@ -1313,13 +1299,11 @@ Available models:
 
     #[test]
     fn cycle_model_wraps_and_recovers_from_custom() {
-        let mut cfg = HarnessConfig::default();
-        cfg.available_models = vec![
-            "grok-build".into(),
-            "v9-stickynote".into(),
-            "other".into(),
-        ];
-        cfg.model = "grok-build".into();
+        let mut cfg = HarnessConfig {
+            available_models: vec!["grok-build".into(), "v9-stickynote".into(), "other".into()],
+            model: "grok-build".into(),
+            ..Default::default()
+        };
         cfg.cycle_model(1);
         assert_eq!(cfg.model, "v9-stickynote");
         cfg.cycle_model(-1);
@@ -1358,8 +1342,10 @@ Available models:
     fn grok_args_use_the_per_agent_model() {
         // Models are picked per seat: the argv must carry the CALLER's model,
         // not the config default.
-        let mut cfg = HarnessConfig::default();
-        cfg.model = "config-default-model".into();
+        let cfg = HarnessConfig {
+            model: "config-default-model".into(),
+            ..Default::default()
+        };
         for model in ["host-model-a", "seat-model-b"] {
             let args = build_grok_tick_args(
                 &cfg,
@@ -1414,7 +1400,10 @@ Available models:
         assert!(!list.contains("use_tool"));
         // Global coding context dropped + filesystem sandboxed.
         assert!(args.contains(&"--no-memory".into()));
-        let sb = args.iter().position(|a| a == "--sandbox").expect("--sandbox");
+        let sb = args
+            .iter()
+            .position(|a| a == "--sandbox")
+            .expect("--sandbox");
         assert_eq!(args[sb + 1], "workspace");
     }
 
@@ -1432,7 +1421,10 @@ Available models:
         let yolo_count = args.iter().filter(|a| *a == "--yolo").count();
         let always = args.iter().filter(|a| *a == "--always-approve").count();
         assert_eq!(yolo_count, 1, "expected single --yolo: {args:?}");
-        assert_eq!(always, 0, "must not pass --always-approve (alias): {args:?}");
+        assert_eq!(
+            always, 0,
+            "must not pass --always-approve (alias): {args:?}"
+        );
         assert!(args.contains(&"--session-id".into()));
         assert!(!args.contains(&"--resume".into()));
     }
@@ -1549,9 +1541,11 @@ Available models:
     fn stop_all_removes_work_root() {
         let id = uuid::Uuid::new_v4();
         let root = std::env::temp_dir().join(format!("botc-stop-test-{id}"));
-        let mut cfg = HarnessConfig::default();
-        cfg.work_root = root.clone();
-        cfg.socket_path = root.join("engine.sock");
+        let cfg = HarnessConfig {
+            work_root: root.clone(),
+            socket_path: root.join("engine.sock"),
+            ..Default::default()
+        };
         let pool = AgentPool::prepare(
             &cfg,
             vec![AgentConfig {
@@ -1609,9 +1603,11 @@ Available models:
     fn stop_all_with_running_child_returns_quickly() {
         let id = uuid::Uuid::new_v4();
         let root = std::env::temp_dir().join(format!("botc-stop-run-{id}"));
-        let mut cfg = HarnessConfig::default();
-        cfg.work_root = root.clone();
-        cfg.socket_path = root.join("engine.sock");
+        let cfg = HarnessConfig {
+            work_root: root.clone(),
+            socket_path: root.join("engine.sock"),
+            ..Default::default()
+        };
         let mut pool = AgentPool::prepare(
             &cfg,
             vec![AgentConfig {

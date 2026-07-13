@@ -3,8 +3,8 @@
 use crate::comms::PrivateMessage;
 use crate::game::ids::SeatId;
 use crate::game::phase::NightStep;
-use crate::game::state::Game;
 use crate::game::st_policy::{MayorRedirectChoice, PendingHostDecision};
+use crate::game::state::Game;
 use crate::game::win;
 use crate::roles::{Character, CharacterType, Team};
 
@@ -20,10 +20,7 @@ pub enum KillResult {
     /// A seat died to the demon (normal kill or Mayor bounce victim).
     Died(SeatId),
     /// Imp self-kill; a living Minion became the Imp.
-    Starpass {
-        dead_imp: SeatId,
-        new_imp: SeatId,
-    },
+    Starpass { dead_imp: SeatId, new_imp: SeatId },
     /// Night paused for host Mayor bounce or starpass pick (`game.pending_host`).
     NeedsHost,
 }
@@ -133,10 +130,7 @@ pub(crate) fn complete_starpass(game: &mut Game, dead_imp: SeatId, new_imp: Seat
     );
 
     win::win_check(game);
-    KillResult::Starpass {
-        dead_imp,
-        new_imp,
-    }
+    KillResult::Starpass { dead_imp, new_imp }
 }
 
 /// Apply death chain for a non-self demon target (steps 1–6 of §9.5).

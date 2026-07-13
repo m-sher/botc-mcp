@@ -21,17 +21,17 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
-use crate::game::{Game, GameId, Phase, RoleAssignment, SeatId, StartOpts, StChoiceMode};
-use crate::roles::{Character, CharacterType};
+use crate::game::{Game, GameId, Phase, RoleAssignment, SeatId, StChoiceMode, StartOpts};
 use crate::harness::action_log::{ActionKind, ActionLog, ActorLabel};
-use crate::harness::scheduler::{plan_ticks, wait_signature, SchedTarget};
 use crate::harness::agents::{
     agent_mcp_bin_ok, cycle_in_list, find_agent_mcp_bin, find_grok,
-    resolve_agent_mcp_bin_for_display, AgentConfig, AgentPool, AgentRole, HarnessConfig,
-    LineKind, LogLine,
+    resolve_agent_mcp_bin_for_display, AgentConfig, AgentPool, AgentRole, HarnessConfig, LineKind,
+    LogLine,
 };
+use crate::harness::scheduler::{plan_ticks, wait_signature, SchedTarget};
 use crate::harness::socket::SocketServer;
 use crate::mcp_server::{self, SharedStore};
+use crate::roles::{Character, CharacterType};
 use crate::tools;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,12 +126,15 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let mut cfg = HarnessConfig::default();
-        cfg.grok_bin = find_grok();
-        cfg.agent_mcp_bin = find_agent_mcp_bin();
         let id = uuid::Uuid::new_v4();
-        cfg.work_root = PathBuf::from(format!("/tmp/botc-harness-{id}"));
-        cfg.socket_path = cfg.work_root.join("engine.sock");
+        let work_root = PathBuf::from(format!("/tmp/botc-harness-{id}"));
+        let mut cfg = HarnessConfig {
+            grok_bin: find_grok(),
+            agent_mcp_bin: find_agent_mcp_bin(),
+            work_root: work_root.clone(),
+            socket_path: work_root.join("engine.sock"),
+            ..Default::default()
+        };
         // Populate the setup picker from `grok models` (CLI default becomes selected).
         let models_note = cfg.load_models_from_grok();
         let mcp_ok = agent_mcp_bin_ok(&cfg);
@@ -252,13 +255,9 @@ impl App {
             return;
         }
         if delta > 0 {
-            self.scroll_from_bottom = self
-                .scroll_from_bottom
-                .saturating_add(delta as usize);
+            self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(delta as usize);
         } else {
-            self.scroll_from_bottom = self
-                .scroll_from_bottom
-                .saturating_sub((-delta) as usize);
+            self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub((-delta) as usize);
         }
     }
 
@@ -683,18 +682,10 @@ impl App {
             &agent_cfgs,
             self.results_public_cursor,
         );
-        if !self.results_terminal_logged {
-            if matches!(g.phase, Phase::Ended { .. }) {
-                crate::harness::results_log::log_game_end(
-                    &self.run_id,
-                    gid,
-                    g,
-                    &agent_cfgs,
-                    &usage,
-                );
-                self.results_terminal_logged = true;
-                crate::dlog!("RESULTS game_end logged run_id={}", self.run_id);
-            }
+        if !self.results_terminal_logged && matches!(g.phase, Phase::Ended { .. }) {
+            crate::harness::results_log::log_game_end(&self.run_id, gid, g, &agent_cfgs, &usage);
+            self.results_terminal_logged = true;
+            crate::dlog!("RESULTS game_end logged run_id={}", self.run_id);
         }
     }
 
@@ -775,7 +766,8 @@ impl App {
 
         if ended {
             self.auto_tick = false;
-            self.status = "Game ended — agents idle. Press q to quit or Tab to review streams.".into();
+            self.status =
+                "Game ended — agents idle. Press q to quit or Tab to review streams.".into();
             crate::dlog!("TICK -> game ended, auto_tick off");
             return;
         }
@@ -783,9 +775,7 @@ impl App {
         // Host-retry brake: a host-only fallback plan that repeats with no state
         // change means the host agent runs but never makes the required call.
         // Without a cap, event-driven auto would re-spawn it forever (token burn).
-        let host_only = plan
-            .iter()
-            .all(|t| matches!(t, SchedTarget::Host(_)));
+        let host_only = plan.iter().all(|t| matches!(t, SchedTarget::Host(_)));
         let plan_key = format!("{}|{sig:?}", plan_dbg.join(","));
         if host_only && plan_key == self.last_plan_key {
             self.host_plan_repeats += 1;
@@ -800,7 +790,9 @@ impl App {
                 "auto-advance stopped: host repeated '{}' {HOST_RETRY_CAP}x without progress (see debug log). t=resume",
                 self.last_targets.join(",")
             );
-            crate::dlog!("TICK -> host plan repeated {HOST_RETRY_CAP}x with no progress, auto_tick disabled");
+            crate::dlog!(
+                "TICK -> host plan repeated {HOST_RETRY_CAP}x with no progress, auto_tick disabled"
+            );
             return;
         }
 
@@ -903,7 +895,9 @@ impl App {
         let mut spans = vec![
             Span::styled(
                 format!(" {phase} "),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("· turn "),
             Span::styled(format!("{turn} "), Style::default().fg(Color::Yellow)),
@@ -926,7 +920,9 @@ impl App {
         } else {
             spans.push(Span::styled(
                 format!("▶ running: {}", running.join(",")),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             ));
         }
         spans
@@ -959,14 +955,13 @@ impl App {
                 let g = st.get(GameId(gid));
                 // Final drain of any unlogged public events.
                 if let Some(game) = g {
-                    self.results_public_cursor =
-                        crate::harness::results_log::drain_public_events(
-                            &self.run_id,
-                            gid,
-                            game,
-                            &agent_cfgs,
-                            self.results_public_cursor,
-                        );
+                    self.results_public_cursor = crate::harness::results_log::drain_public_events(
+                        &self.run_id,
+                        gid,
+                        game,
+                        &agent_cfgs,
+                        self.results_public_cursor,
+                    );
                     if matches!(game.phase, Phase::Ended { .. }) {
                         crate::harness::results_log::log_game_end(
                             &self.run_id,
@@ -996,7 +991,10 @@ impl App {
                     );
                 }
                 self.results_terminal_logged = true;
-                crate::dlog!("RESULTS terminal event logged on shutdown run_id={}", self.run_id);
+                crate::dlog!(
+                    "RESULTS terminal event logged on shutdown run_id={}",
+                    self.run_id
+                );
             }
         }
 
@@ -1074,7 +1072,10 @@ fn fmt_public_event(e: &crate::comms::PublicEvent) -> String {
         }
         PlayerDied { seat } => format!("P{} died", seat.0),
         SlayerMiss { slayer, target } => {
-            format!("P{} tried to slay P{} — nothing happened", slayer.0, target.0)
+            format!(
+                "P{} tried to slay P{} — nothing happened",
+                slayer.0, target.0
+            )
         }
         PhaseChanged { summary } => summary.clone(),
         GameEnded { winner } => format!("Game over — {winner:?} wins"),
@@ -1103,7 +1104,7 @@ fn game_summary_and_hint(g: &Game) -> (String, String) {
         .into_iter()
         .rev()
         .take(16)
-        .map(|(_, e)| fmt_public_event(&e))
+        .map(|(_, e)| fmt_public_event(e))
         .collect();
     let recent: Vec<_> = recent.into_iter().rev().collect();
     let recent_str = if recent.is_empty() {
@@ -1189,14 +1190,19 @@ fn feed_line(e: &crate::harness::action_log::ActionEntry) -> Line<'static> {
     let ac = actor_color(e.actor.is_host, e.actor.seat);
     let (tool_style, marker) = match e.kind {
         ActionKind::Game => (
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
             "▶ ",
         ),
         ActionKind::Info => (Style::default().fg(Color::DarkGray), "  "),
         ActionKind::Meta => (Style::default().fg(Color::Gray), "  "),
     };
     let mut spans = vec![
-        Span::styled(format!("{:>4}s ", e.secs), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:>4}s ", e.secs),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::styled(
             format!("{:<5}", e.actor.name),
             Style::default().fg(ac).add_modifier(Modifier::BOLD),
@@ -1337,7 +1343,11 @@ fn draw_action_feed(f: &mut Frame, area: Rect, app: &mut App) {
         FeedFilter::All => "all",
         FeedFilter::GameOnly => "game-only",
     };
-    let tail = if app.feed_scroll == 0 { "·live" } else { "·scroll" };
+    let tail = if app.feed_scroll == 0 {
+        "·live"
+    } else {
+        "·scroll"
+    };
     let title = format!(
         "actions · {filt} · {} total · click=expand f=filter {tail}",
         app.action_log.len()
@@ -1462,10 +1472,7 @@ pub fn run_tui() -> io::Result<()> {
                     }
                 }
                 Event::Mouse(m) => app.on_mouse(m),
-                Event::Resize(_, _)
-                | Event::FocusGained
-                | Event::FocusLost
-                | Event::Paste(_) => {}
+                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
             }
         }
         // Idle wait so we don't busy-spin when the queue is empty.
@@ -1577,7 +1584,11 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
             app.player_count,
             app.player_count + 1
         ),
-        if app.setup_row == 0 { focused } else { Style::default() },
+        if app.setup_row == 0 {
+            focused
+        } else {
+            Style::default()
+        },
     )));
     lines.push(Line::raw(""));
 
@@ -1602,7 +1613,11 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
         let mark = if app.setup_row == row { "▶ " } else { "  " };
         let mut spans = vec![Span::styled(
             format!("{mark}{who:<5} "),
-            if app.setup_row == row { focused } else { Style::default() },
+            if app.setup_row == row {
+                focused
+            } else {
+                Style::default()
+            },
         )];
         // Role column: Host runs the game; players show their previewed character.
         let (role_text, role_st) = if slot == 0 {
@@ -1640,9 +1655,18 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
         dim,
     )));
     lines.push(Line::raw(""));
-    lines.push(Line::raw(format!("  Grok binary: {}", app.cfg.grok_bin.display())));
-    lines.push(Line::raw(format!("  Agent MCP:   {}  ({mcp_note})", mcp.display())));
-    lines.push(Line::raw(format!("  Work root:   {}", app.cfg.work_root.display())));
+    lines.push(Line::raw(format!(
+        "  Grok binary: {}",
+        app.cfg.grok_bin.display()
+    )));
+    lines.push(Line::raw(format!(
+        "  Agent MCP:   {}  ({mcp_note})",
+        mcp.display()
+    )));
+    lines.push(Line::raw(format!(
+        "  Work root:   {}",
+        app.cfg.work_root.display()
+    )));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "  Controls:  ↑/↓ focus row · ←/→ change (count / model) · a model→all · r reroll roles",
@@ -1755,7 +1779,7 @@ fn draw_board_panel(f: &mut Frame, area: Rect, app: &mut App) {
                             detail.push_str(" · idle");
                         }
                     } else {
-                        detail.push_str("—");
+                        detail.push('—');
                     }
                     push(
                         &mut lines,
@@ -1783,9 +1807,7 @@ fn draw_board_panel(f: &mut Frame, area: Rect, app: &mut App) {
                                     None => "Drunk".into(),
                                 }
                             } else {
-                                s.true_role
-                                    .clone()
-                                    .unwrap_or_else(|| "?".into())
+                                s.true_role.clone().unwrap_or_else(|| "?".into())
                             };
                             let st = s
                                 .true_char
@@ -1835,7 +1857,10 @@ fn draw_board_panel(f: &mut Frame, area: Rect, app: &mut App) {
                             marks.push(Span::styled(format!(" · {team}"), tsty));
                         }
                         if s.poisoned {
-                            marks.push(Span::styled(" · poison", Style::default().fg(Color::Magenta)));
+                            marks.push(Span::styled(
+                                " · poison",
+                                Style::default().fg(Color::Magenta),
+                            ));
                         }
                         if s.monk_protected {
                             marks.push(Span::styled(" · monk", Style::default().fg(Color::Cyan)));
@@ -2108,7 +2133,11 @@ fn draw_monitor(f: &mut Frame, area: Rect, app: &mut App) {
     let view_h = cols[2].height.saturating_sub(2) as usize;
     let para = Paragraph::new(log_lines).wrap(Wrap { trim: false });
     // Wrapped-row count for the exact rendered width (tail-anchor scroll, #53).
-    let row_count = if inner_w == 0 { 0 } else { para.line_count(inner_w) };
+    let row_count = if inner_w == 0 {
+        0
+    } else {
+        para.line_count(inner_w)
+    };
     // scroll_from_bottom=0 → show the end; larger → look further up (row units).
     let scroll_y = stream_scroll_y(row_count, view_h, app.scroll_from_bottom);
     let scroll_y_u16 = u16::try_from(scroll_y).unwrap_or(u16::MAX);
@@ -2123,11 +2152,9 @@ fn draw_monitor(f: &mut Frame, area: Rect, app: &mut App) {
         "·think▾"
     };
     let log_p = para
-        .block(
-            Block::default().borders(Borders::ALL).title(format!(
-                "{agent_title} {tail_mark} {think_mark}  click·h  wheel·scroll"
-            )),
-        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            "{agent_title} {tail_mark} {think_mark}  click·h  wheel·scroll"
+        )))
         .scroll((scroll_y_u16, 0));
     f.render_widget(log_p, cols[2]);
 }
@@ -2160,7 +2187,11 @@ fn think_summary(n: usize, preview: &str) -> Line<'static> {
         String::new()
     } else {
         let s: String = preview.trim().chars().take(48).collect();
-        let ell = if preview.trim().chars().count() > 48 { "…" } else { "" };
+        let ell = if preview.trim().chars().count() > 48 {
+            "…"
+        } else {
+            ""
+        };
         format!(" “{s}{ell}”")
     };
     Line::from(Span::styled(
@@ -2267,7 +2298,10 @@ mod tests {
             lk(LineKind::Text, "Calling night_action on seat 2"),
             lk(LineKind::System, "— turn end —"),
         ];
-        let texts: Vec<String> = stream_lines(&entries, false).iter().map(line_text).collect();
+        let texts: Vec<String> = stream_lines(&entries, false)
+            .iter()
+            .map(line_text)
+            .collect();
         assert_eq!(
             texts.iter().filter(|t| t.contains("thinking…")).count(),
             1,
@@ -2278,7 +2312,9 @@ mod tests {
             !texts.iter().any(|t| t.contains("maybe seat 2")),
             "collapsed must not dump think bodies: {texts:?}"
         );
-        assert!(texts.iter().any(|t| t.contains("Calling night_action on seat 2")));
+        assert!(texts
+            .iter()
+            .any(|t| t.contains("Calling night_action on seat 2")));
         assert!(texts.iter().any(|t| t.contains("turn end")));
 
         let etexts: Vec<String> = stream_lines(&entries, true).iter().map(line_text).collect();
@@ -2296,7 +2332,10 @@ mod tests {
             lk(LineKind::Thought, "second"),
             lk(LineKind::Text, "action B"),
         ];
-        let texts: Vec<String> = stream_lines(&entries, false).iter().map(line_text).collect();
+        let texts: Vec<String> = stream_lines(&entries, false)
+            .iter()
+            .map(line_text)
+            .collect();
         assert_eq!(texts.len(), 4, "got {texts:?}");
         assert!(texts[0].contains("thinking… 1 line"));
         assert_eq!(texts[1], "action A");

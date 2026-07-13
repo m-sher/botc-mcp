@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# botc-mcp pre-commit: cargo fmt (check) + clippy (-D warnings) on all targets.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "==> cargo fmt --all -- --check"
+if ! cargo fmt --all -- --check; then
+  echo "error: rustfmt needed. Run: cargo fmt --all" >&2
+  exit 1
+fi
+
+echo "==> cargo clippy --all-targets -- -D warnings"
+cargo clippy --all-targets -- -D warnings
+
+echo "pre-commit OK"

@@ -42,7 +42,10 @@ fn main() {
     let sc = &created["result"]["structuredContent"];
     let game_id = sc["game_id"].as_u64().expect("game_id");
     let host = sc["host_token"].as_str().expect("host").to_string();
-    println!("create_game: game_id={game_id} players={}", sc["players"].as_array().unwrap().len());
+    println!(
+        "create_game: game_id={game_id} players={}",
+        sc["players"].as_array().unwrap().len()
+    );
 
     let list = rpc(&store, 3, "tools/list", json!({}));
     let n = list["result"]["tools"].as_array().unwrap().len();

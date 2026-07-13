@@ -100,10 +100,7 @@ impl HostDecisionView {
                 detail: format!("mayor seat {}", mayor.0),
                 seats: living_others.clone(),
             },
-            PendingHostDecision::StarpassPick {
-                minions,
-                dead_imp,
-            } => Self {
+            PendingHostDecision::StarpassPick { minions, dead_imp } => Self {
                 kind: "starpass_pick".into(),
                 detail: format!("dead_imp seat {}", dead_imp.0),
                 seats: minions.clone(),

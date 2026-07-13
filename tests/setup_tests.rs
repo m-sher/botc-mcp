@@ -70,7 +70,10 @@ fn create_game_stores_seed_and_lobby_phase() {
 #[test]
 fn composition_8() {
     let c = botc_mcp::game::setup::composition(8);
-    assert_eq!((c.townsfolk, c.outsiders, c.minions, c.demons), (5, 1, 1, 1));
+    assert_eq!(
+        (c.townsfolk, c.outsiders, c.minions, c.demons),
+        (5, 1, 1, 1)
+    );
 }
 
 #[test]

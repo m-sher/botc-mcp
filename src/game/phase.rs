@@ -6,11 +6,22 @@ use crate::game::ids::SeatId;
 pub enum Phase {
     Lobby,
     /// First night; `cursor` indexes into [`crate::game::state::Game::night_queue`].
-    FirstNight { cursor: usize },
-    Day { day: u32, stage: DayStage },
+    FirstNight {
+        cursor: usize,
+    },
+    Day {
+        day: u32,
+        stage: DayStage,
+    },
     /// Subsequent nights (`night >= 2`); `cursor` indexes into `night_queue`.
-    Night { night: u32, cursor: usize },
-    Ended { winner: Winner, reason: EndReason },
+    Night {
+        night: u32,
+        cursor: usize,
+    },
+    Ended {
+        winner: Winner,
+        reason: EndReason,
+    },
 }
 
 impl Phase {
@@ -52,19 +63,45 @@ pub enum NightStep {
     MinionBriefing,
     /// Imp learns minions + bluffs (n ≥ 7).
     DemonBriefing,
-    Poisoner { seat: SeatId },
-    Spy { seat: SeatId },
-    Washerwoman { seat: SeatId },
-    Librarian { seat: SeatId },
-    Investigator { seat: SeatId },
-    Chef { seat: SeatId },
-    Empath { seat: SeatId },
-    FortuneTeller { seat: SeatId },
-    Butler { seat: SeatId },
-    Monk { seat: SeatId },
+    Poisoner {
+        seat: SeatId,
+    },
+    Spy {
+        seat: SeatId,
+    },
+    Washerwoman {
+        seat: SeatId,
+    },
+    Librarian {
+        seat: SeatId,
+    },
+    Investigator {
+        seat: SeatId,
+    },
+    Chef {
+        seat: SeatId,
+    },
+    Empath {
+        seat: SeatId,
+    },
+    FortuneTeller {
+        seat: SeatId,
+    },
+    Butler {
+        seat: SeatId,
+    },
+    Monk {
+        seat: SeatId,
+    },
     /// Imp chooses a kill target (not on first night).
-    DemonKill { seat: SeatId },
-    Ravenkeeper { seat: SeatId },
-    Undertaker { seat: SeatId },
+    DemonKill {
+        seat: SeatId,
+    },
+    Ravenkeeper {
+        seat: SeatId,
+    },
+    Undertaker {
+        seat: SeatId,
+    },
     Dawn,
 }

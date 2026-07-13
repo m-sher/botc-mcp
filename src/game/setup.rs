@@ -5,12 +5,10 @@ use rand::Rng;
 
 use crate::error::GameError;
 use crate::game::ids::SeatId;
-use crate::game::state::RoleAssignment;
 use crate::game::st_policy::{RegistrationMode, StChoiceMode};
+use crate::game::state::RoleAssignment;
 use crate::rng::SeededRng;
-use crate::roles::{
-    all_minions, all_outsiders, all_townsfolk, Character, CharacterType, Team,
-};
+use crate::roles::{all_minions, all_outsiders, all_townsfolk, Character, CharacterType, Team};
 
 /// Base (pre-modifier) counts for Trouble Brewing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +53,8 @@ pub struct BagResult {
 /// # Panics
 /// Panics if `n` is outside 5..=15.
 pub fn composition(n: u8) -> Composition {
-    try_composition(n).unwrap_or_else(|| panic!("composition requires player count 5..=15, got {n}"))
+    try_composition(n)
+        .unwrap_or_else(|| panic!("composition requires player count 5..=15, got {n}"))
 }
 
 /// Fallible composition lookup.
@@ -298,7 +297,10 @@ mod tests {
     #[test]
     fn composition_8_unit() {
         let c = composition(8);
-        assert_eq!((c.townsfolk, c.outsiders, c.minions, c.demons), (5, 1, 1, 1));
+        assert_eq!(
+            (c.townsfolk, c.outsiders, c.minions, c.demons),
+            (5, 1, 1, 1)
+        );
     }
 
     #[test]

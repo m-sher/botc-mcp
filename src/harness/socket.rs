@@ -85,9 +85,8 @@ impl SocketServer {
             std::fs::create_dir_all(parent)?;
         }
         let listener = UnixListener::bind(&path)?;
-        let sock_id = sock_id_of(&path).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "socket metadata missing after bind")
-        })?;
+        let sock_id = sock_id_of(&path)
+            .ok_or_else(|| std::io::Error::other("socket metadata missing after bind"))?;
         // Non-blocking accept so stop()/Drop never deadlocks if the socket file
         // is unlinked or rebound (#48). We poll with a short sleep + stop flag.
         listener.set_nonblocking(true)?;
@@ -271,10 +270,7 @@ impl SocketClient {
         let stream = UnixStream::connect(path)?;
         stream.set_read_timeout(Some(Duration::from_secs(120)))?;
         stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-        Ok(Self {
-            stream,
-            next_id: 1,
-        })
+        Ok(Self { stream, next_id: 1 })
     }
 
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value, String> {
@@ -296,9 +292,7 @@ impl SocketClient {
         stream.flush().map_err(|e| e.to_string())?;
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|e| e.to_string())?;
+        reader.read_line(&mut line).map_err(|e| e.to_string())?;
         let resp: RpcResponse =
             serde_json::from_str(line.trim()).map_err(|e| format!("bad response: {e}"))?;
         if resp.id != id {
@@ -321,10 +315,8 @@ mod tests {
     #[test]
     fn stop_after_socket_unlinked_does_not_deadlock() {
         let store = mcp_server::new_shared_store();
-        let path = std::env::temp_dir().join(format!(
-            "botc-sock-unlink-{}.sock",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("botc-sock-unlink-{}.sock", uuid::Uuid::new_v4()));
         let server = SocketServer::start(store, &path).expect("bind");
         assert!(path.exists());
         std::fs::remove_file(&path).expect("unlink");
@@ -341,10 +333,8 @@ mod tests {
     fn drop_old_server_does_not_unlink_rebound_socket() {
         let store_a = mcp_server::new_shared_store();
         let store_b = mcp_server::new_shared_store();
-        let path = std::env::temp_dir().join(format!(
-            "botc-sock-rebind-{}.sock",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("botc-sock-rebind-{}.sock", uuid::Uuid::new_v4()));
         let a = SocketServer::start(store_a, &path).expect("bind a");
         let b = SocketServer::start(store_b, &path).expect("bind b (rebind)");
         assert!(path.exists());
