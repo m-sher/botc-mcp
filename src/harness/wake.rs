@@ -258,9 +258,13 @@ fn try_deliver(
         None => return Deliver::Idle,
     };
 
-    let st = match store.lock() {
+    // try_lock: never block on the store while holding the coordinator mutex.
+    // Completing tools hold the store then call note_tool_success (coord) — if we
+    // waited here we'd deadlock with that order inverted.
+    let st = match store.try_lock() {
         Ok(s) => s,
-        Err(_) => {
+        Err(std::sync::TryLockError::WouldBlock) => return Deliver::Idle,
+        Err(std::sync::TryLockError::Poisoned(_)) => {
             return Deliver::GameOver(json!({
                 "status": "error",
                 "retry": true,
