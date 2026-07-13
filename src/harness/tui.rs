@@ -648,12 +648,30 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Per-agent usage snapshot for results log / game_end.
+    fn agent_usage_for_results(&self) -> Vec<(String, crate::harness::agents::AgentUsage)> {
+        let Some(pool) = self.agents.as_ref() else {
+            return Vec::new();
+        };
+        pool.agents
+            .iter()
+            .map(|a| {
+                let label = match a.config.role {
+                    AgentRole::Host => "Host".to_string(),
+                    AgentRole::Player { seat } => format!("P{}", seat.0),
+                };
+                (label, a.usage.lock().unwrap().clone())
+            })
+            .collect()
+    }
+
     /// Drain ranking-relevant public events; if the game just ended, write `game_end` once.
     fn results_poll(&mut self) {
         let Some(gid) = self.game_id else {
             return;
         };
         let agent_cfgs = self.agent_configs_for_results();
+        let usage = self.agent_usage_for_results();
         let st = self.store.lock().unwrap();
         let Some(g) = st.get(GameId(gid)) else {
             return;
@@ -667,7 +685,13 @@ impl App {
         );
         if !self.results_terminal_logged {
             if matches!(g.phase, Phase::Ended { .. }) {
-                crate::harness::results_log::log_game_end(&self.run_id, gid, g, &agent_cfgs);
+                crate::harness::results_log::log_game_end(
+                    &self.run_id,
+                    gid,
+                    g,
+                    &agent_cfgs,
+                    &usage,
+                );
                 self.results_terminal_logged = true;
                 crate::dlog!("RESULTS game_end logged run_id={}", self.run_id);
             }
@@ -930,6 +954,7 @@ impl App {
         if let Some(gid) = self.game_id {
             if !self.results_terminal_logged {
                 let agent_cfgs = self.agent_configs_for_results();
+                let usage = self.agent_usage_for_results();
                 let st = self.store.lock().unwrap();
                 let g = st.get(GameId(gid));
                 // Final drain of any unlogged public events.
@@ -948,6 +973,7 @@ impl App {
                             gid,
                             game,
                             &agent_cfgs,
+                            &usage,
                         );
                     } else {
                         crate::harness::results_log::log_game_abort(
@@ -956,6 +982,7 @@ impl App {
                             Some(game),
                             &agent_cfgs,
                             "tui_quit",
+                            &usage,
                         );
                     }
                 } else {
@@ -965,6 +992,7 @@ impl App {
                         None,
                         &agent_cfgs,
                         "tui_quit",
+                        &usage,
                     );
                 }
                 self.results_terminal_logged = true;
@@ -1396,6 +1424,7 @@ pub fn run_tui() -> io::Result<()> {
     install_panic_hook();
     let mut guard = TerminalGuard::enter()?;
     let mut app = App::new();
+    crate::harness::results_log::set_run_id(&app.run_id);
     app.status = format!(
         "{}  · debug: {log_path}  · results: {}",
         app.status,
@@ -1675,6 +1704,21 @@ fn draw_board_panel(f: &mut Frame, area: Rect, app: &mut App) {
             let selected = i == app.selected_agent;
             let mark = if selected { "▶" } else { " " };
             let model = crate::harness::action_log::clip_chars(&a.config.model, 12);
+            let (usage_short, usage_style) = {
+                let u = a.usage.lock().unwrap();
+                let short = u.board_short();
+                let pct = u.context.as_ref().map(|c| c.usage_pct).unwrap_or(0);
+                let style = if pct >= 80 {
+                    Style::default().fg(Color::Red)
+                } else if pct >= 50 {
+                    Style::default().fg(Color::Yellow)
+                } else if pct > 0 || u.game_total.total_tokens > 0 {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    dim
+                };
+                (short, style)
+            };
 
             match a.config.role {
                 AgentRole::Host => {
@@ -1717,6 +1761,12 @@ fn draw_board_panel(f: &mut Frame, area: Rect, app: &mut App) {
                         &mut lines,
                         &mut row_map,
                         Line::from(Span::styled(format!("    {detail}"), dim)),
+                        Some(i),
+                    );
+                    push(
+                        &mut lines,
+                        &mut row_map,
+                        Line::from(Span::styled(format!("    {usage_short}"), usage_style)),
                         Some(i),
                     );
                 }
@@ -1811,6 +1861,12 @@ fn draw_board_panel(f: &mut Frame, area: Rect, app: &mut App) {
                         marks.push(Span::styled("—", dim));
                     }
                     push(&mut lines, &mut row_map, Line::from(marks), Some(i));
+                    push(
+                        &mut lines,
+                        &mut row_map,
+                        Line::from(Span::styled(format!("    {usage_short}"), usage_style)),
+                        Some(i),
+                    );
                 }
             }
         }

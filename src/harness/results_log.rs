@@ -17,6 +17,7 @@
 //! | `nomination` | A nomination opens | Social targeting metrics later |
 //! | `game_end` | Engine reaches Ended | Team win + per-seat outcome |
 //! | `game_abort` | TUI quit mid-game | Incomplete run filtering |
+//! | `tick_usage` | Headless grok tick reports `usage` | Token spend / context growth |
 //!
 //! Chat / tool spam is intentionally **not** logged here.
 
@@ -30,10 +31,15 @@ use serde_json::{json, Value};
 
 use crate::comms::PublicEvent;
 use crate::game::{EndReason, Game, Phase, SeatId, Winner};
-use crate::harness::agents::{AgentConfig, AgentRole};
+use crate::harness::agents::{
+    AgentConfig, AgentRole, AgentUsage, ContextWindow, TickUsage,
+};
 
 static FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 static PATH: OnceLock<PathBuf> = OnceLock::new();
+/// Set by the TUI so tick_usage lines share the same run id without threading it
+/// through every spawn.
+static RUN_ID: OnceLock<Mutex<String>> = OnceLock::new();
 
 /// Schema version stamped on every line.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -62,6 +68,84 @@ pub fn init() -> PathBuf {
         .ok();
     let _ = FILE.set(Mutex::new(file));
     path
+}
+
+/// Stamp every subsequent `tick_usage` / game event with this TUI run id.
+pub fn set_run_id(run_id: &str) {
+    let slot = RUN_ID.get_or_init(|| Mutex::new(String::new()));
+    *slot.lock().unwrap() = run_id.to_string();
+}
+
+fn current_run_id() -> String {
+    RUN_ID
+        .get()
+        .and_then(|m| {
+            let s = m.lock().unwrap();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.clone())
+            }
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn tick_usage_json(t: &TickUsage) -> Value {
+    json!({
+        "input_tokens": t.input_tokens,
+        "cache_read_input_tokens": t.cache_read_input_tokens,
+        "output_tokens": t.output_tokens,
+        "reasoning_tokens": t.reasoning_tokens,
+        "total_tokens": t.total_tokens,
+        "num_turns": t.num_turns,
+    })
+}
+
+fn context_json(c: &ContextWindow) -> Value {
+    json!({
+        "tokens_used": c.tokens_used,
+        "window_tokens": c.window_tokens,
+        "usage_pct": c.usage_pct,
+    })
+}
+
+/// One headless tick's spend (from streaming-json `end.usage`).
+pub fn log_tick_usage(
+    game_id: u64,
+    agent: &str,
+    model: &str,
+    tick: &TickUsage,
+    context: Option<&ContextWindow>,
+    cumulative: &TickUsage,
+    ticks_with_usage: u32,
+) {
+    emit(json!({
+        "event": "tick_usage",
+        "run_id": current_run_id(),
+        "game_id": game_id,
+        "agent": agent,
+        "model": model,
+        "tick": tick_usage_json(tick),
+        "cumulative": tick_usage_json(cumulative),
+        "ticks_with_usage": ticks_with_usage,
+        "context": context.map(context_json),
+    }));
+}
+
+/// Usage snapshot for `game_end` / `game_abort` (agent label → usage).
+pub fn usage_snapshot_json(entries: &[(String, AgentUsage)]) -> Vec<Value> {
+    entries
+        .iter()
+        .map(|(label, u)| {
+            json!({
+                "agent": label,
+                "ticks_with_usage": u.ticks_with_usage,
+                "last_tick": u.last_tick.as_ref().map(tick_usage_json),
+                "game_total": tick_usage_json(&u.game_total),
+                "context": u.context.as_ref().map(context_json),
+            })
+        })
+        .collect()
 }
 
 /// True if a file handle is open.
@@ -266,7 +350,13 @@ fn reason_str(r: EndReason) -> &'static str {
 }
 
 /// `game_end` — terminal outcome + per-seat win flags for ranking.
-pub fn log_game_end(run_id: &str, game_id: u64, game: &Game, agents: &[AgentConfig]) {
+pub fn log_game_end(
+    run_id: &str,
+    game_id: u64,
+    game: &Game,
+    agents: &[AgentConfig],
+    usage: &[(String, AgentUsage)],
+) {
     let (winner, reason) = match &game.phase {
         Phase::Ended { winner, reason } => (*winner, *reason),
         _ => return,
@@ -296,6 +386,7 @@ pub fn log_game_end(run_id: &str, game_id: u64, game: &Game, agents: &[AgentConf
         "reason": reason_str(reason),
         "host": { "model": host_model(agents) },
         "seats": seats,
+        "usage": usage_snapshot_json(usage),
         "phase": phase_fields(game),
     }));
 }
@@ -307,6 +398,7 @@ pub fn log_game_abort(
     game: Option<&Game>,
     agents: &[AgentConfig],
     why: &str,
+    usage: &[(String, AgentUsage)],
 ) {
     let seats = game
         .map(|g| seats_snapshot(g, agents))
@@ -319,6 +411,7 @@ pub fn log_game_abort(
         "why": why,
         "host": { "model": host_model(agents) },
         "seats": seats,
+        "usage": usage_snapshot_json(usage),
         "phase": phase,
     }));
 }

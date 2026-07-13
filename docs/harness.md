@@ -82,7 +82,9 @@ Three columns — **left: board** (agents + grimoire + noms) · **center: action
 | Line | Content |
 | --- | --- |
 | Host | `●/○` running, model, phase, `pending_host` / night wake |
-| Seat | `●/○`, true role (Drunk shows face), model; second line: alive/DEAD, team, poison, monk, butler master, ghost/slayer/virgin flags |
+| Seat | `●/○`, true role (Drunk shows face), model; second line: alive/DEAD, team, poison, monk, butler master, ghost/slayer/virgin flags; third line: **token usage** |
+
+**Usage line** (per agent): cumulative spend `Σ…`, last tick total, and context fill from the session (`ctx N% (used / window)`). Cyan under 50%, yellow 50–79%, red ≥80%. Values come from each headless tick’s streaming-json `end.usage` plus `signals.json` after the process exits.
 
 Team colours match setup (Townsfolk green, Outsider yellow, Minion/Demon red). Below the roster, a **live noms tracker**: closed nominations with yes totals (and `≥½` when they meet threshold) plus the open vote with a running tally (`P0✓ P3✗ P1–` for pass).
 
@@ -157,6 +159,7 @@ line, schema field `v` (currently `1`). Survives quit; not under the deleted wor
 | `nomination` | Someone is put on the block | Social targeting later |
 | `game_end` | Engine `Ended` | `winner`, `reason`, per-seat `won` |
 | `game_abort` | Quit before end | Filter incomplete runs |
+| `tick_usage` | Each headless tick with `end.usage` | Token spend + cumulative + optional context window |
 
 Chat and full tool traces are **not** in this file (see the debug log / action feed for those).
 
