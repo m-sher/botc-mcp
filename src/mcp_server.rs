@@ -164,6 +164,7 @@ const TOOL_NAMES: &[&str] = &[
     "skip_night_action",
     "host_decide",
     "host_queue_lie",
+    "await_turn",
 ];
 
 fn tool_descriptors() -> Vec<Value> {
@@ -221,6 +222,15 @@ fn tool_schema(name: &str) -> Value {
         | "end_nominations" | "skip_night_action" | "pass_vote" => json!({
             "type": "object",
             "properties": { "game_id": game_id, "token": token },
+            "required": ["game_id"],
+        }),
+        "await_turn" => json!({
+            "type": "object",
+            "properties": {
+                "game_id": game_id,
+                "token": token,
+                "budget_secs": { "type": "integer", "description": "Server long-poll budget seconds (capped; default 300). On idle/timeout, call await_turn again. Redelivery uses the durable mailbox (same wake_id), not a client cursor." },
+            },
             "required": ["game_id"],
         }),
         "get_public_log" => json!({
@@ -367,6 +377,7 @@ fn tool_description(name: &str) -> &'static str {
         "skip_night_action" => "Host: default pending wake OR pending host decision (random/default fallback)",
         "host_decide" => "Host: resolve ST decision (mayor_redirect, starpass_pick, night_info)",
         "host_queue_lie" => "Host: enqueue free-text false info for next disabled info result",
+        "await_turn" => "Long-poll until it is your turn; returns wake prompt, soft idle (re-call), or game_over. On tool timeout, call again — wakes are durable.",
         _ => "botc-mcp tool",
     }
 }
@@ -431,6 +442,13 @@ fn invoke_tool(store: &SharedStore, name: &str, args: Value) -> Result<Value, Rp
         "skip_night_action" => tool_skip_night_action(store, args),
         "host_decide" => tool_host_decide(store, args),
         "host_queue_lie" => tool_host_queue_lie(store, args),
+        // Harness socket intercepts await_turn for real long-poll; stdio MCP has no
+        // wake coordinator, so return a soft error the model can understand.
+        "await_turn" => Ok(json!({
+            "status": "error",
+            "retry": false,
+            "hint": "await_turn long-poll is only supported under botc-tui (harness socket). Standalone botc-mcp has no wake coordinator.",
+        })),
         other => Err(RpcError {
             code: -32601,
             message: format!("unknown tool: {other}"),
