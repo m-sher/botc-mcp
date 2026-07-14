@@ -16,7 +16,6 @@ pub mod results_log;
 pub mod scheduler;
 pub mod socket;
 pub mod tui;
-pub mod wake;
 
 pub use agents::{AgentConfig, AgentRole, HarnessConfig};
 pub use tui::run_tui;
