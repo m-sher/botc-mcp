@@ -197,13 +197,34 @@ impl Game {
         })
     }
 
+    /// A seat's **publicly-known** alive status, for player-facing views only.
+    ///
+    /// A seat killed during the current night is not public until the dawn
+    /// announcement (`DiedInNight`), so it must still read as alive to players in
+    /// between. `deaths_tonight` holds exactly those unannounced night kills and is
+    /// cleared at dawn, so day deaths (execution/Slayer — never added to it) stay
+    /// visible the instant they resolve. The true [`Seat::alive`] remains the source
+    /// of truth for ability resolution, win checks, host views, and scheduling —
+    /// only player-facing roster DTOs are masked with this.
+    ///
+    /// The mask applies **only while a night is in progress**: if a night kill ends
+    /// the game (`Phase::Ended`) — where `dawn()` is skipped and `deaths_tonight` is
+    /// never cleared — or once the day begins, the true state is shown so the
+    /// deciding death is not hidden on the final revealed board.
+    pub fn seat_publicly_alive(&self, seat: &Seat) -> bool {
+        seat.alive
+            || (matches!(self.phase, Phase::FirstNight { .. } | Phase::Night { .. })
+                && self.deaths_tonight.contains(&seat.id))
+    }
+
     pub fn public_seats(&self) -> Vec<PublicSeatView> {
         self.seats
             .iter()
             .map(|s| PublicSeatView {
                 id: s.id,
                 name: s.display_name.clone(),
-                alive: s.alive,
+                // Public view: a not-yet-announced night kill still reads as alive.
+                alive: self.seat_publicly_alive(s),
                 ghost_vote_available: s.ghost_vote_available,
             })
             .collect()

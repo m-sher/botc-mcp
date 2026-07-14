@@ -1086,16 +1086,18 @@ fn fmt_public_event(e: &crate::comms::PublicEvent) -> String {
 /// Free function so the scheduler can build it under the store lock without a second lock.
 fn game_summary_and_hint(g: &Game) -> (String, String) {
     let phase = format!("{:?}", g.phase);
+    // Player-facing roster: use PUBLICLY-known alive so a night kill isn't leaked
+    // into a later night-order agent's prompt before the dawn announcement.
     let living: Vec<_> = g
         .seats
         .iter()
-        .filter(|s| s.alive)
+        .filter(|s| g.seat_publicly_alive(s))
         .map(|s| format!("P{}", s.id.0))
         .collect();
     let dead: Vec<_> = g
         .seats
         .iter()
-        .filter(|s| !s.alive)
+        .filter(|s| !g.seat_publicly_alive(s))
         .map(|s| format!("P{}", s.id.0))
         .collect();
     let recent: Vec<_> = g
