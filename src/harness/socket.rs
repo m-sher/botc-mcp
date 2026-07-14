@@ -12,7 +12,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::auth::Actor;
+use crate::game::GameId;
 use crate::harness::action_log::ActionLog;
+use crate::harness::wake::{WakeActor, WakeCoordinator, AWAIT_SERVER_BUDGET_SECS};
 use crate::mcp_server::{self, SharedStore};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,12 +71,18 @@ pub struct SocketServer {
 impl SocketServer {
     /// Start with a throwaway action log (tests / callers that don't monitor).
     pub fn start(store: SharedStore, path: impl Into<PathBuf>) -> std::io::Result<Self> {
-        Self::start_with_log(store, Arc::new(ActionLog::default()), path)
+        Self::start_with_log(
+            store,
+            Arc::new(WakeCoordinator::new()),
+            Arc::new(ActionLog::default()),
+            path,
+        )
     }
 
     /// Start serving, recording every dispatched tool RPC into `action_log`.
     pub fn start_with_log(
         store: SharedStore,
+        wake: Arc<WakeCoordinator>,
         action_log: Arc<ActionLog>,
         path: impl Into<PathBuf>,
     ) -> std::io::Result<Self> {
@@ -98,9 +107,10 @@ impl SocketServer {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let store = Arc::clone(&store);
+                        let wake = Arc::clone(&wake);
                         let action_log = Arc::clone(&action_log);
                         thread::spawn(move || {
-                            if let Err(e) = handle_client(store, action_log, stream) {
+                            if let Err(e) = handle_client(store, wake, action_log, stream) {
                                 eprintln!("botc harness client error: {e}");
                             }
                         });
@@ -159,6 +169,7 @@ impl Drop for SocketServer {
 
 fn handle_client(
     store: SharedStore,
+    wake: Arc<WakeCoordinator>,
     action_log: Arc<ActionLog>,
     stream: UnixStream,
 ) -> std::io::Result<()> {
@@ -190,14 +201,19 @@ fn handle_client(
                 continue;
             }
         };
-        let resp = dispatch(&store, &action_log, req);
+        let resp = dispatch(&store, &wake, &action_log, req);
         writeln!(writer, "{}", serde_json::to_string(&resp).unwrap())?;
         writer.flush()?;
     }
     Ok(())
 }
 
-fn dispatch(store: &SharedStore, action_log: &ActionLog, req: RpcRequest) -> RpcResponse {
+fn dispatch(
+    store: &SharedStore,
+    wake: &WakeCoordinator,
+    action_log: &ActionLog,
+    req: RpcRequest,
+) -> RpcResponse {
     match req.op.as_str() {
         "ping" => RpcResponse {
             id: req.id,
@@ -222,7 +238,19 @@ fn dispatch(store: &SharedStore, action_log: &ActionLog, req: RpcRequest) -> Rpc
                 .get("token")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            let outcome = mcp_server::invoke_named_tool(store, name, req.arguments.clone());
+            let outcome = if name == "await_turn" {
+                invoke_await_turn(store, wake, &req.arguments)
+            } else {
+                let r = mcp_server::invoke_named_tool(store, name, req.arguments.clone());
+                if r.is_ok() {
+                    if let Some(ref tok) = token {
+                        if let Some(actor) = resolve_wake_actor(store, tok, &req.arguments) {
+                            wake.note_tool_success(actor, name);
+                        }
+                    }
+                }
+                r
+            };
             let (ok, err, result_preview) = match &outcome {
                 Ok(v) => (true, None, Some(v.to_string())),
                 Err(e) => (false, Some(e.clone()), None),
@@ -259,6 +287,86 @@ fn dispatch(store: &SharedStore, action_log: &ActionLog, req: RpcRequest) -> Rpc
     }
 }
 
+fn resolve_wake_actor(store: &SharedStore, token: &str, args: &Value) -> Option<WakeActor> {
+    use crate::auth::Token;
+    let game_id = args.get("game_id").and_then(|v| v.as_u64())?;
+    let st = store.lock().ok()?;
+    let game = st.get(GameId(game_id))?;
+    let actor = game.tokens.resolve(&Token::from_shared(token))?;
+    Some(WakeActor::from_auth(actor))
+}
+
+fn invoke_await_turn(
+    store: &SharedStore,
+    wake: &WakeCoordinator,
+    args: &Value,
+) -> Result<Value, String> {
+    use crate::auth::Token;
+    let game_id = args
+        .get("game_id")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "await_turn requires game_id".to_string())?;
+    let token = args
+        .get("token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "await_turn requires token".to_string())?;
+    let budget_secs = args
+        .get("budget_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(AWAIT_SERVER_BUDGET_SECS)
+        .min(AWAIT_SERVER_BUDGET_SECS);
+
+    let (wake_actor, display_name) = {
+        let st = store
+            .lock()
+            .map_err(|_| "store lock poisoned".to_string())?;
+        let game = st
+            .get(GameId(game_id))
+            .ok_or_else(|| format!("unknown game_id {game_id}"))?;
+        let actor = game
+            .tokens
+            .resolve(&Token::from_shared(token))
+            .ok_or_else(|| "unauthorized".to_string())?;
+        let wa = WakeActor::from_auth(actor);
+        let name = match actor {
+            Actor::Host => "Host".to_string(),
+            Actor::Player { seat } => game
+                .seats
+                .iter()
+                .find(|s| s.id == seat)
+                .map(|s| s.display_name.clone())
+                .unwrap_or_else(|| format!("P{}", seat.0)),
+        };
+        (wa, name)
+    };
+
+    // Bind only when unbound. A mismatched id against an already-bound game must
+    // not wipe rotation/outstanding for the live table (stale/hallucinated game_id).
+    match wake.game_id() {
+        None => wake.set_game_id(game_id),
+        Some(bound) if bound == game_id => {}
+        Some(bound) => {
+            return Err(format!(
+                "await_turn game_id={game_id} does not match bound game_id={bound}"
+            ));
+        }
+    }
+
+    let structured = wake.await_turn(
+        store,
+        wake_actor,
+        &display_name,
+        Duration::from_secs(budget_secs.max(1)),
+    );
+    // MCP-shaped envelope (same as other tools).
+    let text = structured.to_string();
+    Ok(json!({
+        "content": [{ "type": "text", "text": text }],
+        "structuredContent": structured,
+        "isError": false
+    }))
+}
+
 /// Client used by `botc-agent-mcp` to call the harness.
 pub struct SocketClient {
     stream: UnixStream,
@@ -274,6 +382,15 @@ impl SocketClient {
     }
 
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value, String> {
+        let read_timeout = if name == "await_turn" {
+            // Server budget + skew so soft `idle` returns before the socket times out.
+            Duration::from_secs(AWAIT_SERVER_BUDGET_SECS + 60)
+        } else {
+            Duration::from_secs(120)
+        };
+        self.stream
+            .set_read_timeout(Some(read_timeout))
+            .map_err(|e| e.to_string())?;
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let req = RpcRequest {
@@ -293,6 +410,7 @@ impl SocketClient {
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        let _ = self.stream.set_read_timeout(Some(Duration::from_secs(120)));
         let resp: RpcResponse =
             serde_json::from_str(line.trim()).map_err(|e| format!("bad response: {e}"))?;
         if resp.id != id {

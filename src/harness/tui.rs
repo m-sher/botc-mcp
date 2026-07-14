@@ -28,8 +28,9 @@ use crate::harness::agents::{
     resolve_agent_mcp_bin_for_display, AgentConfig, AgentPool, AgentRole, HarnessConfig, LineKind,
     LogLine,
 };
-use crate::harness::scheduler::{plan_ticks, wait_signature, SchedTarget};
+use crate::harness::scheduler::{plan_ticks, SchedTarget};
 use crate::harness::socket::SocketServer;
+use crate::harness::wake::WakeCoordinator;
 use crate::mcp_server::{self, SharedStore};
 use crate::roles::{Character, CharacterType};
 use crate::tools;
@@ -65,13 +66,14 @@ struct App {
     selected_agent: usize,
     status: String,
     store: SharedStore,
+    /// Shared long-poll wake mailbox for continuous agent sessions.
+    wake: Arc<WakeCoordinator>,
     game_id: Option<u64>,
     host_token: Option<crate::auth::Token>,
     player_names: Vec<String>,
     socket: Option<SocketServer>,
     agents: Option<AgentPool>,
-    /// Event-driven auto-advance: when on, the next turn is ticked as soon as all
-    /// agents are idle (no fixed timer; a running agent is never skipped).
+    /// When on, respawn dead headless agents so `await_turn` sessions stay alive.
     auto_tick: bool,
     /// When the last tick was launched — shown as "last turn Ns ago" (staleness).
     last_tick: Instant,
@@ -79,21 +81,6 @@ struct App {
     should_quit: bool,
     /// Lines scrolled up from the live tail (0 = stick to newest output) (#45).
     scroll_from_bottom: usize,
-    /// Round-robin cursor for discussion/nomination turns in the scheduler (#60).
-    /// Reset to 0 whenever the game enters a new phase/stage (see `stage_key`).
-    tick_rotation: usize,
-    /// Key of the phase/stage the last tick planned for; a change resets `tick_rotation`
-    /// so discussion rounds start counting from the first speaker.
-    stage_key: String,
-    /// Signature of what the engine was waiting on last tick, for stall detection (#60).
-    wait_sig: Option<String>,
-    /// Consecutive cycles the engine has sat on `wait_sig`; drives host escalation (#60).
-    stall: usize,
-    /// Fingerprint of the last plan (targets + signature) for the host-retry brake.
-    last_plan_key: String,
-    /// Consecutive identical host-only plans with no state change; capped to stop
-    /// an unbounded host retry loop.
-    host_plan_repeats: usize,
     /// Agent indices whose stream shows full `[think]` blocks (default: collapsed).
     thinking_expanded: HashSet<usize>,
     /// Last drawn hit targets for mouse (board / stream / feed).
@@ -162,6 +149,7 @@ impl App {
             selected_agent: 0,
             status,
             store: mcp_server::new_shared_store(),
+            wake: Arc::new(WakeCoordinator::new()),
             game_id: None,
             host_token: None,
             player_names: Vec::new(),
@@ -172,12 +160,6 @@ impl App {
             cfg,
             should_quit: false,
             scroll_from_bottom: 0,
-            tick_rotation: 0,
-            stage_key: String::new(),
-            wait_sig: None,
-            stall: 0,
-            last_plan_key: String::new(),
-            host_plan_repeats: 0,
             thinking_expanded: HashSet::new(),
             hit_agents: Rect::default(),
             hit_stream: Rect::default(),
@@ -416,13 +398,9 @@ impl App {
                 self.toggle_thinking_selected();
             }
             KeyCode::Char(' ') if self.agents.is_some() => {
-                // Never skip a running agent: only advance when everything is idle.
-                if self.any_agent_running() {
-                    self.status =
-                        "still running — advances automatically when this turn finishes".into();
-                } else {
-                    self.do_tick();
-                }
+                // Nudge await_turn waiters + respawn any dead continuous sessions.
+                self.wake.notify_all();
+                self.maintain_sessions();
             }
             // Stream scroll: keyboard and mouse wheel (over stream). 0 = live tail.
             KeyCode::PageUp if self.focus == Focus::Monitor => {
@@ -478,8 +456,11 @@ impl App {
             st.insert(created.game).0
         };
 
+        // Fresh coordinator per game so waiters/rotation don't leak across launches.
+        self.wake = Arc::new(WakeCoordinator::new());
         match SocketServer::start_with_log(
             Arc::clone(&self.store),
+            Arc::clone(&self.wake),
             Arc::clone(&self.action_log),
             &self.cfg.socket_path,
         ) {
@@ -524,6 +505,7 @@ impl App {
         }
 
         self.game_id = Some(game_id);
+        self.wake.set_game_id(game_id);
         self.host_token = Some(created.host_token.clone());
 
         // Register token → actor labels so the action feed can name each caller.
@@ -613,7 +595,7 @@ impl App {
                 match pool.kickoff_all(self.player_count) {
                     Ok(spawned) => {
                         self.status = format!(
-                            "Game {game_id} · kicked {spawned}/{} · Space=tick · click stream=think · wheel=scroll · q=quit",
+                            "Game {game_id} · continuous await_turn · kicked {spawned}/{} · t=auto-respawn · q=quit",
                             self.player_count + 1
                         );
                         self.auto_tick = true;
@@ -699,132 +681,81 @@ impl App {
         }
     }
 
-    /// One turn-routed tick (#60): plan from engine state, then tick only the
-    /// agent(s) the game is waiting on. Stops (and disarms auto-tick) at `Ended`.
-    fn do_tick(&mut self) {
+    /// Continuous-session maintenance: drain results, surface end-of-game, and
+    /// respawn any headless agent that exited so `await_turn` can continue.
+    /// Turn routing itself is pull-based inside `await_turn` (no per-turn spawn).
+    fn maintain_sessions(&mut self) {
         let Some(gid) = self.game_id else {
             return;
         };
-        // Read all we need under one short lock: the plan, the prompt context,
-        // and whether the game is over. Do NOT hold the lock while spawning grok.
-        let (plan, summary, hint, ended, sig, stall, state_dbg) = {
+        let (ended, plan_dbg, state_dbg) = {
             let st = self.store.lock().unwrap();
             let Some(g) = st.get(GameId(gid)) else {
                 return;
             };
-            // New phase/stage => restart the turn rotation (round counting depends
-            // on rotation starting at 0 when discussion/nominations begin).
-            let key = stage_key_of(g);
-            if key != self.stage_key {
-                crate::dlog!("STAGE {} -> {} (rotation reset)", self.stage_key, key);
-                self.stage_key = key;
-                self.tick_rotation = 0;
-            }
-            // Stall detection: same wait as last cycle => it's not progressing.
-            let sig = wait_signature(g);
-            let stall = if sig.is_some() && sig == self.wait_sig {
-                self.stall + 1
-            } else {
-                0
-            };
-            let plan = plan_ticks(g, self.tick_rotation, stall);
-            let (summary, hint) = game_summary_and_hint(g);
+            let plan = plan_ticks(g, self.wake.rotation(), self.wake.stall());
+            let plan_dbg: Vec<String> = plan.iter().map(target_label).collect();
             let state_dbg = format!(
-                "phase={:?} pending_host={:?} pending_night={:?} nom={:?}",
+                "phase={:?} pending_host={:?} pending_night={:?} waiting={:?} rot={} stall={}",
                 g.phase,
                 g.pending_host.as_ref().map(|p| p.kind_str()),
                 g.pending_night.as_ref().map(|w| w.seat.0),
-                g.current_nomination
-                    .as_ref()
-                    .map(|n| (n.by.0, n.target.0, n.votes.len())),
+                self.wake.waiting_labels(),
+                self.wake.rotation(),
+                self.wake.stall(),
             );
-            (
-                plan,
-                summary,
-                hint,
-                matches!(g.phase, Phase::Ended { .. }),
-                sig,
-                stall,
-                state_dbg,
-            )
+            (matches!(g.phase, Phase::Ended { .. }), plan_dbg, state_dbg)
         };
-        self.wait_sig = sig.clone();
-        self.stall = stall;
+        self.last_targets = plan_dbg.clone();
+        crate::dlog!("MAINTAIN {state_dbg} plan=[{}]", plan_dbg.join(", "));
 
-        let plan_dbg: Vec<String> = plan.iter().map(target_label).collect();
-        crate::dlog!(
-            "TICK rotation={} sig={:?} stall={} {} plan=[{}]",
-            self.tick_rotation,
-            sig,
-            stall,
-            state_dbg,
-            plan_dbg.join(", ")
-        );
-
-        // Always drain ranking events (deaths / noms) even on the end tick.
         self.results_poll();
 
         if ended {
             self.auto_tick = false;
+            self.wake.notify_all();
             self.status =
-                "Game ended — agents idle. Press q to quit or Tab to review streams.".into();
-            crate::dlog!("TICK -> game ended, auto_tick off");
+                "Game ended — agents may finish await_turn. Press q to quit or Tab to review."
+                    .into();
+            crate::dlog!("MAINTAIN -> game ended, auto_tick off");
             return;
         }
 
-        // Host-retry brake: a host-only fallback plan that repeats with no state
-        // change means the host agent runs but never makes the required call.
-        // Without a cap, event-driven auto would re-spawn it forever (token burn).
-        let host_only = plan.iter().all(|t| matches!(t, SchedTarget::Host(_)));
-        let plan_key = format!("{}|{sig:?}", plan_dbg.join(","));
-        if host_only && plan_key == self.last_plan_key {
-            self.host_plan_repeats += 1;
-        } else {
-            self.host_plan_repeats = 0;
-        }
-        self.last_plan_key = plan_key;
-        const HOST_RETRY_CAP: usize = 5;
-        if host_only && self.host_plan_repeats >= HOST_RETRY_CAP {
-            self.auto_tick = false;
-            self.status = format!(
-                "auto-advance stopped: host repeated '{}' {HOST_RETRY_CAP}x without progress (see debug log). t=resume",
-                self.last_targets.join(",")
-            );
-            crate::dlog!(
-                "TICK -> host plan repeated {HOST_RETRY_CAP}x with no progress, auto_tick disabled"
-            );
-            return;
-        }
-
-        self.last_targets = plan_dbg;
         self.last_tick = Instant::now();
         if let Some(pool) = self.agents.as_mut() {
-            match pool.tick_scheduled(&plan, &summary, &hint) {
-                Ok(spawned) => {
+            match pool.ensure_alive() {
+                Ok(report) if !report.capped.is_empty() => {
+                    self.auto_tick = false;
                     self.status = format!(
-                        "Turn tick → {}: {spawned} of {} spawned.",
-                        self.last_targets.join(", "),
-                        plan.len()
+                        "auto-respawn stopped: {} hit reconnect cap (t=resume). plan=[{}]",
+                        report.capped.join(","),
+                        plan_dbg.join(", ")
                     );
-                    crate::dlog!("TICK -> tick_scheduled spawned {spawned}/{}", plan.len());
-                    if spawned > 0 {
-                        // Consume the turn slot only when someone actually ran —
-                        // a failed spawn must not silently skip a speaker.
-                        self.tick_rotation = self.tick_rotation.wrapping_add(1);
-                    } else {
-                        // Event-driven auto would re-fire immediately while idle; if a
-                        // tick spawns nothing (broken grok / all errored), stop auto to
-                        // avoid a hot retry loop. Re-enable with `t` after fixing.
-                        self.auto_tick = false;
-                        self.status =
-                            "auto-advance stopped: tick spawned no agent (check grok / debug log). t=resume".into();
-                        crate::dlog!("TICK -> 0 spawned, auto_tick disabled");
-                    }
+                    crate::dlog!(
+                        "MAINTAIN ensure_alive capped=[{}] respawned={}",
+                        report.capped.join(","),
+                        report.respawned
+                    );
+                }
+                Ok(report) if report.respawned > 0 => {
+                    self.status = format!(
+                        "Respawned {} agent session(s) into await_turn loop.",
+                        report.respawned
+                    );
+                    crate::dlog!("MAINTAIN ensure_alive respawned {}", report.respawned);
+                }
+                Ok(_) => {
+                    let waiting = self.wake.waiting_labels();
+                    self.status = format!(
+                        "Continuous · plan=[{}] · waiting=[{}]",
+                        plan_dbg.join(", "),
+                        waiting.join(", ")
+                    );
                 }
                 Err(e) => {
                     self.auto_tick = false;
-                    self.status = format!("tick error (auto stopped): {e}");
-                    crate::dlog!("TICK -> tick_scheduled ERROR {e}, auto_tick disabled");
+                    self.status = format!("respawn error (auto stopped): {e}");
+                    crate::dlog!("MAINTAIN ensure_alive ERROR {e}");
                 }
             }
         }
@@ -854,14 +785,6 @@ impl App {
         }
     }
 
-    /// True if any agent's Grok child is currently running.
-    fn any_agent_running(&self) -> bool {
-        self.agents
-            .as_ref()
-            .map(|p| p.agents.iter().any(|a| *a.running.lock().unwrap()))
-            .unwrap_or(false)
-    }
-
     /// Labels of agents whose Grok child is currently running.
     fn running_labels(&self) -> Vec<String> {
         let Some(pool) = self.agents.as_ref() else {
@@ -888,9 +811,9 @@ impl App {
         };
         let ago = self.last_tick.elapsed().as_secs();
         let tick = if self.auto_tick {
-            "auto (on turn end)".to_string()
+            "auto-respawn".to_string()
         } else {
-            "manual (Space)".to_string()
+            "manual (Space=nudge)".to_string()
         };
         let mut spans = vec![
             Span::styled(
@@ -998,6 +921,8 @@ impl App {
             }
         }
 
+        // Unblock await_turn waiters before killing children.
+        self.wake.stop();
         // Stop agents first (kills children + removes work root with tokens).
         if let Some(mut pool) = self.agents.take() {
             pool.stop_all();
@@ -1013,124 +938,6 @@ impl App {
     }
 }
 
-/// Stable key for the current phase/stage; a change means the turn rotation restarts.
-/// Includes the living count so a mid-stage death (Slayer shot) restarts the round
-/// with the current roster instead of mis-indexing speakers/rounds.
-fn stage_key_of(g: &Game) -> String {
-    let living = g.seats.iter().filter(|s| s.alive).count();
-    match &g.phase {
-        Phase::Lobby => "lobby".into(),
-        Phase::FirstNight { .. } => "night1".into(),
-        Phase::Night { night, .. } => format!("night{night}"),
-        Phase::Day { day, stage } => format!(
-            "day{day}-{}-{living}",
-            match stage {
-                crate::game::DayStage::Discussion => "disc",
-                crate::game::DayStage::Nominations => "noms",
-            }
-        ),
-        Phase::Ended { .. } => "ended".into(),
-    }
-}
-
-/// Readable one-line rendering of a public event (for agent prompts, not Debug).
-fn fmt_public_event(e: &crate::comms::PublicEvent) -> String {
-    use crate::comms::PublicEvent::*;
-    // Each event MUST be a single line: the snapshot lists one event per line, so a
-    // message with embedded newlines would blur where one speaker ends and the next
-    // begins — which makes agents think a message was "cut off" or reorder events.
-    let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-    match e {
-        Chat { seat, text, .. } => format!("P{}: {}", seat.0, one_line(text)),
-        StorytellerAnnounce { text } => format!("Storyteller: {}", one_line(text)),
-        Nominated { by, target } => format!("P{} nominated P{}", by.0, target.0),
-        VoteCast {
-            seat,
-            nominee,
-            support,
-        } => format!(
-            "P{} voted {} on P{}",
-            seat.0,
-            if *support { "YES" } else { "no" },
-            nominee.0
-        ),
-        Executed { seat } => format!("P{} was executed", seat.0),
-        NoExecution => "No one was executed today".to_string(),
-        DiedInNight { seats } => {
-            if seats.is_empty() {
-                "No one died in the night".to_string()
-            } else {
-                format!(
-                    "Died in the night: {}",
-                    seats
-                        .iter()
-                        .map(|s| format!("P{}", s.0))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            }
-        }
-        PlayerDied { seat } => format!("P{} died", seat.0),
-        SlayerMiss { slayer, target } => {
-            format!(
-                "P{} tried to slay P{} — nothing happened",
-                slayer.0, target.0
-            )
-        }
-        PhaseChanged { summary } => summary.clone(),
-        GameEnded { winner } => format!("Game over — {winner:?} wins"),
-    }
-}
-
-/// Public snapshot + host hint string for tick prompts, computed from a locked game.
-/// Free function so the scheduler can build it under the store lock without a second lock.
-fn game_summary_and_hint(g: &Game) -> (String, String) {
-    let phase = format!("{:?}", g.phase);
-    let living: Vec<_> = g
-        .seats
-        .iter()
-        .filter(|s| s.alive)
-        .map(|s| format!("P{}", s.id.0))
-        .collect();
-    let dead: Vec<_> = g
-        .seats
-        .iter()
-        .filter(|s| !s.alive)
-        .map(|s| format!("P{}", s.id.0))
-        .collect();
-    let recent: Vec<_> = g
-        .public_log
-        .since(0)
-        .into_iter()
-        .rev()
-        .take(16)
-        .map(|(_, e)| fmt_public_event(e))
-        .collect();
-    let recent: Vec<_> = recent.into_iter().rev().collect();
-    let recent_str = if recent.is_empty() {
-        "(nothing public has happened yet)".to_string()
-    } else {
-        recent.join("\n")
-    };
-    let summary = format!(
-        "phase: {phase}\nliving: {}\ndead: {}\nrecent public events:\n{}",
-        living.join(", "),
-        if dead.is_empty() {
-            "none".to_string()
-        } else {
-            dead.join(", ")
-        },
-        recent_str
-    );
-    let hint = format!(
-        "pending_night={} pending_host={:?}",
-        g.pending_night.is_some(),
-        g.pending_host.as_ref().map(|p| p.kind_str())
-    );
-    (summary, hint)
-}
-
-/// Label a scheduler target for the status bar.
 fn target_label(t: &SchedTarget) -> String {
     match t {
         SchedTarget::Host(_) => "Host".into(),
@@ -1453,14 +1260,14 @@ pub fn run_tui() -> io::Result<()> {
         if app.should_quit {
             break Ok(());
         }
-        // Event-driven auto-advance: tick the next turn as soon as every agent is
-        // idle (a running agent is never skipped; there is no fixed timer).
-        if app.auto_tick && app.agents.is_some() && !app.any_agent_running() {
-            app.do_tick();
-        } else if app.agents.is_some() && app.game_id.is_some() && !app.any_agent_running() {
-            // Between turns (manual mode / idle), still drain deaths & noms into
-            // the ranking log without spawning agents.
-            app.results_poll();
+        // Continuous sessions: agents pull wakes via await_turn. Every ~2s,
+        // respawn any process that exited and drain ranking events.
+        if app.agents.is_some() && app.game_id.is_some() {
+            if app.auto_tick && app.last_tick.elapsed() >= Duration::from_secs(2) {
+                app.maintain_sessions();
+            } else {
+                app.results_poll();
+            }
         }
         // Drain the whole queue so scroll floods don't lag behind real keys.
         while event::poll(Duration::from_millis(0))? {
