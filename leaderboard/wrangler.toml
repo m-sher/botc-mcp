@@ -1,0 +1,17 @@
+name = "botc-leaderboard"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# Static page (public/index.html). The Worker handles /api/* and falls back to
+# env.ASSETS for everything else.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+# Binding name LEADERBOARD matches worker.js (env.LEADERBOARD).
+# Namespace title on Cloudflare is BOTC_LEADERBOARD (separate from QTris).
+[[kv_namespaces]]
+binding = "LEADERBOARD"
+id = "126dd17c17a741d285c496ce1ca37d77"
+
+# PUBLISH_TOKEN is a secret: `npx wrangler secret put PUBLISH_TOKEN`

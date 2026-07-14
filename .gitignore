@@ -6,3 +6,13 @@ Cargo.lock
 *.swp
 .DS_Store
 botc-results.jsonl
+
+# Leaderboard local state / secrets
+.env
+leaderboard/ratings.json
+leaderboard/ratings.json.tmp
+leaderboard/.wrangler/
+leaderboard/.dev.vars
+logs/
+leaderboard/aliases.json
+leaderboard/aliases.json.tmp
