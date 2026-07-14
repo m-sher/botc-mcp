@@ -340,9 +340,16 @@ fn invoke_await_turn(
         (wa, name)
     };
 
-    // Bind coordinator to this game once (TUI also calls set_game_id at launch).
-    if wake.game_id() != Some(game_id) {
-        wake.set_game_id(game_id);
+    // Bind only when unbound. A mismatched id against an already-bound game must
+    // not wipe rotation/outstanding for the live table (stale/hallucinated game_id).
+    match wake.game_id() {
+        None => wake.set_game_id(game_id),
+        Some(bound) if bound == game_id => {}
+        Some(bound) => {
+            return Err(format!(
+                "await_turn game_id={game_id} does not match bound game_id={bound}"
+            ));
+        }
     }
 
     let structured = wake.await_turn(

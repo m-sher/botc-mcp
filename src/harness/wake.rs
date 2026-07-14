@@ -215,7 +215,7 @@ impl WakeCoordinator {
             }
 
             match try_deliver(store, &mut guard, actor, display_name) {
-                Deliver::GameOver(v) | Deliver::Wake(v) => break v,
+                Deliver::GameOver(v) | Deliver::Wake(v) | Deliver::Error(v) => break v,
                 Deliver::Idle => {
                     let now = Instant::now();
                     if now >= deadline {
@@ -224,7 +224,7 @@ impl WakeCoordinator {
                             "status": "idle",
                             "next_since_seq": since,
                             "retry": true,
-                            "hint": "No wake yet (server poll budget). Call await_turn again immediately with the same since_seq. If the tool times out instead, also re-call await_turn — wakes are durable.",
+                            "hint": "No wake yet (server poll budget). Call await_turn again immediately. If the tool times out instead, also re-call await_turn — wakes are durable.",
                         });
                     }
                     let remaining = deadline.saturating_duration_since(now);
@@ -245,6 +245,8 @@ enum Deliver {
     GameOver(Value),
     Wake(Value),
     Idle,
+    /// Permanent failure — do not retry in a hot loop.
+    Error(Value),
 }
 
 fn try_deliver(
@@ -265,10 +267,11 @@ fn try_deliver(
         Ok(s) => s,
         Err(std::sync::TryLockError::WouldBlock) => return Deliver::Idle,
         Err(std::sync::TryLockError::Poisoned(_)) => {
-            return Deliver::GameOver(json!({
+            // Permanent: poisoned mutex stays poisoned — do not invite a hot retry loop.
+            return Deliver::Error(json!({
                 "status": "error",
-                "retry": true,
-                "hint": "Store lock poisoned; call await_turn again.",
+                "retry": false,
+                "hint": "Store lock poisoned; harness must restart.",
             }));
         }
     };
@@ -316,11 +319,12 @@ fn try_deliver(
     }
 
     let plan = plan_ticks(game, guard.rotation, guard.stall);
-    let (summary, host_hint) = public_summary(game);
 
     // Redeliver outstanding if still planned for this actor.
     if let Some(env) = guard.outstanding.get(&actor).cloned() {
         if plan_still_contains(&plan, &env) {
+            // Summary only when delivering a wake (idle polls skip O(log) string build).
+            let (summary, _) = public_summary(game);
             return Deliver::Wake(wake_json(&env, &summary));
         }
         guard.outstanding.remove(&actor);
@@ -332,6 +336,7 @@ fn try_deliver(
         .find(|t| target_matches_actor(t, actor))
         .cloned()
     {
+        let (summary, host_hint) = public_summary(game);
         let plan_key = plan_key_of(&target);
         let seq = guard.next_seq;
         guard.next_seq = guard.next_seq.saturating_add(1);
@@ -470,12 +475,16 @@ fn tool_completes_wake(tool: &str, target: &SchedTarget) -> bool {
     }
 }
 
+/// Stage fingerprint for rotation reset. Day keys include **living count** so a
+/// mid-discussion death (e.g. Slayer) restarts the round against the new roster
+/// instead of mis-indexing `rotation / living.len()` in `plan_ticks`.
 fn stage_key_of(game: &Game) -> String {
+    let living = game.seats.iter().filter(|s| s.alive).count();
     match &game.phase {
         Phase::Lobby => "lobby".into(),
         Phase::FirstNight { .. } => "n1".into(),
         Phase::Night { night, .. } => format!("n{night}"),
-        Phase::Day { day, stage } => format!("d{day}-{stage:?}"),
+        Phase::Day { day, stage } => format!("d{day}-{stage:?}-{living}"),
         Phase::Ended { .. } => "ended".into(),
     }
 }
@@ -738,5 +747,136 @@ mod tests {
             // No host work in this seed/state — acceptable; still a valid soft idle.
             assert_eq!(status, "idle", "{v}");
         }
+    }
+
+    #[test]
+    fn stage_key_includes_living_count_on_day() {
+        let (store, gid) = started_store();
+        // Force Day Discussion with known living roster.
+        {
+            let mut st = store.lock().unwrap();
+            let g = st.get_mut(GameId(gid)).unwrap();
+            g.phase = Phase::Day {
+                day: 1,
+                stage: crate::game::DayStage::Discussion,
+            };
+            g.pending_night = None;
+            g.pending_host = None;
+            for s in &mut g.seats {
+                s.alive = true;
+            }
+            let k5 = stage_key_of(g);
+            assert!(
+                k5.ends_with("-5") || k5.contains("-5"),
+                "living=5 should appear in stage key: {k5}"
+            );
+            g.seats[2].alive = false;
+            let k4 = stage_key_of(g);
+            assert_ne!(k5, k4, "death must change stage key so rotation resets");
+            assert!(
+                k4.contains("-4"),
+                "living=4 should appear in stage key: {k4}"
+            );
+        }
+    }
+
+    #[test]
+    fn mid_discussion_death_resets_rotation() {
+        let (store, gid) = started_store();
+        let coord = WakeCoordinator::new();
+        coord.set_game_id(gid);
+        {
+            let mut st = store.lock().unwrap();
+            let g = st.get_mut(GameId(gid)).unwrap();
+            g.phase = Phase::Day {
+                day: 1,
+                stage: crate::game::DayStage::Discussion,
+            };
+            g.pending_night = None;
+            g.pending_host = None;
+            for s in &mut g.seats {
+                s.alive = true;
+            }
+        }
+        // Deliver a discuss wake so stage_key is stamped with living=5.
+        let v = coord.await_turn(
+            &store,
+            WakeActor::Player(SeatId(0)),
+            "P0",
+            Duration::from_secs(1),
+        );
+        assert_eq!(v["status"], "wake", "{v}");
+        assert_eq!(v["kind"], "discuss");
+        // Simulate several speakers having already gone (high rotation).
+        {
+            let mut g = coord.inner.lock().unwrap();
+            g.rotation = 7;
+        }
+        // Mid-day death shrinks living 5→4; next deliver must reset rotation.
+        {
+            let mut st = store.lock().unwrap();
+            st.get_mut(GameId(gid)).unwrap().seats[1].alive = false;
+        }
+        let _ = coord.await_turn(
+            &store,
+            WakeActor::Player(SeatId(0)),
+            "P0",
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            coord.rotation(),
+            0,
+            "rotation must reset when living count changes mid-discussion"
+        );
+    }
+
+    /// Regression: await_turn must not block on the store while holding the
+    /// coordinator (inverted order vs note_tool_success / TUI maintain).
+    #[test]
+    fn try_lock_avoids_deadlock_under_store_hold() {
+        let (store, gid) = started_store();
+        let coord = WakeCoordinator::new();
+        coord.set_game_id(gid);
+
+        let store_hold = Arc::clone(&store);
+        let blocker = thread::spawn(move || {
+            let _guard = store_hold.lock().unwrap();
+            thread::sleep(Duration::from_millis(400));
+        });
+
+        // Give the blocker the store first.
+        thread::sleep(Duration::from_millis(20));
+
+        let coord2 = coord.clone();
+        let store2 = Arc::clone(&store);
+        let waiter = thread::spawn(move || {
+            // Must return (idle) without hanging while store is held.
+            coord2.await_turn(
+                &store2,
+                WakeActor::Player(SeatId(0)),
+                "P0",
+                Duration::from_millis(150),
+            )
+        });
+
+        // Concurrent note_tool while store is held by blocker — coord-only path.
+        thread::sleep(Duration::from_millis(30));
+        coord.note_tool_success(WakeActor::Player(SeatId(0)), "say");
+        // TUI-style: hold store then read coordinator (would deadlock if await blocked).
+        {
+            let _st = store.lock().unwrap();
+            let _ = coord.rotation();
+            let _ = coord.waiting_labels();
+        }
+
+        let v = waiter
+            .join()
+            .expect("await_turn thread must not hang/panic");
+        let status = v["status"].as_str().unwrap();
+        assert!(
+            status == "idle" || status == "wake",
+            "expected soft result under store contention: {v}"
+        );
+        blocker.join().unwrap();
     }
 }

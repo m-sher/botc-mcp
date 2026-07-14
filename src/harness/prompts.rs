@@ -29,13 +29,13 @@ You stay in **this process for the whole game**. Do **not** end by chatting with
 waiting. The only correct idle is the MCP tool **`await_turn`**.
 
 Loop for the entire game:
-1. Call `await_turn` with `game_id={game_id}` (optional `since_seq` from the last result).
+1. Call `await_turn` with `game_id={game_id}`.
 2. If `status` is **`wake`**: read `prompt` (why you were woken + legal actions). Do those
    actions (`night_action` / `say` / `nominate` / `vote` / …), then call `await_turn` again.
 3. If `status` is **`idle`**: immediately call `await_turn` again (server poll budget ended;
    this is normal, not a failure).
-4. If `await_turn` **errors or times out**: call `await_turn` again with the same `since_seq`.
-   Wakes are durable — you cannot miss a turn by timing out; the same `wake_id` may redeliver.
+4. If `await_turn` **errors or times out**: call `await_turn` again. Wakes are durable — you
+   cannot miss a turn by timing out; the same `wake_id` may redeliver until you act.
 5. If `status` is **`game_over`**: stop.
 
 Never busy-poll with get_public_state instead of `await_turn`. Never invent other seats' private info.

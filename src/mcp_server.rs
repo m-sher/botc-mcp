@@ -224,8 +224,7 @@ fn tool_schema(name: &str) -> Value {
             "properties": {
                 "game_id": game_id,
                 "token": token,
-                "since_seq": { "type": "integer", "description": "Last processed wake seq (optional; redelivery uses durable mailbox)" },
-                "budget_secs": { "type": "integer", "description": "Server long-poll budget seconds (capped; default 300). On idle/timeout, call await_turn again." },
+                "budget_secs": { "type": "integer", "description": "Server long-poll budget seconds (capped; default 300). On idle/timeout, call await_turn again. Redelivery uses the durable mailbox (same wake_id), not a client cursor." },
             },
             "required": ["game_id"],
         }),
@@ -432,8 +431,8 @@ fn invoke_tool(store: &SharedStore, name: &str, args: Value) -> Result<Value, Rp
         // wake coordinator, so return a soft error the model can understand.
         "await_turn" => Ok(json!({
             "status": "error",
-            "retry": true,
-            "hint": "await_turn long-poll requires the multi-agent harness (botc-tui). Call again if you see this from a harness proxy that is miswired.",
+            "retry": false,
+            "hint": "await_turn long-poll is only supported under botc-tui (harness socket). Standalone botc-mcp has no wake coordinator.",
         })),
         other => Err(RpcError {
             code: -32601,
