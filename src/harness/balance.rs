@@ -8,8 +8,9 @@
 //!   2. **role type** (Townsfolk / Outsider / Minion / Demon) — tie-breaks (1),
 //!   3. **specific role** (Empath, Poisoner, …) — tie-breaks (2).
 //!
-//! Only models that have **≥1 recorded game** drive the balance (they are the
-//! only ones with an imbalance to correct). Seats whose model has no history are
+//! Only models that have **≥1 completed game** drive the balance (the same games
+//! the leaderboard rates; aborted games carry no eval signal and are not counted).
+//! They are the only ones with an imbalance to correct. Seats whose model is new are
 //! neutral: known-model seats are matched first, and new-model seats fill the
 //! leftover characters at random — a new model simply builds its own record from
 //! the games it plays rather than distorting everyone else's.
@@ -59,9 +60,12 @@ fn keys(c: Character) -> (String, String, String) {
 }
 
 /// Tally per-model history from a `botc-results.jsonl` file. Counts each seat of
-/// every `game_start` event (one per launched game) by team / role type / role.
-/// Missing file or unreadable lines yield an empty map — the caller then falls
-/// back to a random assignment. Only models that actually appear are inserted.
+/// every `game_end` event (one per *completed* game) by team / role type / role.
+/// These are the same games the leaderboard rates: an aborted game (`game_abort`)
+/// produces no eval signal, so counting it would balance against games that never
+/// mattered — hence `game_start`/`game_abort` are ignored. Missing file or
+/// unreadable lines yield an empty map — the caller then falls back to a random
+/// assignment. Only models that actually appear are inserted.
 pub fn read_model_stats(path: &Path) -> HashMap<String, ModelStats> {
     let mut out: HashMap<String, ModelStats> = HashMap::new();
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -75,7 +79,7 @@ pub fn read_model_stats(path: &Path) -> HashMap<String, ModelStats> {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if v.get("event").and_then(Value::as_str) != Some("game_start") {
+        if v.get("event").and_then(Value::as_str) != Some("game_end") {
             continue;
         }
         let Some(seats) = v.get("seats").and_then(Value::as_array) else {
@@ -382,5 +386,28 @@ mod tests {
         assert_eq!(a.len(), 5);
         let evil = (0..5).filter(|&s| team_of(&a, s) == "Evil").count();
         assert_eq!(evil, 2, "composition preserved even with no history");
+    }
+
+    #[test]
+    fn read_model_stats_counts_only_completed_games() {
+        // Only `game_end` seats count. A `game_abort` or `game_start` for the same
+        // model must be ignored — those games never reached the leaderboard, so
+        // they carry no eval signal to balance against.
+        let path = std::env::temp_dir().join("botc_balance_read_model_stats_test.jsonl");
+        let lines = [
+            r#"{"event":"game_end","seats":[{"model":"grok","team":"Good","character_type":"Townsfolk","true_character":"Empath"}]}"#,
+            r#"{"event":"game_abort","seats":[{"model":"grok","team":"Evil","character_type":"Demon","true_character":"Imp"}]}"#,
+            r#"{"event":"game_start","seats":[{"model":"grok","team":"Evil","character_type":"Minion","true_character":"Poisoner"}]}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let stats = read_model_stats(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let g = stats.get("grok").expect("grok has one completed game");
+        assert_eq!(g.games, 1, "only the game_end seat counts");
+        assert_eq!(g.team_n("Good"), 1);
+        assert_eq!(g.team_n("Evil"), 0, "aborted/started games must not count");
+        assert_eq!(g.type_n("Townsfolk"), 1);
+        assert_eq!(g.role_n("Empath"), 1);
     }
 }
