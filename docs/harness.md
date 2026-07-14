@@ -113,11 +113,9 @@ full thinking; again collapses. Expansion is **per agent**; the title shows `·t
 
 ## Turn order (scheduling)
 
-Trouble Brewing is strictly **sequential**. `plan_ticks` (`src/harness/scheduler.rs`) still
-picks **exactly one** actor (plus, rarely, a host fallback). That plan is consumed by
-**`await_turn`** long-polls rather than by spawning a new headless process per turn: each
-agent stays blocked in `await_turn` until it is their turn, then receives a wake payload
-with why they were woken and which actions are legal.
+Trouble Brewing is strictly **sequential**, so each tick wakes **exactly one agent** (plus,
+rarely, a host fallback) with a targeted prompt that says why it was woken, which actions are
+legal, and what ends the turn (`src/harness/scheduler.rs`, `plan_ticks`).
 
 The host is **minimal**: it is woken only for genuine Storyteller decisions and stall
 fallbacks. The engine self-drives the rest — a player's `nominate` auto-opens the vote,
@@ -213,34 +211,15 @@ On quit (`q`) or process exit, the harness **kills** all Grok children and **rem
   self-consistent — `search_replace` (edit) requires `read_file`, so both are removed together or
   grok refuses to start.
 
-## Continuous sessions (`await_turn`)
-
-Agents are **long-lived** headless processes (one kickoff, then `--resume` only to recover crashes). After orientation they loop on MCP **`await_turn`**:
-
-| `status` | Meaning | Agent should |
-| --- | --- | --- |
-| `wake` | It is this seat/host's turn; `prompt` has full instructions | Act, then `await_turn` again |
-| `idle` | Server long-poll budget ended (soft; not an error) | Call `await_turn` immediately |
-| tool timeout / error | Client cancelled the call | Call `await_turn` again (same seq) |
-| `game_over` | Engine finished | Stop |
-
-Wakes are **durable** until a resolving tool succeeds (`night_action`, `say`, `vote`, host tools, …). A timeout after the server tried to deliver still redelivers the same `wake_id`.
-
-Timeouts (defaults):
-
-- Server poll budget: **300s** (`AWAIT_SERVER_BUDGET_SECS`)
-- Grok client `tool_timeouts.await_turn`: **3600s** (written into per-agent MCP config)
-- Socket read timeout for `await_turn`: budget + 60s (other tools stay at 120s)
-
-Turn routing still uses [`plan_ticks`](../src/harness/scheduler.rs); the coordinator lives in [`wake.rs`](../src/harness/wake.rs). Stall escalation uses wall-clock bumps while agents long-poll. Space in the TUI **nudges** waiters / respawns; `t` toggles auto-respawn of dead processes.
-
 ## Limitations (v1)
 
-- Headless processes still **exit** if the model stops calling tools without `await_turn`; the TUI **respawns** with a reconnect prompt when auto-respawn is on.
+- Agents are driven by **event-driven headless ticks** (`grok --prompt-file … --resume`), not a single eternal ACP connection: the next turn is ticked when all agents go idle, and a running agent is never skipped (a hung agent will hold the game until it exits — watch the debug log).
 - Auto-approve uses a **single** flag (`--yolo`). Do not also pass `--always-approve` (same clap option → CLI error).
+- The next turn is only ticked once **all** agents are idle, so a per-seat tick is never spawned on top of a still-running one.
 - First-run success is required before `--resume` is used; a failed kickoff retries with a fresh `--session-id`.
 - Host-first Storyteller pauses require the **host** Grok agent (or skip defaults via host tools) to resolve night info.
-- Cost: N+1 concurrent long-lived sessions (each mostly blocked in `await_turn`).
+- Cost: N+1 model sessions, but the turn-router ticks only the 1–2 agents whose turn it is (plus a fan-out during an open vote), not all N+1 each cycle.
+- Ticks are **turn-routed** (see *Turn order*): one agent per tick in every phase, so there are no concurrent day actions to conflict.
 - Progression is player/engine-driven; the host is only needed for `pending_host` decisions and stall fallbacks. Dead players don't get speaking turns (they still vote with their ghost vote); day length is bounded by `DISCUSSION_ROUNDS`.
 
 ## Tests
