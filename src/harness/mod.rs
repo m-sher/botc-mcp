@@ -9,6 +9,7 @@
 
 pub mod action_log;
 pub mod agents;
+pub mod balance;
 pub mod debug_log;
 pub mod prompts;
 pub mod proxy_acl;

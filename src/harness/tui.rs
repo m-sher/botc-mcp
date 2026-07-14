@@ -200,9 +200,10 @@ impl App {
 
     /// Draw a fresh, valid role assignment for the current player count and stash it
     /// in `setup_roles`. Uses a throwaway game so the same engine bag logic that the
-    /// real game will use produces the preview; `launch()` then replays these exact
-    /// assignments. Leaves `status` untouched on success (keeps the boot note); only
-    /// reports on failure.
+    /// real game will use produces the composition; the bag is then reassigned across
+    /// seats so each model keeps a balanced eval record (team → role type → role; see
+    /// [`crate::harness::balance`]). `launch()` replays these exact assignments.
+    /// Leaves `status` untouched on success (keeps the boot note); only reports failure.
     fn reroll_roles(&mut self) {
         let names: Vec<String> = (0..self.player_count).map(|i| format!("P{i}")).collect();
         let created = match Game::create(names, rand::random()) {
@@ -219,15 +220,36 @@ impl App {
             self.status = format!("role preview failed: {e}");
             return;
         }
-        self.setup_roles = g
+        // The engine dealt a valid composition; capture it as a bag (characters plus
+        // any Drunk face) and the model sitting at each seat, then reassign the bag so
+        // models play a balanced mix of teams/roles over time. Permuting the bag keeps
+        // the composition intact, so the result is always a valid fixed assignment.
+        let seats: Vec<SeatId> = g.seats.iter().map(|s| s.id).collect();
+        let bag: Vec<(Character, Option<Character>)> = g
             .seats
             .iter()
-            .map(|s| RoleAssignment {
-                seat: s.id,
-                true_character: s.true_character.expect("started game assigns every seat"),
-                believed_character: s.believed_character,
+            .map(|s| {
+                (
+                    s.true_character.expect("started game assigns every seat"),
+                    s.believed_character,
+                )
             })
             .collect();
+        // Seat model lookup: `seat_models[0]` is the Host, players are `1..=N`.
+        let models: Vec<&str> = seats
+            .iter()
+            .map(|id| {
+                self.seat_models
+                    .get(id.0 as usize + 1)
+                    .map(String::as_str)
+                    .unwrap_or("")
+            })
+            .collect();
+        let stats =
+            crate::harness::balance::read_model_stats(&crate::harness::results_log::log_path());
+        let mut rng = rand::thread_rng();
+        self.setup_roles =
+            crate::harness::balance::balanced_assignment(&seats, &models, &bag, &stats, &mut rng);
     }
 
     fn selected_thinking_expanded(&self) -> bool {
