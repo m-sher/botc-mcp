@@ -49,12 +49,21 @@ enum FeedFilter {
     GameOnly,
 }
 
+/// One setup-screen session pick: which [`Backend`] runs the seat and on which model.
+/// A single struct (not parallel vectors) so backend and model can never desync, and
+/// the model is always kept within its backend's list.
+#[derive(Debug, Clone)]
+struct SeatChoice {
+    backend: Backend,
+    model: String,
+}
+
 struct App {
     focus: Focus,
     player_count: usize,
-    /// Per-session model picks: index 0 = Host, 1..=N = players P0..P{N-1}.
+    /// Per-session backend+model picks: index 0 = Host, 1..=N = players P0..P{N-1}.
     /// Kept in lockstep with `player_count` (+1 for the host row).
-    seat_models: Vec<String>,
+    seat_choices: Vec<SeatChoice>,
     /// Previewed role for each player seat (index i = P{i}), shown on the setup
     /// screen so models can be picked per role. Regenerated on count change and on
     /// reroll; passed to `start_game` as fixed assignments so the launched game
@@ -158,8 +167,14 @@ impl App {
         let mut app = Self {
             focus: Focus::Setup,
             player_count,
-            // One pick per session (host + players), all starting on the CLI default.
-            seat_models: vec![cfg.model.clone(); player_count + 1],
+            // One pick per session (host + players), all starting grok on the CLI default.
+            seat_choices: vec![
+                SeatChoice {
+                    backend: Backend::Grok,
+                    model: cfg.model.clone(),
+                };
+                player_count + 1
+            ],
             setup_roles: Vec::new(),
             setup_row: 0,
             selected_agent: 0,
@@ -238,13 +253,13 @@ impl App {
                 )
             })
             .collect();
-        // Seat model lookup: `seat_models[0]` is the Host, players are `1..=N`.
+        // Seat model lookup: `seat_choices[0]` is the Host, players are `1..=N`.
         let models: Vec<&str> = seats
             .iter()
             .map(|id| {
-                self.seat_models
+                self.seat_choices
                     .get(id.0 as usize + 1)
-                    .map(String::as_str)
+                    .map(|c| c.model.as_str())
                     .unwrap_or("")
             })
             .collect();
@@ -338,8 +353,13 @@ impl App {
         if self.setup_row == 0 {
             let pc = self.player_count as i32 + delta;
             self.player_count = pc.clamp(5, 15) as usize;
-            self.seat_models
-                .resize(self.player_count + 1, self.cfg.model.clone());
+            self.seat_choices.resize(
+                self.player_count + 1,
+                SeatChoice {
+                    backend: Backend::Grok,
+                    model: self.cfg.model.clone(),
+                },
+            );
             // Roles are count-specific; redraw the assignment so the picker stays valid.
             self.reroll_roles();
             self.status = format!(
@@ -349,14 +369,24 @@ impl App {
             );
         } else {
             let idx = self.setup_row - 1;
-            let cur = self.seat_models[idx].clone();
-            self.seat_models[idx] = cycle_in_list(&cur, &self.cfg.available_models, delta);
+            let backend = self.seat_choices[idx].backend;
+            let cur = self.seat_choices[idx].model.clone();
+            // Cycle within the seat's *own* backend's model list.
+            let next = {
+                let list = self.cfg.models_for(backend);
+                cycle_in_list(&cur, list, delta)
+            };
+            self.seat_choices[idx].model = next;
             let who = if idx == 0 {
                 "Host".to_string()
             } else {
                 format!("P{}", idx - 1)
             };
-            self.status = format!("{who} model: {}  (a = apply to all)", self.seat_models[idx]);
+            self.status = format!(
+                "{who}: [{}] {}  (b = backend · a = apply to all)",
+                backend.as_str(),
+                self.seat_choices[idx].model
+            );
         }
     }
 
@@ -389,14 +419,35 @@ impl App {
                     self.status = "rerolled roles".into();
                 }
             }
-            // Apply the focused row's model to every session.
+            // Cycle the focused seat's backend (grok ↔ claude); snap model to that
+            // backend's default so the pick is always valid.
+            KeyCode::Char('b') | KeyCode::Char('B') if self.focus == Focus::Setup => {
+                if self.setup_row >= 1 {
+                    let idx = self.setup_row - 1;
+                    let nb = self.seat_choices[idx].backend.cycle(1);
+                    let model = self.cfg.default_model(nb);
+                    self.seat_choices[idx].backend = nb;
+                    self.seat_choices[idx].model = model;
+                    let who = if idx == 0 {
+                        "Host".to_string()
+                    } else {
+                        format!("P{}", idx - 1)
+                    };
+                    self.status = format!(
+                        "{who} backend: [{}] {}",
+                        nb.as_str(),
+                        self.seat_choices[idx].model
+                    );
+                }
+            }
+            // Apply the focused row's backend + model to every session.
             KeyCode::Char('a') if self.focus == Focus::Setup => {
                 if self.setup_row >= 1 {
-                    let m = self.seat_models[self.setup_row - 1].clone();
-                    for slot in self.seat_models.iter_mut() {
-                        *slot = m.clone();
+                    let src = self.seat_choices[self.setup_row - 1].clone();
+                    for slot in self.seat_choices.iter_mut() {
+                        *slot = src.clone();
                     }
-                    self.status = format!("model for ALL sessions: {m}");
+                    self.status = format!("ALL sessions: [{}] {}", src.backend.as_str(), src.model);
                 }
             }
             KeyCode::Enter if self.focus == Focus::Setup => self.launch(),
@@ -484,6 +535,40 @@ impl App {
                 p.display()
             );
             return;
+        }
+        // #69: a claude seat needs the claude binary + a model from the claude list.
+        if self
+            .seat_choices
+            .iter()
+            .any(|c| c.backend == Backend::Claude)
+        {
+            let bin = &self.cfg.claude_bin;
+            if !(bin.is_absolute() && bin.exists()) {
+                self.status = format!(
+                    "claude backend selected but `claude` was not found ({}). Install Claude Code or switch the seat to grok (b).",
+                    bin.display()
+                );
+                return;
+            }
+            if let Some((slot, c)) = self.seat_choices.iter().enumerate().find(|(_, c)| {
+                c.backend == Backend::Claude
+                    && !self
+                        .cfg
+                        .models_for(Backend::Claude)
+                        .iter()
+                        .any(|m| m == &c.model)
+            }) {
+                let who = if slot == 0 {
+                    "Host".to_string()
+                } else {
+                    format!("P{}", slot - 1)
+                };
+                self.status = format!(
+                    "{who}: claude model '{}' not in the claude list — re-pick with ←/→.",
+                    c.model
+                );
+                return;
+            }
         }
         // Refresh resolved path so workdir config gets an absolute sibling if possible.
         self.cfg.agent_mcp_bin = find_agent_mcp_bin();
@@ -580,24 +665,28 @@ impl App {
             created.player_tokens.len()
         );
 
-        // Per-session models from the setup picker (index 0 = host, 1+i = P{i}).
-        // Fall back to the default model if the picks are out of sync.
-        let model_for = |slot: usize| -> String {
-            self.seat_models
+        // Per-session backend+model from the setup picker (index 0 = host, 1+i = P{i}).
+        // Fall back to the default grok model if the picks are out of sync.
+        let choice_for = |slot: usize| -> SeatChoice {
+            self.seat_choices
                 .get(slot)
                 .cloned()
-                .unwrap_or_else(|| self.cfg.model.clone())
+                .unwrap_or_else(|| SeatChoice {
+                    backend: Backend::Grok,
+                    model: self.cfg.model.clone(),
+                })
         };
+        let host_choice = choice_for(0);
         let mut configs = vec![AgentConfig {
             role: AgentRole::Host,
             display_name: "Storyteller".into(),
             token: created.host_token.as_str().to_string(),
             game_id,
-            model: model_for(0),
-            // Per-seat backend picker lands in Phase 4; every seat is grok until then.
-            backend: Backend::Grok,
+            model: host_choice.model,
+            backend: host_choice.backend,
         }];
         for (i, tok) in created.player_tokens.iter().enumerate() {
+            let c = choice_for(1 + i);
             configs.push(AgentConfig {
                 role: AgentRole::Player {
                     seat: SeatId(i as u8),
@@ -605,8 +694,8 @@ impl App {
                 display_name: self.player_names[i].clone(),
                 token: tok.as_str().to_string(),
                 game_id,
-                model: model_for(1 + i),
-                backend: Backend::Grok,
+                model: c.model,
+                backend: c.backend,
             });
         }
 
@@ -1610,7 +1699,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     let count_mark = if app.setup_row == 0 { "▶ " } else { "  " };
     lines.push(Line::from(Span::styled(
         format!(
-            "{count_mark}Players: {}    →  {} headless Grok sessions (host + players)",
+            "{count_mark}Players: {}    →  {} headless agent sessions (host + players)",
             app.player_count,
             app.player_count + 1
         ),
@@ -1624,7 +1713,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
 
     // One row per session: Host, P0, P1, … each showing seat · role · model.
     lines.push(Line::from(Span::styled(
-        "  Seat · role · model   (←/→ change model · a = apply to all · r = reroll roles)",
+        "  Seat · role · [backend] model   (←/→ model · b backend · a apply-all · r reroll)",
         dim,
     )));
     for slot in 0..=app.player_count {
@@ -1634,12 +1723,13 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
         } else {
             format!("P{}", slot - 1)
         };
-        let model = app
-            .seat_models
+        let (backend, model) = app
+            .seat_choices
             .get(slot)
-            .cloned()
-            .unwrap_or_else(|| app.cfg.model.clone());
-        let known = app.cfg.available_models.iter().any(|m| m == &model);
+            .map(|c| (c.backend, c.model.clone()))
+            .unwrap_or((Backend::Grok, app.cfg.model.clone()));
+        let list = app.cfg.models_for(backend);
+        let known = list.iter().any(|m| m == &model);
         let mark = if app.setup_row == row { "▶ " } else { "  " };
         let mut spans = vec![Span::styled(
             format!("{mark}{who:<5} "),
@@ -1658,6 +1748,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
             ("—".to_string(), dim)
         };
         spans.push(Span::styled(format!("{role_text:<26}"), role_st));
+        spans.push(Span::styled(format!("[{}] ", backend.as_str()), dim));
         spans.push(Span::styled(
             model.clone(),
             if app.setup_row == row {
@@ -1666,20 +1757,32 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(actor_color(slot == 0, slot.checked_sub(1).map(|s| s as u8)))
             },
         ));
-        if !known && !app.cfg.available_models.is_empty() {
-            spans.push(Span::styled("  (not in `grok models`)", dim));
+        if !known && !list.is_empty() {
+            spans.push(Span::styled(
+                format!("  (not in {} models)", backend.as_str()),
+                dim,
+            ));
         }
         lines.push(Line::from(spans));
     }
 
     lines.push(Line::raw(""));
+    // Show the model list for the focused seat's backend (grok vs claude).
+    let focus_backend = app
+        .setup_row
+        .checked_sub(1)
+        .and_then(|i| app.seat_choices.get(i))
+        .map(|c| c.backend)
+        .unwrap_or(Backend::Grok);
+    let focus_models = app.cfg.models_for(focus_backend);
     lines.push(Line::from(Span::styled(
         format!(
-            "  Available models: {}",
-            if app.cfg.available_models.is_empty() {
-                "(could not read `grok models`)".to_string()
+            "  {} models: {}",
+            focus_backend.as_str(),
+            if focus_models.is_empty() {
+                "(none found)".to_string()
             } else {
-                app.cfg.available_models.join(" · ")
+                focus_models.join(" · ")
             }
         ),
         dim,
@@ -1688,6 +1791,10 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::raw(format!(
         "  Grok binary: {}",
         app.cfg.grok_bin.display()
+    )));
+    lines.push(Line::raw(format!(
+        "  Claude bin:  {}",
+        app.cfg.claude_bin.display()
     )));
     lines.push(Line::raw(format!(
         "  Agent MCP:   {}  ({mcp_note})",
@@ -1699,7 +1806,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     )));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "  Controls:  ↑/↓ focus row · ←/→ change (count / model) · a model→all · r reroll roles",
+        "  Controls:  ↑/↓ focus row · ←/→ change (count / model) · b backend · a apply→all · r reroll",
         dim,
     )));
     lines.push(Line::from(Span::styled(
@@ -1708,7 +1815,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     )));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "  Each agent workdir gets .grok/config.toml → botc-agent-mcp (token-scoped)",
+        "  Each agent workdir gets a per-backend MCP config → botc-agent-mcp (token-scoped)",
         dim,
     )));
     lines.push(Line::from(Span::styled(
