@@ -691,8 +691,16 @@ impl AgentPool {
                 AgentRole::Player { seat } => format!("seat{}", seat.0),
             };
             let workdir = cfg.work_root.join(&label);
-            fs::create_dir_all(workdir.join(".grok"))?;
-            write_agent_mcp_config(&workdir, cfg, &a.token, a.game_id, a.role)?;
+            match a.backend {
+                Backend::Grok => {
+                    fs::create_dir_all(workdir.join(".grok"))?;
+                    write_agent_mcp_config(&workdir, cfg, &a.token, a.game_id, a.role)?;
+                }
+                Backend::Claude => {
+                    fs::create_dir_all(workdir.join(".claude"))?;
+                    write_claude_mcp_config(&workdir, cfg, &a.token, a.game_id, a.role)?;
+                }
+            }
             let session_id = uuid::Uuid::new_v4().to_string();
             live.push(LiveAgent {
                 config: a,
@@ -949,6 +957,184 @@ fn copy_grok_auth(workdir: &Path) {
     }
 }
 
+// ---- Claude Code backend spawn plumbing (issue #69) ----
+
+/// Build the `claude` argv (flags only — the prompt is fed on **stdin**, avoiding
+/// arg-length limits and the variadic `--tools` swallowing it) for one headless tick.
+/// Pure + unit-tested. Corrected against `claude --help` v2.1.209: there is NO
+/// `--max-turns`; `--tools ""` disables ALL built-in tools (only the botc MCP tools
+/// remain); `--strict-mcp-config` + `--mcp-config` load ONLY our server.
+pub fn build_claude_tick_args(
+    model: &str,
+    workdir: &Path,
+    session_id: &str,
+    session_started: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "-p".into(),
+        "--model".into(),
+        model.to_string(),
+        "--output-format".into(),
+        "stream-json".into(),
+        // Required alongside -p + stream-json, else claude refuses to stream events.
+        "--verbose".into(),
+        "--permission-mode".into(),
+        "bypassPermissions".into(),
+        // Empty allowlist → every built-in file/shell/web tool is off; only the botc
+        // MCP tools survive, so a seat can only play (no cross-seat token theft).
+        "--tools".into(),
+        String::new(),
+        "--mcp-config".into(),
+        workdir.join(".mcp.json").display().to_string(),
+        "--strict-mcp-config".into(),
+        "--add-dir".into(),
+        workdir.display().to_string(),
+    ];
+    if session_started {
+        args.push("--resume".into());
+    } else {
+        args.push("--session-id".into());
+    }
+    args.push(session_id.to_string());
+    args
+}
+
+/// Isolate a claude child from the operator's global config/creds AND from the fact
+/// that the harness itself runs inside claude-code. HOME redirects `~/.claude.json`,
+/// `~/.claude`, `~/.cursor`; `CLAUDE_CONFIG_DIR` (which outranks HOME) is pinned to the
+/// isolated dir; inherited nested-session / egress-redirect vars are scrubbed so the
+/// child is a clean top-level session on the operator's own account.
+fn claude_env(cmd: &mut Command, iso_home: &Path) {
+    cmd.env("HOME", iso_home)
+        .env("CLAUDE_CONFIG_DIR", iso_home.join(".claude"))
+        .env_remove("XDG_CONFIG_HOME");
+    for var in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_EXECPATH",
+        "CLAUDE_AGENT_SDK_VERSION",
+        "CLAUDE_EFFORT",
+        "AI_AGENT",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+    ] {
+        cmd.env_remove(var);
+    }
+}
+
+/// Configure the `claude` [`Command`] for one tick (argv + isolated env + piped
+/// stdio). stdin is piped so the caller can feed the prompt; the argv carries no
+/// prompt, so the debug log (argv + prompt_first_line) leaks nothing.
+fn configure_claude_command(
+    cfg: &HarnessConfig,
+    agent: &LiveAgent,
+    label: &str,
+    prompt: &str,
+    session_id: &str,
+    session_started: bool,
+) -> Command {
+    let args = build_claude_tick_args(
+        &agent.config.model,
+        &agent.workdir,
+        session_id,
+        session_started,
+    );
+    crate::dlog!(
+        "SPAWN {label} backend=claude model={} mode={} session={} prompt_first_line={:?} argv=[{}]",
+        agent.config.model,
+        if session_started { "resume" } else { "fresh" },
+        session_id,
+        prompt.lines().next().unwrap_or(""),
+        args.join(" ")
+    );
+    let iso_home = agent
+        .workdir
+        .canonicalize()
+        .unwrap_or_else(|_| agent.workdir.clone());
+    let mut cmd = Command::new(&cfg.claude_bin);
+    cmd.args(&args);
+    claude_env(&mut cmd, &iso_home);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+/// Write a claude seat's per-game `.mcp.json` (only the botc stdio server) + its
+/// `agent.token`. `--strict-mcp-config` then ensures no global `~/.claude.json`
+/// servers load. Reuses the same `botc-agent-mcp` proxy invocation as grok.
+fn write_claude_mcp_config(
+    workdir: &Path,
+    cfg: &HarnessConfig,
+    token: &str,
+    game_id: u64,
+    role: AgentRole,
+) -> std::io::Result<()> {
+    let mcp_bin = resolve_agent_mcp_bin(cfg);
+    let token_path = workdir.join("agent.token");
+    fs::write(&token_path, token)?;
+    let role_s = match role {
+        AgentRole::Host => "host",
+        AgentRole::Player { .. } => "player",
+    };
+    let config = serde_json::json!({
+        "mcpServers": {
+            "botc": {
+                "type": "stdio",
+                "command": mcp_bin.display().to_string(),
+                "args": [
+                    "--socket", cfg.socket_path.display().to_string(),
+                    "--token-file", token_path.display().to_string(),
+                    "--game-id", game_id.to_string(),
+                    "--role", role_s,
+                ],
+                "env": {},
+            }
+        }
+    });
+    fs::write(
+        workdir.join(".mcp.json"),
+        serde_json::to_string_pretty(&config).unwrap_or_default(),
+    )?;
+    seed_claude_auth(workdir);
+    Ok(())
+}
+
+/// Seed the claude child's isolated config dir with the operator's subscription
+/// credential so a headless session authenticates after HOME/CLAUDE_CONFIG_DIR are
+/// redirected. No-op when `ANTHROPIC_API_KEY` is set (that path needs no on-disk
+/// secret). Best-effort, mode 0600, under the work root (removed on quit).
+fn seed_claude_auth(workdir: &Path) {
+    if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        crate::dlog!("CLAUDE AUTH copy skipped: no HOME in harness env");
+        return;
+    };
+    let src = PathBuf::from(home).join(".claude/.credentials.json");
+    let dst_dir = workdir.join(".claude");
+    let _ = fs::create_dir_all(&dst_dir);
+    let dst = dst_dir.join(".credentials.json");
+    if let Err(e) = fs::copy(&src, &dst) {
+        crate::dlog!(
+            "CLAUDE AUTH copy {} -> {} failed: {e}",
+            src.display(),
+            dst.display()
+        );
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o600));
+    }
+}
+
 fn resolve_agent_mcp_bin(cfg: &HarnessConfig) -> PathBuf {
     if cfg.agent_mcp_bin.is_absolute() && cfg.agent_mcp_bin.exists() {
         return cfg.agent_mcp_bin.clone();
@@ -1109,9 +1295,7 @@ fn spawn_tick(
             cmd
         }
         Backend::Claude => {
-            return Err(std::io::Error::other(
-                "claude backend not yet wired (added in phase 3b of #69)",
-            ));
+            configure_claude_command(cfg, agent, &label, prompt, &session_id, session_started)
         }
     };
 
@@ -1199,6 +1383,17 @@ fn spawn_tick(
                 push_full_line(&mut g, LineKind::Stderr, line);
             }
         });
+    }
+
+    // Claude reads its prompt from stdin (avoids arg-length limits and the variadic
+    // --tools swallowing a trailing positional). The stdout reader thread above is
+    // already draining, so this write cannot deadlock even for a large prompt.
+    if backend == Backend::Claude {
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(prompt.as_bytes());
+            // Dropping stdin closes it → claude stops waiting and runs the turn.
+        }
     }
 
     child_slot.store(child);
@@ -1742,6 +1937,44 @@ mod tests {
         let u = parse_stream_line_usage(grok).unwrap();
         assert_eq!(u.cache_creation_input_tokens, 0);
         assert_eq!(u.total_tokens, 150);
+    }
+
+    #[test]
+    fn claude_argv_has_required_flags_and_no_grok_flags() {
+        let wd = Path::new("/tmp/wd");
+        let has_pair =
+            |v: &[String], a: &str, b: &str| v.windows(2).any(|w| w[0] == a && w[1] == b);
+        let fresh = build_claude_tick_args("claude-opus-4-8", wd, "sid-123", false);
+        assert!(fresh.contains(&"-p".to_string()));
+        assert!(has_pair(&fresh, "--output-format", "stream-json"));
+        assert!(fresh.contains(&"--verbose".to_string()));
+        assert!(has_pair(&fresh, "--permission-mode", "bypassPermissions"));
+        assert!(has_pair(&fresh, "--model", "claude-opus-4-8"));
+        assert!(fresh.contains(&"--strict-mcp-config".to_string()));
+        assert!(fresh
+            .windows(2)
+            .any(|w| w[0] == "--mcp-config" && w[1].ends_with(".mcp.json")));
+        // `--tools ""` — empty allowlist disables every built-in tool.
+        let ti = fresh.iter().position(|a| a == "--tools").expect("--tools");
+        assert_eq!(fresh[ti + 1], "", "--tools value is the empty string");
+        // Fresh vs resumed session flag.
+        assert!(has_pair(&fresh, "--session-id", "sid-123"));
+        assert!(!fresh.contains(&"--resume".to_string()));
+        let resumed = build_claude_tick_args("claude-opus-4-8", wd, "sid-123", true);
+        assert!(has_pair(&resumed, "--resume", "sid-123"));
+        assert!(!resumed.contains(&"--session-id".to_string()));
+        // No grok-only / claude-absent flags may leak in.
+        for bad in [
+            "--max-turns",
+            "--sandbox",
+            "--no-memory",
+            "--no-subagents",
+            "--disallowed-tools",
+            "streaming-json",
+            "--prompt-file",
+        ] {
+            assert!(!fresh.iter().any(|a| a == bad), "unexpected flag {bad}");
+        }
     }
 
     #[test]
