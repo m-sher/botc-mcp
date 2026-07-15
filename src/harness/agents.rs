@@ -961,9 +961,14 @@ fn copy_grok_auth(workdir: &Path) {
 
 /// Build the `claude` argv (flags only — the prompt is fed on **stdin**, avoiding
 /// arg-length limits and the variadic `--tools` swallowing it) for one headless tick.
-/// Pure + unit-tested. Corrected against `claude --help` v2.1.209: there is NO
-/// `--max-turns`; `--tools ""` disables ALL built-in tools (only the botc MCP tools
-/// remain); `--strict-mcp-config` + `--mcp-config` load ONLY our server.
+/// Pure + unit-tested. Corrected against `claude --help` v2.1.209: `--tools ""` disables
+/// ALL built-in tools (only the botc MCP tools remain); `--strict-mcp-config` +
+/// `--mcp-config` load ONLY our server.
+///
+/// ACCEPTED ASYMMETRY (#69): claude has no `--max-turns` flag, so unlike grok
+/// (`--max-turns 12`) a claude tick is not turn-capped — it self-terminates when done.
+/// In practice both backends make a handful of tool calls per tick, so grok's cap
+/// rarely bites; equalizing would need `--max-budget-usd` (declined) so this stands.
 pub fn build_claude_tick_args(
     model: &str,
     workdir: &Path,
@@ -980,10 +985,13 @@ pub fn build_claude_tick_args(
         "--verbose".into(),
         "--permission-mode".into(),
         "bypassPermissions".into(),
-        // Empty allowlist → every built-in file/shell/web tool is off; only the botc
-        // MCP tools survive, so a seat can only play (no cross-seat token theft).
+        // Keep ONLY `ToolSearch` from the built-in set — the meta-tool claude uses to
+        // discover/load the (deferred) botc MCP tools, analogous to grok's search_tool.
+        // Every file/shell/web built-in is dropped (confinement), but `--tools ""` would
+        // ALSO drop ToolSearch, leaving the MCP tools unreachable — the model then can't
+        // call them and fakes `<function_calls>` text instead.
         "--tools".into(),
-        String::new(),
+        "ToolSearch".into(),
         "--mcp-config".into(),
         workdir.join(".mcp.json").display().to_string(),
         "--strict-mcp-config".into(),
@@ -1058,6 +1066,11 @@ fn configure_claude_command(
     let mut cmd = Command::new(&cfg.claude_bin);
     cmd.args(&args);
     claude_env(&mut cmd, &iso_home);
+    // Symmetry with grok's `--cwd workdir` + `--no-memory`: pin the child's working
+    // dir to the clean isolated workdir (which has no CLAUDE.md / .claude/settings.json)
+    // so claude discovers NO project memory or settings from wherever botc-tui was
+    // launched — matching grok's context confinement (and closing an isolation gap).
+    cmd.current_dir(&iso_home);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1954,9 +1967,14 @@ mod tests {
         assert!(fresh
             .windows(2)
             .any(|w| w[0] == "--mcp-config" && w[1].ends_with(".mcp.json")));
-        // `--tools ""` — empty allowlist disables every built-in tool.
+        // `--tools ToolSearch` — only the MCP-discovery meta-tool survives (no
+        // file/shell/web built-ins), so the deferred botc MCP tools stay reachable.
         let ti = fresh.iter().position(|a| a == "--tools").expect("--tools");
-        assert_eq!(fresh[ti + 1], "", "--tools value is the empty string");
+        assert_eq!(
+            fresh[ti + 1],
+            "ToolSearch",
+            "--tools keeps ToolSearch for MCP access"
+        );
         // Fresh vs resumed session flag.
         assert!(has_pair(&fresh, "--session-id", "sid-123"));
         assert!(!fresh.contains(&"--resume".to_string()));

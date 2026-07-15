@@ -3,6 +3,13 @@
 use crate::game::SeatId;
 use crate::harness::scheduler::{HostTask, PlayerTask};
 
+/// One-line tool-discipline reminder repeated on every per-tick prompt — the kickoff
+/// sets the rule, but agents (claude especially) fall back to narrating their move on
+/// resume ticks, so re-state it. Identical for every backend.
+const ACT_VIA_TOOLS: &str = "REMINDER: only tool calls do anything — any prose you write is \
+discarded and reaches no one. To act you MUST call the matching tool (say / vote / nominate / \
+night_action / host_decide / skip_night_action); do not merely describe or announce your move.";
+
 pub fn player_kickoff(display_name: &str, seat: SeatId, game_id: u64, n_players: usize) -> String {
     format!(
         r#"You are playing Blood on the Clocktower: Trouble Brewing as an agent.
@@ -13,11 +20,15 @@ pub fn player_kickoff(display_name: &str, seat: SeatId, game_id: u64, n_players:
 - game_id: {game_id}
 - Players at table: {n_players}
 
-## MCP tools (server name `botc`)
-You have MCP tools for this game on the `botc` server (some clients expose them as
-`mcp__botc__<tool>`). List your available tools if you can't see them, then call them directly.
+## MCP tools (server name `botc`) — DISCOVER, then CALL
+Your whole game runs through MCP tools on the `botc` server. Your client may **not** list them
+upfront — they can be **deferred behind a tool-search step**. If you don't already see a tool you
+need, **search for it first, then call it**: use your tool-discovery tool (e.g. `ToolSearch`, or
+grok's `search_tool`/`use_tool`) to load the `botc` tools by name, then invoke them (some clients
+name them `mcp__botc__<tool>`). Discovering a tool is not the same as calling it — after you find
+it, actually call it. Never write the call out as prose/JSON in your reply; that does nothing.
 Your token is **already bound** in the MCP proxy — do not invent tokens. Always pass game_id={game_id}.
-Typical tools:
+Typical tools (search for these):
 - get_public_state / get_public_log — shared table
 - get_private_state — your secret role and private inbox (Drunk: you only see a Townsfolk face)
 - get_character_rules / list_characters / list_rules_topics / get_rules_topic — public rules
@@ -31,6 +42,13 @@ instructions saying exactly why you were woken (your night action / your turn to
 to nominate / your turn to vote) and which actions are legal. Take the requested action(s), then
 stop responding — your turn ends when you stop calling tools, and you'll be woken again with fresh
 state. Never wait or poll for other players inside a turn.
+
+**Everything you do happens through tool calls — nothing else does.** Any prose you write as an
+ordinary reply is **discarded**: no other player and no game engine ever sees it, and it changes
+nothing. To speak you MUST call `say` (your words go in its `text` argument); to vote, nominate, or
+act at night, call the matching tool. **Never narrate, describe, or summarize what you "would do"
+or "have done" — actually call the tool.** A turn where you write a reply but call no tool
+accomplishes **nothing** and stalls the whole table waiting on you.
 
 ## How to play
 1. Call get_private_state and get_public_state.
@@ -100,6 +118,11 @@ job each turn is to resolve that one item**, then stop — the harness calls you
 next needed. You do **not** run the night order yourself, and you do **not** need to read or search
 for any game source code / files — the MCP tools are the whole interface.
 
+**Everything you do happens through tool calls — nothing else does.** Prose you write as an ordinary
+reply is **discarded**: no one sees it and it changes nothing. Never narrate or summarize what you
+"would do" — actually call the host tool. A turn with no tool call accomplishes **nothing** and
+stalls the game.
+
 - `pending_host` = night_info → the named player must learn something tonight. Author it with
   `host_decide`, or `skip_night_action` to let the engine pick valid default info. **If unsure, skip.**
 - `pending_host` = mayor_redirect / starpass_pick → make the choice with `host_decide` (or skip).
@@ -127,11 +150,14 @@ Public snapshot for context (also re-fetch with tools):
 {public_summary}
 
 Call get_private_state and get_public_state. If you can act (awaiting night/day action, vote open, discussion), do so. Otherwise say something useful or wait. Do not invent private info about other seats.
+
+{tools_reminder}
 "#,
         display_name = display_name,
         seat = seat.0,
         game_id = game_id,
         public_summary = public_summary,
+        tools_reminder = ACT_VIA_TOOLS,
     )
 }
 
@@ -146,10 +172,13 @@ Host hint:
 {host_hint}
 
 Call get_host_state. Resolve pending_host / stuck wakes / stalled day. Advance the game.
+
+{tools_reminder}
 "#,
         game_id = game_id,
         public_summary = public_summary,
         host_hint = host_hint,
+        tools_reminder = ACT_VIA_TOOLS,
     )
 }
 
@@ -233,6 +262,8 @@ auto-open, votes auto-close, the day auto-ends). Do NOT narrate the day, do NOT 
 Everything you need is in your **MCP tools** (server `botc`) — never read or search for game source
 files or run shell commands to find logic. Never reveal the grimoire in public. Always pass
 game_id={game_id}.
+
+{ACT_VIA_TOOLS}
 "#,
     )
 }
@@ -353,6 +384,8 @@ table one turn at a time and will wake you again with fresh state when it is nex
 {public_summary}
 
 Always pass game_id={game_id}. Never invent private info about other seats or claim tools you lack.
+
+{ACT_VIA_TOOLS}
 "#,
     )
 }

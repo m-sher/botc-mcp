@@ -97,8 +97,13 @@ struct RpcError {
 
 fn dispatch_method(store: &SharedStore, method: &str, params: Value) -> Result<Value, RpcError> {
     match method {
+        // Echo the client's requested protocol version (see botc-agent-mcp): a fixed
+        // old version makes newer MCP clients (Claude Code) reject the server.
         "initialize" => Ok(json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": params
+                .get("protocolVersion")
+                .and_then(|v| v.as_str())
+                .unwrap_or("2024-11-05"),
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "botc-mcp", "version": env!("CARGO_PKG_VERSION") }
         })),

@@ -90,8 +90,17 @@ fn handle_line(
     let params = req.get("params").cloned().unwrap_or(Value::Null);
 
     let result: Result<Value, (i64, String)> = match method {
+        // Echo the client's requested protocol version. Our wire use (initialize +
+        // tools/list + tools/call) is version-agnostic, so mirroring the client keeps
+        // every client happy. Newer clients (Claude Code speaks e.g. "2025-11-25")
+        // reject a server that unilaterally downgrades to an old fixed version — that
+        // left the botc server stuck at "pending" so its tools never loaded. Fall back
+        // to a known-good version when the client sends none.
         "initialize" => Ok(json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": params
+                .get("protocolVersion")
+                .and_then(|v| v.as_str())
+                .unwrap_or("2024-11-05"),
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "botc-agent-mcp", "version": env!("CARGO_PKG_VERSION") }
         })),
