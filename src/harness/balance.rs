@@ -125,9 +125,79 @@ pub fn read_model_stats(path: &Path) -> HashMap<String, ModelStats> {
     out
 }
 
+/// Greedy min-cost matching between `models` and `chars` on the shared lexicographic
+/// cost (team → role type → specific role). Returns `out[i]` = the char index matched
+/// to model `i`. Only models with ≥1 completed game drive the matching (they are the
+/// only ones with an imbalance to correct); models with no history take the leftovers
+/// at random. Shuffled order + strict `<` gives a random tie-break.
+///
+/// Both directions of the balance are this one matching — they differ only in which
+/// side is pinned to a seat: [`balanced_assignment`] pins the models (roles move),
+/// [`balanced_model_order`] pins the roles (models move).
+fn match_models_to_chars(
+    models: &[&str],
+    chars: &[Character],
+    stats: &HashMap<String, ModelStats>,
+    rng: &mut impl Rng,
+) -> Vec<usize> {
+    let n = models.len();
+    debug_assert_eq!(n, chars.len());
+
+    let mut char_order: Vec<usize> = (0..n).collect();
+    char_order.shuffle(rng);
+    let mut model_order: Vec<usize> = (0..n).collect();
+    model_order.shuffle(rng);
+
+    let mut known: Vec<usize> = Vec::new();
+    let mut fresh: Vec<usize> = Vec::new();
+    for &mi in &model_order {
+        if stats.contains_key(models[mi]) {
+            known.push(mi);
+        } else {
+            fresh.push(mi);
+        }
+    }
+
+    let mut assign: Vec<Option<usize>> = vec![None; n];
+    let mut remaining: Vec<usize> = char_order;
+
+    // Cost of pairing char c with model m is (m's count of c.team, of c.role_type, of
+    // c.role): giving a team/type/role to the model that has the fewest of it corrects
+    // the imbalance.
+    while !known.is_empty() && !remaining.is_empty() {
+        let mut best: Option<(usize, usize, (u32, u32, u32))> = None; // (char_pos, known_pos, cost)
+        for (cp, &ci) in remaining.iter().enumerate() {
+            let (team, rtype, role) = keys(chars[ci]);
+            for (kp, &mi) in known.iter().enumerate() {
+                let st = &stats[models[mi]];
+                let cost = (st.team_n(&team), st.type_n(&rtype), st.role_n(&role));
+                if best.is_none_or(|(_, _, bc)| cost < bc) {
+                    best = Some((cp, kp, cost));
+                }
+            }
+        }
+        let (cp, kp, _) = best.expect("non-empty");
+        let ci = remaining.remove(cp);
+        let mi = known.remove(kp);
+        assign[mi] = Some(ci);
+    }
+
+    // The greedy consumed exactly one char per known model, so the leftovers line up
+    // one-to-one with the shuffled no-history models.
+    for (&mi, &ci) in fresh.iter().zip(remaining.iter()) {
+        assign[mi] = Some(ci);
+    }
+
+    assign
+        .into_iter()
+        .map(|a| a.expect("every model matched a character"))
+        .collect()
+}
+
 /// Reassign a fixed bag of characters to the given player seats so each model's
-/// record stays balanced (team → role type → role, lexicographically). The bag
-/// (`true_character`, `believed_character` pairs — the latter carries a Drunk's
+/// record stays balanced (team → role type → role, lexicographically). The models are
+/// PINNED to their seats and the roles move — this is what `r` (reroll roles) does.
+/// The bag (`true_character`, `believed_character` pairs — the latter carries a Drunk's
 /// Townsfolk face) is preserved exactly; only *which seat* gets each entry changes,
 /// so the result is always a valid setup for the same composition.
 ///
@@ -139,63 +209,14 @@ pub fn balanced_assignment(
     stats: &HashMap<String, ModelStats>,
     rng: &mut impl Rng,
 ) -> Vec<RoleAssignment> {
-    let n = seats.len();
-    debug_assert_eq!(n, bag.len());
-    debug_assert_eq!(n, seat_models.len());
-
-    // Random order up front so ties (and new-seat fill) resolve arbitrarily.
-    let mut char_order: Vec<usize> = (0..n).collect();
-    char_order.shuffle(rng);
-    let mut seat_order: Vec<usize> = (0..n).collect();
-    seat_order.shuffle(rng);
-
-    // Split seats into known (model has history) and new.
-    let mut known: Vec<usize> = Vec::new();
-    let mut fresh: Vec<usize> = Vec::new();
-    for &si in &seat_order {
-        if stats.contains_key(seat_models[si]) {
-            known.push(si);
-        } else {
-            fresh.push(si);
-        }
-    }
-
-    let mut assign: Vec<Option<usize>> = vec![None; n];
-    let mut chars: Vec<usize> = char_order; // remaining char indices, shuffled
-
-    // Greedy min-cost matching over known seats: repeatedly take the (char, seat)
-    // pair whose lexicographic cost is lowest. Cost of putting char c on model m is
-    // (m's count of c.team, of c.role_type, of c.role): assigning a team/type/role
-    // to the model that has the fewest of it corrects the imbalance. Shuffled order
-    // + strict `<` gives a random tie-break.
-    while !known.is_empty() && !chars.is_empty() {
-        let mut best: Option<(usize, usize, (u32, u32, u32))> = None; // (char_pos, known_pos, cost)
-        for (cp, &ci) in chars.iter().enumerate() {
-            let (team, rtype, role) = keys(bag[ci].0);
-            for (kp, &si) in known.iter().enumerate() {
-                let st = &stats[seat_models[si]];
-                let cost = (st.team_n(&team), st.type_n(&rtype), st.role_n(&role));
-                if best.is_none_or(|(_, _, bc)| cost < bc) {
-                    best = Some((cp, kp, cost));
-                }
-            }
-        }
-        let (cp, kp, _) = best.expect("non-empty");
-        let ci = chars.remove(cp);
-        let si = known.remove(kp);
-        assign[si] = Some(ci);
-    }
-
-    // The greedy consumed exactly one character per known seat, so the remaining
-    // characters line up one-to-one with the shuffled new-model seats.
-    for (&si, &ci) in fresh.iter().zip(chars.iter()) {
-        assign[si] = Some(ci);
-    }
-
-    (0..n)
+    debug_assert_eq!(seats.len(), bag.len());
+    debug_assert_eq!(seats.len(), seat_models.len());
+    let chars: Vec<Character> = bag.iter().map(|(c, _)| *c).collect();
+    // Models are indexed by seat, so pick[i] is the char for seat i.
+    let pick = match_models_to_chars(seat_models, &chars, stats, rng);
+    (0..seats.len())
         .map(|i| {
-            let ci = assign[i].expect("every seat assigned a character");
-            let (true_character, believed_character) = bag[ci];
+            let (true_character, believed_character) = bag[pick[i]];
             RoleAssignment {
                 seat: seats[i],
                 true_character,
@@ -203,6 +224,28 @@ pub fn balanced_assignment(
             }
         })
         .collect()
+}
+
+/// The inverse of [`balanced_assignment`]: the seats' ROLES are pinned (the drawn
+/// layout) and the picked models are a pool that moves — this is what `m` (shuffle
+/// models) does. Returns `out[seat_i]` = index into `model_keys` of the model to place
+/// at seat `i`, chosen so each model's record stays balanced on the same axes.
+///
+/// `seat_chars[i]` is the role at seat `i`; `model_keys` is the pool (same length).
+pub fn balanced_model_order(
+    seat_chars: &[Character],
+    model_keys: &[&str],
+    stats: &HashMap<String, ModelStats>,
+    rng: &mut impl Rng,
+) -> Vec<usize> {
+    debug_assert_eq!(seat_chars.len(), model_keys.len());
+    // Chars are indexed by seat, so pick[j] is the seat for pool model j — invert it.
+    let pick = match_models_to_chars(model_keys, seat_chars, stats, rng);
+    let mut out = vec![0usize; seat_chars.len()];
+    for (mj, &si) in pick.iter().enumerate() {
+        out[si] = mj;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -428,6 +471,64 @@ mod tests {
         assert_eq!(g.team_n("Evil"), 0, "aborted/started games must not count");
         assert_eq!(g.type_n("Townsfolk"), 1);
         assert_eq!(g.role_n("Empath"), 1);
+    }
+
+    #[test]
+    fn model_order_places_owed_evil_model_on_an_evil_seat() {
+        // Inverse direction (`m`): the ROLES are pinned per seat — seats 0-2 are
+        // Good/Townsfolk, seat 3 is the Minion, seat 4 the Demon — and the models move.
+        let seat_chars = vec![
+            Character::Empath,
+            Character::FortuneTeller,
+            Character::Chef,
+            Character::Poisoner,
+            Character::Imp,
+        ];
+        // Strict owed-evil ordering by evil count: A(0) < D(1) < E(2) < C(3) < B(6),
+        // so the two Evil seats must go to A and D; B (always Evil) must not get one.
+        let stats = stats_with(vec![
+            ("A", model(&[("Good", "Townsfolk", "Empath", 6)])),
+            ("B", model(&[("Evil", "Minion", "Poisoner", 6)])),
+            (
+                "C",
+                model(&[
+                    ("Good", "Townsfolk", "Chef", 3),
+                    ("Evil", "Demon", "Imp", 3),
+                ]),
+            ),
+            (
+                "D",
+                model(&[
+                    ("Good", "Townsfolk", "Chef", 5),
+                    ("Evil", "Minion", "Poisoner", 1),
+                ]),
+            ),
+            (
+                "E",
+                model(&[
+                    ("Good", "Townsfolk", "Empath", 4),
+                    ("Evil", "Demon", "Imp", 2),
+                ]),
+            ),
+        ]);
+        let pool = ["A", "B", "C", "D", "E"];
+        let mut rng = StdRng::seed_from_u64(11);
+        let order = balanced_model_order(&seat_chars, &pool, &stats, &mut rng);
+        // order[seat] = index into pool. Evil seats are 3 (Minion) and 4 (Demon).
+        let evil: Vec<&str> = [3usize, 4].iter().map(|&s| pool[order[s]]).collect();
+        assert!(
+            evil.contains(&"A"),
+            "A (never Evil) must take an Evil seat, got {evil:?}"
+        );
+        assert!(
+            !evil.contains(&"B"),
+            "B (always Evil, owed Good) must not take an Evil seat, got {evil:?}"
+        );
+        // It is a permutation: every pool model placed exactly once.
+        let mut used = order.clone();
+        used.sort();
+        used.dedup();
+        assert_eq!(used.len(), 5, "each model placed exactly once");
     }
 
     #[test]

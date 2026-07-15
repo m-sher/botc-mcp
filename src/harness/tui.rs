@@ -273,6 +273,40 @@ impl App {
             crate::harness::balance::balanced_assignment(&seats, &models, &bag, &stats, &mut rng);
     }
 
+    /// Shuffle the picked models across the player seats so each model's record stays
+    /// balanced against the **current** role layout. This is the exact inverse of
+    /// [`Self::reroll_roles`] (`r`), which redraws the roles against the current models:
+    /// here the roles are pinned and the models move. Both use the same lexicographic
+    /// cost (team → role type → role, keyed by node_key). The Host has no role, so its
+    /// pick is left untouched; your picks are treated as a pool, so a model may land on
+    /// a different seat than you placed it.
+    fn shuffle_models(&mut self) {
+        if self.setup_roles.len() != self.player_count
+            || self.seat_choices.len() < self.player_count + 1
+        {
+            self.status = "no role preview yet — press r first".into();
+            return;
+        }
+        // Roles pinned per player seat (index i = seat i); the picks are the pool.
+        let seat_chars: Vec<Character> =
+            self.setup_roles.iter().map(|a| a.true_character).collect();
+        let pool: Vec<SeatChoice> = self.seat_choices[1..=self.player_count].to_vec();
+        let keys: Vec<String> = pool
+            .iter()
+            .map(|c| crate::harness::balance::node_key(c.backend.as_str(), &c.model))
+            .collect();
+        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let stats =
+            crate::harness::balance::read_model_stats(&crate::harness::results_log::log_path());
+        let mut rng = rand::thread_rng();
+        let order =
+            crate::harness::balance::balanced_model_order(&seat_chars, &key_refs, &stats, &mut rng);
+        for (i, &mi) in order.iter().enumerate() {
+            self.seat_choices[1 + i] = pool[mi].clone();
+        }
+        self.status = "models shuffled onto the current roles (balanced)".into();
+    }
+
     fn selected_thinking_expanded(&self) -> bool {
         self.thinking_expanded.contains(&self.selected_agent)
     }
@@ -421,6 +455,11 @@ impl App {
                 if !self.setup_roles.is_empty() {
                     self.status = "rerolled roles".into();
                 }
+            }
+            // Shuffle the picked models across seats, balanced against the CURRENT
+            // roles — the inverse of `r` (which redraws roles against current models).
+            KeyCode::Char('s') | KeyCode::Char('S') if self.focus == Focus::Setup => {
+                self.shuffle_models();
             }
             // Cycle the focused seat's backend (grok ↔ claude); snap model to that
             // backend's default so the pick is always valid.
@@ -1716,7 +1755,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
 
     // One row per session: Host, P0, P1, … each showing seat · role · model.
     lines.push(Line::from(Span::styled(
-        "  Seat · role · [backend] model   (←/→ model · b backend · a apply-all · r reroll)",
+        "  Seat · role · [backend] model   (←/→ model · b backend · a apply-all · r roles→models · s models→roles)",
         dim,
     )));
     for slot in 0..=app.player_count {
@@ -1809,7 +1848,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     )));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "  Controls:  ↑/↓ focus row · ←/→ change (count / model) · b backend · a apply→all · r reroll",
+        "  Controls:  ↑/↓ row · ←/→ change · b backend · a apply→all · r reroll roles (balance vs models) · s shuffle models (balance vs roles)",
         dim,
     )));
     lines.push(Line::from(Span::styled(
