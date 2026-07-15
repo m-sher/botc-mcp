@@ -96,6 +96,19 @@ def invert(mapping: dict[str, str]) -> dict[str, str]:
     return {pub: real for real, pub in mapping.items()}
 
 
+def node_key(backend, model) -> str:
+    """Compose the ranking node key for a seat (issue #69). Identical to `node_key` in
+    src/harness/balance.rs and scripts/rate_models.py: grok — and legacy rows with no
+    `backend` — stay bare; other backends namespace as `<backend>:<model>`."""
+    model = (model or "").strip()
+    backend = (backend or "").strip()
+    if not model:
+        return ""
+    if backend in ("", "grok"):
+        return model
+    return f"{backend}:{model}"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Show / maintain private model aliases.")
     ap.add_argument(
@@ -135,7 +148,7 @@ def main() -> None:
             if rec.get("event") != "game_end":
                 continue
             for s in rec.get("seats") or []:
-                m = (s.get("model") or "").strip()
+                m = node_key(s.get("backend"), s.get("model"))
                 if m:
                     reals.add(m)
 

@@ -253,16 +253,19 @@ impl App {
                 )
             })
             .collect();
-        // Seat model lookup: `seat_choices[0]` is the Host, players are `1..=N`.
-        let models: Vec<&str> = seats
+        // Seat identity lookup (`seat_choices[0]` is the Host, players are `1..=N`).
+        // Key by the composed node_key so balance history matches read_model_stats
+        // (grok stays bare; claude → "claude:<model>").
+        let node_keys: Vec<String> = seats
             .iter()
             .map(|id| {
                 self.seat_choices
                     .get(id.0 as usize + 1)
-                    .map(|c| c.model.as_str())
-                    .unwrap_or("")
+                    .map(|c| crate::harness::balance::node_key(c.backend.as_str(), &c.model))
+                    .unwrap_or_default()
             })
             .collect();
+        let models: Vec<&str> = node_keys.iter().map(String::as_str).collect();
         let stats =
             crate::harness::balance::read_model_stats(&crate::harness::results_log::log_path());
         let mut rng = rand::thread_rng();

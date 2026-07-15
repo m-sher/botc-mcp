@@ -59,6 +59,22 @@ fn keys(c: Character) -> (String, String, String) {
     )
 }
 
+/// Compose the ranking/identity node key for a seat (issue #69). Grok — and legacy
+/// rows with no `backend` field — stay **bare**, so pre-#69 corpus and ratings keys
+/// are unchanged and no leaderboard node splits. Other backends are namespaced
+/// `<backend>:<model>`, so a native claude seat never conflates with claude weights
+/// served through grok. Empty model → empty key (the caller skips it). Must stay
+/// identical to `node_key` in scripts/rate_models.py and scripts/model_aliases.py.
+pub fn node_key(backend: &str, model: &str) -> String {
+    if model.is_empty() {
+        String::new()
+    } else if backend.is_empty() || backend == "grok" {
+        model.to_string()
+    } else {
+        format!("{backend}:{model}")
+    }
+}
+
 /// Tally per-model history from a `botc-results.jsonl` file. Counts each seat of
 /// every `game_end` event (one per *completed* game) by team / role type / role.
 /// These are the same games the leaderboard rates: an aborted game (`game_abort`)
@@ -87,10 +103,13 @@ pub fn read_model_stats(path: &Path) -> HashMap<String, ModelStats> {
         };
         for s in seats {
             let model = s.get("model").and_then(Value::as_str).unwrap_or("");
-            if model.is_empty() {
+            // Compose-on-read: legacy rows (no backend) default to grok → bare model.
+            let backend = s.get("backend").and_then(Value::as_str).unwrap_or("grok");
+            let key = node_key(backend, model);
+            if key.is_empty() {
                 continue;
             }
-            let entry = out.entry(model.to_string()).or_default();
+            let entry = out.entry(key).or_default();
             entry.games += 1;
             if let Some(t) = s.get("team").and_then(Value::as_str) {
                 *entry.team.entry(t.to_string()).or_insert(0) += 1;
@@ -409,5 +428,44 @@ mod tests {
         assert_eq!(g.team_n("Evil"), 0, "aborted/started games must not count");
         assert_eq!(g.type_n("Townsfolk"), 1);
         assert_eq!(g.role_n("Empath"), 1);
+    }
+
+    #[test]
+    fn node_key_golden() {
+        // Legacy grok (no backend) and explicit grok both stay bare → same node.
+        assert_eq!(node_key("", "grok-build"), "grok-build");
+        assert_eq!(node_key("grok", "grok-build"), "grok-build");
+        // Claude is namespaced and never conflates with grok:same-name.
+        assert_eq!(
+            node_key("claude", "claude-opus-4-8"),
+            "claude:claude-opus-4-8"
+        );
+        assert_ne!(node_key("claude", "x"), node_key("grok", "x"));
+        // Empty model → empty key (skipped by the caller).
+        assert_eq!(node_key("claude", ""), "");
+        assert_eq!(node_key("grok", ""), "");
+    }
+
+    #[test]
+    fn read_model_stats_folds_legacy_grok_and_splits_claude() {
+        let path = std::env::temp_dir().join("botc_balance_nodekey_test.jsonl");
+        let lines = [
+            // legacy grok row (no backend field) — Good
+            r#"{"event":"game_end","seats":[{"model":"m","team":"Good","character_type":"Townsfolk","true_character":"Empath"}]}"#,
+            // explicit grok row — Evil — must fold onto the SAME node as the legacy row
+            r#"{"event":"game_end","seats":[{"model":"m","backend":"grok","team":"Evil","character_type":"Minion","true_character":"Poisoner"}]}"#,
+            // native claude row with the SAME model name — a DISTINCT node
+            r#"{"event":"game_end","seats":[{"model":"m","backend":"claude","team":"Good","character_type":"Townsfolk","true_character":"Chef"}]}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let stats = read_model_stats(&path);
+        let _ = std::fs::remove_file(&path);
+        let g = stats.get("m").expect("bare grok node");
+        assert_eq!(g.games, 2, "legacy + explicit grok fold to one node");
+        assert_eq!(g.team_n("Good"), 1);
+        assert_eq!(g.team_n("Evil"), 1);
+        let c = stats.get("claude:m").expect("claude node is separate");
+        assert_eq!(c.games, 1);
+        assert_eq!(c.team_n("Good"), 1);
     }
 }
