@@ -20,14 +20,46 @@ pub enum AgentRole {
     Player { seat: SeatId },
 }
 
+/// Which agent CLI runs a seat's turns. Per-seat (on [`AgentConfig`]) so a single
+/// game can mix grok and claude players (issue #69). `Grok` is the default so every
+/// existing construction site and corpus record keeps its current behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    #[default]
+    Grok,
+    Claude,
+}
+
+impl Backend {
+    /// Stable lowercase tag used in the results corpus and the setup UI.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Backend::Grok => "grok",
+            Backend::Claude => "claude",
+        }
+    }
+
+    /// Cycle to another backend by `delta` steps (setup picker; wraps both ways).
+    pub fn cycle(self, delta: i32) -> Self {
+        const N: i32 = 2;
+        match (self as i32 + delta).rem_euclid(N) {
+            0 => Backend::Grok,
+            _ => Backend::Claude,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub role: AgentRole,
     pub display_name: String,
     pub token: String,
     pub game_id: u64,
-    /// Model this agent's grok sessions run on (picked per seat in setup).
+    /// Model this agent's sessions run on (picked per seat in setup).
     pub model: String,
+    /// Which CLI backend runs this seat's turns; per-seat so one game can mix
+    /// grok and claude players (issue #69).
+    pub backend: Backend,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +73,13 @@ pub struct HarnessConfig {
     /// Models available in the setup pickers — filled from `grok models` at TUI start.
     pub available_models: Vec<String>,
     pub grok_bin: PathBuf,
+    /// Path to the `claude` (Claude Code) binary for claude-backed seats (issue #69).
+    pub claude_bin: PathBuf,
+    /// Claude models offered in the setup picker (curated — there is no `claude models`
+    /// subcommand). Filled at TUI start; the default is [`Self::claude_model`].
+    pub claude_models: Vec<String>,
+    /// Default claude model — the starting pick / fallback for a claude seat.
+    pub claude_model: String,
     pub agent_mcp_bin: PathBuf,
     pub work_root: PathBuf,
     pub socket_path: PathBuf,
@@ -66,6 +105,11 @@ impl Default for HarnessConfig {
             model: "grok-build".into(),
             available_models: Vec::new(),
             grok_bin: PathBuf::from("grok"),
+            // Kept PURE — App::new discovers the real binary / model list at TUI start
+            // (mirrors grok's available_models staying empty here).
+            claude_bin: PathBuf::from("claude"),
+            claude_models: Vec::new(),
+            claude_model: "claude-opus-4-8".into(),
             agent_mcp_bin: PathBuf::from("botc-agent-mcp"),
             work_root: PathBuf::from("/tmp/botc-harness"),
             socket_path: PathBuf::from("/tmp/botc-harness/engine.sock"),
@@ -99,6 +143,53 @@ impl Default for HarnessConfig {
             no_memory: true,
         }
     }
+}
+
+impl HarnessConfig {
+    /// Models offered in the setup picker for `backend`.
+    pub fn models_for(&self, backend: Backend) -> &[String] {
+        match backend {
+            Backend::Grok => &self.available_models,
+            Backend::Claude => &self.claude_models,
+        }
+    }
+
+    /// Default model for `backend` — the pick a seat snaps to when its backend changes.
+    pub fn default_model(&self, backend: Backend) -> String {
+        match backend {
+            Backend::Grok => self.model.clone(),
+            Backend::Claude => self.claude_model.clone(),
+        }
+    }
+}
+
+/// Locate the `claude` (Claude Code) binary: `$PATH`, then `~/.local/bin/claude`,
+/// else the bare name (spawn will surface a clear error if truly absent).
+pub fn find_claude() -> PathBuf {
+    if let Ok(p) = which("claude") {
+        return p;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let p = Path::new(&home).join(".local/bin/claude");
+        if p.exists() {
+            return p;
+        }
+    }
+    PathBuf::from("claude")
+}
+
+/// Curated Claude model ids for the setup picker (there is no `claude models` CLI).
+/// Full ids only — the bare id is what lands in the corpus, so it must be stable and
+/// never the `opus`/`sonnet` alias. The first entry is the default.
+pub fn load_claude_models() -> Vec<String> {
+    [
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "claude-haiku-4-5-20251001",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// Parse the human-readable output of `grok models`.
@@ -625,7 +716,7 @@ impl AgentPool {
                     n_players,
                 ),
             };
-            match spawn_grok_tick(&self.cfg, agent, &prompt) {
+            match spawn_tick(&self.cfg, agent, &prompt) {
                 Ok(TickOutcome::Spawned) => n += 1,
                 Ok(TickOutcome::SkippedStillRunning) => {}
                 Err(e) => last_err = Some(e),
@@ -655,7 +746,7 @@ impl AgentPool {
                     public_summary,
                 ),
             };
-            match spawn_grok_tick(&self.cfg, agent, &prompt) {
+            match spawn_tick(&self.cfg, agent, &prompt) {
                 Ok(TickOutcome::Spawned) => n += 1,
                 Ok(TickOutcome::SkippedStillRunning) => {}
                 Err(e) => last_err = Some(e),
@@ -710,7 +801,7 @@ impl AgentPool {
                     )
                 }
             };
-            match spawn_grok_tick(&self.cfg, &mut self.agents[idx], &prompt) {
+            match spawn_tick(&self.cfg, &mut self.agents[idx], &prompt) {
                 Ok(TickOutcome::Spawned) => n += 1,
                 Ok(TickOutcome::SkippedStillRunning) => {}
                 Err(e) => last_err = Some(e),
@@ -916,6 +1007,22 @@ pub fn build_grok_tick_args(
     args
 }
 
+/// The single spawn seam: dispatch one tick to the seat's [`Backend`]. Every caller
+/// routes through here so each backend's running-gate / stream-reader / waiter
+/// invariants live in exactly one place.
+fn spawn_tick(
+    cfg: &HarnessConfig,
+    agent: &mut LiveAgent,
+    prompt: &str,
+) -> std::io::Result<TickOutcome> {
+    match agent.config.backend {
+        Backend::Grok => spawn_grok_tick(cfg, agent, prompt),
+        Backend::Claude => Err(std::io::Error::other(
+            "claude backend not yet wired (added in a later phase of #69)",
+        )),
+    }
+}
+
 fn spawn_grok_tick(
     cfg: &HarnessConfig,
     agent: &mut LiveAgent,
@@ -994,6 +1101,7 @@ fn spawn_grok_tick(
     let child_slot = Arc::clone(&agent.child);
     let game_id = agent.config.game_id;
     let model = agent.config.model.clone();
+    let backend = agent.config.backend;
     let agent_role_label = label.clone();
     // #56: grok exits 1 on normal --max-turns; gate resume on stream evidence of a
     // real session (end / max_turns_reached), not process exit code.
@@ -1026,6 +1134,7 @@ fn spawn_grok_tick(
                         game_id,
                         &agent_role_label,
                         &model,
+                        backend.as_str(),
                         &tick,
                         u.context.as_ref(),
                         &u.game_total,
@@ -1646,6 +1755,7 @@ Available models:
                 token: "tok".into(),
                 game_id: 1,
                 model: "grok-build".into(),
+                backend: Backend::Grok,
             }],
         )
         .unwrap();
@@ -1708,6 +1818,7 @@ Available models:
                 token: "tok".into(),
                 game_id: 1,
                 model: "grok-build".into(),
+                backend: Backend::Grok,
             }],
         )
         .unwrap();

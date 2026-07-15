@@ -108,10 +108,12 @@ fn context_json(c: &ContextWindow) -> Value {
 }
 
 /// One headless tick's spend (from streaming-json `end.usage`).
+#[allow(clippy::too_many_arguments)]
 pub fn log_tick_usage(
     game_id: u64,
     agent: &str,
     model: &str,
+    backend: &str,
     tick: &TickUsage,
     context: Option<&ContextWindow>,
     cumulative: &TickUsage,
@@ -123,6 +125,7 @@ pub fn log_tick_usage(
         "game_id": game_id,
         "agent": agent,
         "model": model,
+        "backend": backend,
         "tick": tick_usage_json(tick),
         "cumulative": tick_usage_json(cumulative),
         "ticks_with_usage": ticks_with_usage,
@@ -185,17 +188,20 @@ pub fn seats_snapshot(game: &Game, agents: &[AgentConfig]) -> Vec<Value> {
     game.seats
         .iter()
         .map(|s| {
-            let model = agents
+            let agent = agents
                 .iter()
-                .find(|a| matches!(a.role, AgentRole::Player { seat } if seat == s.id))
-                .map(|a| a.model.as_str())
-                .unwrap_or("");
+                .find(|a| matches!(a.role, AgentRole::Player { seat } if seat == s.id));
+            let model = agent.map(|a| a.model.as_str()).unwrap_or("");
+            // Additive identity field (issue #69). Missing/legacy → "grok" so the
+            // ranking key composes to the bare model, matching pre-#69 records.
+            let backend = agent.map(|a| a.backend.as_str()).unwrap_or("grok");
             let true_c = s.true_character;
             let believed = s.believed_character.or(true_c);
             json!({
                 "seat": s.id.0,
                 "name": s.display_name,
                 "model": model,
+                "backend": backend,
                 "true_character": true_c.map(|c| c.display_name()),
                 "believed_character": believed.map(|c| c.display_name()),
                 "team": true_c.map(|c| format!("{:?}", c.team())),
@@ -215,12 +221,28 @@ fn host_model(agents: &[AgentConfig]) -> String {
         .unwrap_or_default()
 }
 
+fn host_backend(agents: &[AgentConfig]) -> String {
+    agents
+        .iter()
+        .find(|a| matches!(a.role, AgentRole::Host))
+        .map(|a| a.backend.as_str().to_string())
+        .unwrap_or_else(|| "grok".to_string())
+}
+
 fn model_for_seat(agents: &[AgentConfig], seat: SeatId) -> String {
     agents
         .iter()
         .find(|a| matches!(a.role, AgentRole::Player { seat: s } if s == seat))
         .map(|a| a.model.clone())
         .unwrap_or_default()
+}
+
+fn backend_for_seat(agents: &[AgentConfig], seat: SeatId) -> String {
+    agents
+        .iter()
+        .find(|a| matches!(a.role, AgentRole::Player { seat: s } if s == seat))
+        .map(|a| a.backend.as_str().to_string())
+        .unwrap_or_else(|| "grok".to_string())
 }
 
 fn phase_fields(game: &Game) -> Value {
@@ -259,6 +281,7 @@ pub fn log_game_start(
         "st_choice_mode": st_choice_mode,
         "host": {
             "model": host_model(agents),
+            "backend": host_backend(agents),
             "display_name": "Storyteller",
         },
         "seats": seats_snapshot(game, agents),
@@ -284,6 +307,7 @@ pub fn death_records_from_public(
             "seat": seat.0,
             "cause": cause,
             "model": model_for_seat(agents, seat),
+            "backend": backend_for_seat(agents, seat),
             "true_character": s.and_then(|x| x.true_character).map(|c| c.display_name()),
             "team": s.and_then(|x| x.true_character).map(|c| format!("{:?}", c.team())),
             "phase": phase,
@@ -322,7 +346,9 @@ pub fn log_nomination_if_any(
         "by_seat": by.0,
         "target_seat": target.0,
         "by_model": model_for_seat(agents, *by),
+        "by_backend": backend_for_seat(agents, *by),
         "target_model": model_for_seat(agents, *target),
+        "target_backend": backend_for_seat(agents, *target),
         "by_team": game.seats.iter().find(|s| s.id == *by)
             .and_then(|s| s.true_character).map(|c| format!("{:?}", c.team())),
         "target_team": game.seats.iter().find(|s| s.id == *target)
@@ -379,7 +405,7 @@ pub fn log_game_end(
         "game_id": game_id,
         "winner": winner_str(winner),
         "reason": reason_str(reason),
-        "host": { "model": host_model(agents) },
+        "host": { "model": host_model(agents), "backend": host_backend(agents) },
         "seats": seats,
         "usage": usage_snapshot_json(usage),
         "phase": phase_fields(game),
@@ -404,7 +430,7 @@ pub fn log_game_abort(
         "run_id": run_id,
         "game_id": game_id,
         "why": why,
-        "host": { "model": host_model(agents) },
+        "host": { "model": host_model(agents), "backend": host_backend(agents) },
         "seats": seats,
         "usage": usage_snapshot_json(usage),
         "phase": phase,
@@ -460,6 +486,7 @@ pub fn drain_public_events(
 mod tests {
     use super::*;
     use crate::game::{Game, RoleAssignment, SeatId, StartOpts};
+    use crate::harness::agents::Backend;
     use crate::roles::Character;
 
     fn five_seat_game() -> Game {
@@ -493,6 +520,7 @@ mod tests {
                 token: "h".into(),
                 game_id: 1,
                 model: "host-model".into(),
+                backend: Backend::Grok,
             },
             AgentConfig {
                 role: AgentRole::Player { seat: SeatId(0) },
@@ -500,6 +528,7 @@ mod tests {
                 token: "p0".into(),
                 game_id: 1,
                 model: "model-a".into(),
+                backend: Backend::Grok,
             },
             AgentConfig {
                 role: AgentRole::Player { seat: SeatId(4) },
@@ -507,6 +536,7 @@ mod tests {
                 token: "p4".into(),
                 game_id: 1,
                 model: "model-b".into(),
+                backend: Backend::Grok,
             },
         ];
         let seats = seats_snapshot(&game, &agents);
@@ -529,6 +559,7 @@ mod tests {
             token: "x".into(),
             game_id: 1,
             model: "imp-model".into(),
+            backend: Backend::Grok,
         }];
         let recs = death_records_from_public(
             "run",
@@ -561,6 +592,7 @@ mod tests {
                 token: "a".into(),
                 game_id: 1,
                 model: "m2".into(),
+                backend: Backend::Grok,
             },
             AgentConfig {
                 role: AgentRole::Player { seat: SeatId(3) },
@@ -568,6 +600,7 @@ mod tests {
                 token: "b".into(),
                 game_id: 1,
                 model: "m3".into(),
+                backend: Backend::Grok,
             },
         ];
         // Drain without an open FILE still advances cursor; we only assert cursor

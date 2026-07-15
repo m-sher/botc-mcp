@@ -24,9 +24,9 @@ use ratatui::{Frame, Terminal};
 use crate::game::{Game, GameId, Phase, RoleAssignment, SeatId, StChoiceMode, StartOpts};
 use crate::harness::action_log::{ActionKind, ActionLog, ActorLabel};
 use crate::harness::agents::{
-    agent_mcp_bin_ok, cycle_in_list, find_agent_mcp_bin, find_grok,
-    resolve_agent_mcp_bin_for_display, AgentConfig, AgentPool, AgentRole, HarnessConfig, LineKind,
-    LogLine,
+    agent_mcp_bin_ok, cycle_in_list, find_agent_mcp_bin, find_claude, find_grok,
+    load_claude_models, resolve_agent_mcp_bin_for_display, AgentConfig, AgentPool, AgentRole,
+    Backend, HarnessConfig, LineKind, LogLine,
 };
 use crate::harness::scheduler::{plan_ticks, wait_signature, SchedTarget};
 use crate::harness::socket::SocketServer;
@@ -130,6 +130,7 @@ impl App {
         let work_root = PathBuf::from(format!("/tmp/botc-harness-{id}"));
         let mut cfg = HarnessConfig {
             grok_bin: find_grok(),
+            claude_bin: find_claude(),
             agent_mcp_bin: find_agent_mcp_bin(),
             work_root: work_root.clone(),
             socket_path: work_root.join("engine.sock"),
@@ -137,6 +138,8 @@ impl App {
         };
         // Populate the setup picker from `grok models` (CLI default becomes selected).
         let models_note = cfg.load_models_from_grok();
+        // Claude models are a curated static list (no `claude models` CLI).
+        cfg.claude_models = load_claude_models();
         let mcp_ok = agent_mcp_bin_ok(&cfg);
         let mcp_path = resolve_agent_mcp_bin_for_display(&cfg);
         let status = if mcp_ok {
@@ -591,6 +594,8 @@ impl App {
             token: created.host_token.as_str().to_string(),
             game_id,
             model: model_for(0),
+            // Per-seat backend picker lands in Phase 4; every seat is grok until then.
+            backend: Backend::Grok,
         }];
         for (i, tok) in created.player_tokens.iter().enumerate() {
             configs.push(AgentConfig {
@@ -601,6 +606,7 @@ impl App {
                 token: tok.as_str().to_string(),
                 game_id,
                 model: model_for(1 + i),
+                backend: Backend::Grok,
             });
         }
 
