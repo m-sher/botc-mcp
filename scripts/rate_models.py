@@ -53,6 +53,20 @@ ROLE_COLS = ("Townsfolk", "Outsider", "Minion", "Demon")
 MATRIX_COLS = SIDE_COLS + ROLE_COLS
 
 
+def node_key(backend, model) -> str:
+    """Compose the ranking node key for a seat (issue #69). Must stay identical to
+    `node_key` in src/harness/balance.rs and scripts/model_aliases.py: grok — and
+    legacy rows with no `backend` — stay bare; other backends namespace as
+    `<backend>:<model>`. Empty model → "" (caller skips)."""
+    model = (model or "").strip()
+    backend = (backend or "").strip()
+    if not model:
+        return ""
+    if backend in ("", "grok"):
+        return model
+    return f"{backend}:{model}"
+
+
 def expand_pairwise(
     ends: list[dict],
 ) -> tuple[
@@ -76,7 +90,7 @@ def expand_pairwise(
         winners, losers = [], []
         seen = set()
         for s in g["seats"]:
-            m = (s.get("model") or "").strip()
+            m = node_key(s.get("backend"), s.get("model"))
             if not m:
                 continue
             if m not in seen:

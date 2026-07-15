@@ -24,9 +24,9 @@ use ratatui::{Frame, Terminal};
 use crate::game::{Game, GameId, Phase, RoleAssignment, SeatId, StChoiceMode, StartOpts};
 use crate::harness::action_log::{ActionKind, ActionLog, ActorLabel};
 use crate::harness::agents::{
-    agent_mcp_bin_ok, cycle_in_list, find_agent_mcp_bin, find_grok,
-    resolve_agent_mcp_bin_for_display, AgentConfig, AgentPool, AgentRole, HarnessConfig, LineKind,
-    LogLine,
+    agent_mcp_bin_ok, cycle_in_list, find_agent_mcp_bin, find_claude, find_grok,
+    load_claude_models, resolve_agent_mcp_bin_for_display, AgentConfig, AgentPool, AgentRole,
+    Backend, HarnessConfig, LineKind, LogLine,
 };
 use crate::harness::scheduler::{plan_ticks, wait_signature, SchedTarget};
 use crate::harness::socket::SocketServer;
@@ -49,12 +49,21 @@ enum FeedFilter {
     GameOnly,
 }
 
+/// One setup-screen session pick: which [`Backend`] runs the seat and on which model.
+/// A single struct (not parallel vectors) so backend and model can never desync, and
+/// the model is always kept within its backend's list.
+#[derive(Debug, Clone)]
+struct SeatChoice {
+    backend: Backend,
+    model: String,
+}
+
 struct App {
     focus: Focus,
     player_count: usize,
-    /// Per-session model picks: index 0 = Host, 1..=N = players P0..P{N-1}.
+    /// Per-session backend+model picks: index 0 = Host, 1..=N = players P0..P{N-1}.
     /// Kept in lockstep with `player_count` (+1 for the host row).
-    seat_models: Vec<String>,
+    seat_choices: Vec<SeatChoice>,
     /// Previewed role for each player seat (index i = P{i}), shown on the setup
     /// screen so models can be picked per role. Regenerated on count change and on
     /// reroll; passed to `start_game` as fixed assignments so the launched game
@@ -130,6 +139,7 @@ impl App {
         let work_root = PathBuf::from(format!("/tmp/botc-harness-{id}"));
         let mut cfg = HarnessConfig {
             grok_bin: find_grok(),
+            claude_bin: find_claude(),
             agent_mcp_bin: find_agent_mcp_bin(),
             work_root: work_root.clone(),
             socket_path: work_root.join("engine.sock"),
@@ -137,6 +147,8 @@ impl App {
         };
         // Populate the setup picker from `grok models` (CLI default becomes selected).
         let models_note = cfg.load_models_from_grok();
+        // Claude models are a curated static list (no `claude models` CLI).
+        cfg.claude_models = load_claude_models();
         let mcp_ok = agent_mcp_bin_ok(&cfg);
         let mcp_path = resolve_agent_mcp_bin_for_display(&cfg);
         let status = if mcp_ok {
@@ -155,8 +167,14 @@ impl App {
         let mut app = Self {
             focus: Focus::Setup,
             player_count,
-            // One pick per session (host + players), all starting on the CLI default.
-            seat_models: vec![cfg.model.clone(); player_count + 1],
+            // One pick per session (host + players), all starting grok on the CLI default.
+            seat_choices: vec![
+                SeatChoice {
+                    backend: Backend::Grok,
+                    model: cfg.model.clone(),
+                };
+                player_count + 1
+            ],
             setup_roles: Vec::new(),
             setup_row: 0,
             selected_agent: 0,
@@ -193,8 +211,13 @@ impl App {
             results_public_cursor: 0,
             results_terminal_logged: false,
         };
-        // Draw an initial role assignment so the setup screen shows roles immediately.
+        // Draw an initial role assignment so the setup screen shows roles immediately,
+        // then let the balancer pick which eligible models fill those roles — booting
+        // straight into a balanced table instead of N copies of the CLI default (which
+        // typically has no completed games and so balances nothing). No-op, leaving the
+        // default picks in place, when nothing is eligible yet.
         app.reroll_roles();
+        app.shuffle_models();
         app
     }
 
@@ -235,21 +258,99 @@ impl App {
                 )
             })
             .collect();
-        // Seat model lookup: `seat_models[0]` is the Host, players are `1..=N`.
-        let models: Vec<&str> = seats
+        // Seat identity lookup (`seat_choices[0]` is the Host, players are `1..=N`).
+        // Key by the composed node_key so balance history matches read_model_stats
+        // (grok stays bare; claude → "claude:<model>").
+        let node_keys: Vec<String> = seats
             .iter()
             .map(|id| {
-                self.seat_models
+                self.seat_choices
                     .get(id.0 as usize + 1)
-                    .map(String::as_str)
-                    .unwrap_or("")
+                    .map(|c| crate::harness::balance::node_key(c.backend.as_str(), &c.model))
+                    .unwrap_or_default()
             })
             .collect();
+        let models: Vec<&str> = node_keys.iter().map(String::as_str).collect();
         let stats =
             crate::harness::balance::read_model_stats(&crate::harness::results_log::log_path());
         let mut rng = rand::thread_rng();
         self.setup_roles =
             crate::harness::balance::balanced_assignment(&seats, &models, &bag, &stats, &mut rng);
+    }
+
+    /// The models the balancer may CHOOSE from: everything offered in the pickers
+    /// (grok's `grok models` + claude's curated list) that already has **≥1 completed
+    /// game**. A model with no valid games has no record to balance — pick it by hand
+    /// to give it a first game, after which it becomes eligible.
+    fn eligible_models(
+        &self,
+        stats: &std::collections::HashMap<String, crate::harness::balance::ModelStats>,
+    ) -> Vec<SeatChoice> {
+        let mut out = Vec::new();
+        for (backend, list) in [
+            (Backend::Grok, &self.cfg.available_models),
+            (Backend::Claude, &self.cfg.claude_models),
+        ] {
+            for m in list {
+                if stats.contains_key(&crate::harness::balance::node_key(backend.as_str(), m)) {
+                    out.push(SeatChoice {
+                        backend,
+                        model: m.clone(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Let the harness **choose which models play**, given the current roles, so the
+    /// eval corpus balances. It draws from [`Self::eligible_models`] — the *available*
+    /// models that have a valid (completed) game — rather than merely permuting your
+    /// picks, which would defeat the purpose. Having fewer eligible models than seats
+    /// is normal, so a model may take several seats. Counterpart to
+    /// [`Self::reroll_roles`] (`r`), which redraws the roles against whatever models
+    /// are currently seated. The Host has no role and is left untouched.
+    fn shuffle_models(&mut self) {
+        if self.setup_roles.len() != self.player_count
+            || self.seat_choices.len() < self.player_count + 1
+        {
+            self.status = "no role preview yet — press r first".into();
+            return;
+        }
+        let stats =
+            crate::harness::balance::read_model_stats(&crate::harness::results_log::log_path());
+        let pool = self.eligible_models(&stats);
+        if pool.is_empty() {
+            self.status =
+                "no available model has a completed game yet — pick models by hand to seed one"
+                    .into();
+            return;
+        }
+        let seat_chars: Vec<Character> =
+            self.setup_roles.iter().map(|a| a.true_character).collect();
+        let keys: Vec<String> = pool
+            .iter()
+            .map(|c| crate::harness::balance::node_key(c.backend.as_str(), &c.model))
+            .collect();
+        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let mut rng = rand::thread_rng();
+        let pick = crate::harness::balance::select_balanced_models(
+            &seat_chars,
+            &key_refs,
+            &stats,
+            &mut rng,
+        );
+        for (i, &ci) in pick.iter().enumerate() {
+            self.seat_choices[1 + i] = pool[ci].clone();
+        }
+        let used: std::collections::BTreeSet<&str> =
+            pick.iter().map(|&ci| pool[ci].model.as_str()).collect();
+        self.status = format!(
+            "balancer picked {}/{} eligible models: {}",
+            used.len(),
+            pool.len(),
+            used.into_iter().collect::<Vec<_>>().join(" · ")
+        );
     }
 
     fn selected_thinking_expanded(&self) -> bool {
@@ -335,8 +436,13 @@ impl App {
         if self.setup_row == 0 {
             let pc = self.player_count as i32 + delta;
             self.player_count = pc.clamp(5, 15) as usize;
-            self.seat_models
-                .resize(self.player_count + 1, self.cfg.model.clone());
+            self.seat_choices.resize(
+                self.player_count + 1,
+                SeatChoice {
+                    backend: Backend::Grok,
+                    model: self.cfg.model.clone(),
+                },
+            );
             // Roles are count-specific; redraw the assignment so the picker stays valid.
             self.reroll_roles();
             self.status = format!(
@@ -346,14 +452,24 @@ impl App {
             );
         } else {
             let idx = self.setup_row - 1;
-            let cur = self.seat_models[idx].clone();
-            self.seat_models[idx] = cycle_in_list(&cur, &self.cfg.available_models, delta);
+            let backend = self.seat_choices[idx].backend;
+            let cur = self.seat_choices[idx].model.clone();
+            // Cycle within the seat's *own* backend's model list.
+            let next = {
+                let list = self.cfg.models_for(backend);
+                cycle_in_list(&cur, list, delta)
+            };
+            self.seat_choices[idx].model = next;
             let who = if idx == 0 {
                 "Host".to_string()
             } else {
                 format!("P{}", idx - 1)
             };
-            self.status = format!("{who} model: {}  (a = apply to all)", self.seat_models[idx]);
+            self.status = format!(
+                "{who}: [{}] {}  (b = backend · a = apply to all)",
+                backend.as_str(),
+                self.seat_choices[idx].model
+            );
         }
     }
 
@@ -386,14 +502,40 @@ impl App {
                     self.status = "rerolled roles".into();
                 }
             }
-            // Apply the focused row's model to every session.
+            // Shuffle the picked models across seats, balanced against the CURRENT
+            // roles — the inverse of `r` (which redraws roles against current models).
+            KeyCode::Char('s') | KeyCode::Char('S') if self.focus == Focus::Setup => {
+                self.shuffle_models();
+            }
+            // Cycle the focused seat's backend (grok ↔ claude); snap model to that
+            // backend's default so the pick is always valid.
+            KeyCode::Char('b') | KeyCode::Char('B') if self.focus == Focus::Setup => {
+                if self.setup_row >= 1 {
+                    let idx = self.setup_row - 1;
+                    let nb = self.seat_choices[idx].backend.cycle(1);
+                    let model = self.cfg.default_model(nb);
+                    self.seat_choices[idx].backend = nb;
+                    self.seat_choices[idx].model = model;
+                    let who = if idx == 0 {
+                        "Host".to_string()
+                    } else {
+                        format!("P{}", idx - 1)
+                    };
+                    self.status = format!(
+                        "{who} backend: [{}] {}",
+                        nb.as_str(),
+                        self.seat_choices[idx].model
+                    );
+                }
+            }
+            // Apply the focused row's backend + model to every session.
             KeyCode::Char('a') if self.focus == Focus::Setup => {
                 if self.setup_row >= 1 {
-                    let m = self.seat_models[self.setup_row - 1].clone();
-                    for slot in self.seat_models.iter_mut() {
-                        *slot = m.clone();
+                    let src = self.seat_choices[self.setup_row - 1].clone();
+                    for slot in self.seat_choices.iter_mut() {
+                        *slot = src.clone();
                     }
-                    self.status = format!("model for ALL sessions: {m}");
+                    self.status = format!("ALL sessions: [{}] {}", src.backend.as_str(), src.model);
                 }
             }
             KeyCode::Enter if self.focus == Focus::Setup => self.launch(),
@@ -481,6 +623,40 @@ impl App {
                 p.display()
             );
             return;
+        }
+        // #69: a claude seat needs the claude binary + a model from the claude list.
+        if self
+            .seat_choices
+            .iter()
+            .any(|c| c.backend == Backend::Claude)
+        {
+            let bin = &self.cfg.claude_bin;
+            if !(bin.is_absolute() && bin.exists()) {
+                self.status = format!(
+                    "claude backend selected but `claude` was not found ({}). Install Claude Code or switch the seat to grok (b).",
+                    bin.display()
+                );
+                return;
+            }
+            if let Some((slot, c)) = self.seat_choices.iter().enumerate().find(|(_, c)| {
+                c.backend == Backend::Claude
+                    && !self
+                        .cfg
+                        .models_for(Backend::Claude)
+                        .iter()
+                        .any(|m| m == &c.model)
+            }) {
+                let who = if slot == 0 {
+                    "Host".to_string()
+                } else {
+                    format!("P{}", slot - 1)
+                };
+                self.status = format!(
+                    "{who}: claude model '{}' not in the claude list — re-pick with ←/→.",
+                    c.model
+                );
+                return;
+            }
         }
         // Refresh resolved path so workdir config gets an absolute sibling if possible.
         self.cfg.agent_mcp_bin = find_agent_mcp_bin();
@@ -577,22 +753,28 @@ impl App {
             created.player_tokens.len()
         );
 
-        // Per-session models from the setup picker (index 0 = host, 1+i = P{i}).
-        // Fall back to the default model if the picks are out of sync.
-        let model_for = |slot: usize| -> String {
-            self.seat_models
+        // Per-session backend+model from the setup picker (index 0 = host, 1+i = P{i}).
+        // Fall back to the default grok model if the picks are out of sync.
+        let choice_for = |slot: usize| -> SeatChoice {
+            self.seat_choices
                 .get(slot)
                 .cloned()
-                .unwrap_or_else(|| self.cfg.model.clone())
+                .unwrap_or_else(|| SeatChoice {
+                    backend: Backend::Grok,
+                    model: self.cfg.model.clone(),
+                })
         };
+        let host_choice = choice_for(0);
         let mut configs = vec![AgentConfig {
             role: AgentRole::Host,
             display_name: "Storyteller".into(),
             token: created.host_token.as_str().to_string(),
             game_id,
-            model: model_for(0),
+            model: host_choice.model,
+            backend: host_choice.backend,
         }];
         for (i, tok) in created.player_tokens.iter().enumerate() {
+            let c = choice_for(1 + i);
             configs.push(AgentConfig {
                 role: AgentRole::Player {
                     seat: SeatId(i as u8),
@@ -600,7 +782,8 @@ impl App {
                 display_name: self.player_names[i].clone(),
                 token: tok.as_str().to_string(),
                 game_id,
-                model: model_for(1 + i),
+                model: c.model,
+                backend: c.backend,
             });
         }
 
@@ -1604,7 +1787,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     let count_mark = if app.setup_row == 0 { "▶ " } else { "  " };
     lines.push(Line::from(Span::styled(
         format!(
-            "{count_mark}Players: {}    →  {} headless Grok sessions (host + players)",
+            "{count_mark}Players: {}    →  {} headless agent sessions (host + players)",
             app.player_count,
             app.player_count + 1
         ),
@@ -1618,7 +1801,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
 
     // One row per session: Host, P0, P1, … each showing seat · role · model.
     lines.push(Line::from(Span::styled(
-        "  Seat · role · model   (←/→ change model · a = apply to all · r = reroll roles)",
+        "  Seat · role · [backend] model   (←/→ model · b backend · a apply-all · r roles→models · s models→roles)",
         dim,
     )));
     for slot in 0..=app.player_count {
@@ -1628,12 +1811,13 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
         } else {
             format!("P{}", slot - 1)
         };
-        let model = app
-            .seat_models
+        let (backend, model) = app
+            .seat_choices
             .get(slot)
-            .cloned()
-            .unwrap_or_else(|| app.cfg.model.clone());
-        let known = app.cfg.available_models.iter().any(|m| m == &model);
+            .map(|c| (c.backend, c.model.clone()))
+            .unwrap_or((Backend::Grok, app.cfg.model.clone()));
+        let list = app.cfg.models_for(backend);
+        let known = list.iter().any(|m| m == &model);
         let mark = if app.setup_row == row { "▶ " } else { "  " };
         let mut spans = vec![Span::styled(
             format!("{mark}{who:<5} "),
@@ -1652,6 +1836,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
             ("—".to_string(), dim)
         };
         spans.push(Span::styled(format!("{role_text:<26}"), role_st));
+        spans.push(Span::styled(format!("[{}] ", backend.as_str()), dim));
         spans.push(Span::styled(
             model.clone(),
             if app.setup_row == row {
@@ -1660,20 +1845,32 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(actor_color(slot == 0, slot.checked_sub(1).map(|s| s as u8)))
             },
         ));
-        if !known && !app.cfg.available_models.is_empty() {
-            spans.push(Span::styled("  (not in `grok models`)", dim));
+        if !known && !list.is_empty() {
+            spans.push(Span::styled(
+                format!("  (not in {} models)", backend.as_str()),
+                dim,
+            ));
         }
         lines.push(Line::from(spans));
     }
 
     lines.push(Line::raw(""));
+    // Show the model list for the focused seat's backend (grok vs claude).
+    let focus_backend = app
+        .setup_row
+        .checked_sub(1)
+        .and_then(|i| app.seat_choices.get(i))
+        .map(|c| c.backend)
+        .unwrap_or(Backend::Grok);
+    let focus_models = app.cfg.models_for(focus_backend);
     lines.push(Line::from(Span::styled(
         format!(
-            "  Available models: {}",
-            if app.cfg.available_models.is_empty() {
-                "(could not read `grok models`)".to_string()
+            "  {} models: {}",
+            focus_backend.as_str(),
+            if focus_models.is_empty() {
+                "(none found)".to_string()
             } else {
-                app.cfg.available_models.join(" · ")
+                focus_models.join(" · ")
             }
         ),
         dim,
@@ -1682,6 +1879,10 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::raw(format!(
         "  Grok binary: {}",
         app.cfg.grok_bin.display()
+    )));
+    lines.push(Line::raw(format!(
+        "  Claude bin:  {}",
+        app.cfg.claude_bin.display()
     )));
     lines.push(Line::raw(format!(
         "  Agent MCP:   {}  ({mcp_note})",
@@ -1693,7 +1894,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     )));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "  Controls:  ↑/↓ focus row · ←/→ change (count / model) · a model→all · r reroll roles",
+        "  Controls:  ↑/↓ row · ←/→ change · b backend · a apply→all · r reroll roles (balance vs models) · s shuffle models (balance vs roles)",
         dim,
     )));
     lines.push(Line::from(Span::styled(
@@ -1702,7 +1903,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     )));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "  Each agent workdir gets .grok/config.toml → botc-agent-mcp (token-scoped)",
+        "  Each agent workdir gets a per-backend MCP config → botc-agent-mcp (token-scoped)",
         dim,
     )));
     lines.push(Line::from(Span::styled(

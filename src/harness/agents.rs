@@ -20,14 +20,46 @@ pub enum AgentRole {
     Player { seat: SeatId },
 }
 
+/// Which agent CLI runs a seat's turns. Per-seat (on [`AgentConfig`]) so a single
+/// game can mix grok and claude players (issue #69). `Grok` is the default so every
+/// existing construction site and corpus record keeps its current behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    #[default]
+    Grok,
+    Claude,
+}
+
+impl Backend {
+    /// Stable lowercase tag used in the results corpus and the setup UI.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Backend::Grok => "grok",
+            Backend::Claude => "claude",
+        }
+    }
+
+    /// Cycle to another backend by `delta` steps (setup picker; wraps both ways).
+    pub fn cycle(self, delta: i32) -> Self {
+        const N: i32 = 2;
+        match (self as i32 + delta).rem_euclid(N) {
+            0 => Backend::Grok,
+            _ => Backend::Claude,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub role: AgentRole,
     pub display_name: String,
     pub token: String,
     pub game_id: u64,
-    /// Model this agent's grok sessions run on (picked per seat in setup).
+    /// Model this agent's sessions run on (picked per seat in setup).
     pub model: String,
+    /// Which CLI backend runs this seat's turns; per-seat so one game can mix
+    /// grok and claude players (issue #69).
+    pub backend: Backend,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +73,13 @@ pub struct HarnessConfig {
     /// Models available in the setup pickers — filled from `grok models` at TUI start.
     pub available_models: Vec<String>,
     pub grok_bin: PathBuf,
+    /// Path to the `claude` (Claude Code) binary for claude-backed seats (issue #69).
+    pub claude_bin: PathBuf,
+    /// Claude models offered in the setup picker (curated — there is no `claude models`
+    /// subcommand). Filled at TUI start; the default is [`Self::claude_model`].
+    pub claude_models: Vec<String>,
+    /// Default claude model — the starting pick / fallback for a claude seat.
+    pub claude_model: String,
     pub agent_mcp_bin: PathBuf,
     pub work_root: PathBuf,
     pub socket_path: PathBuf,
@@ -66,6 +105,11 @@ impl Default for HarnessConfig {
             model: "grok-build".into(),
             available_models: Vec::new(),
             grok_bin: PathBuf::from("grok"),
+            // Kept PURE — App::new discovers the real binary / model list at TUI start
+            // (mirrors grok's available_models staying empty here).
+            claude_bin: PathBuf::from("claude"),
+            claude_models: Vec::new(),
+            claude_model: "claude-opus-4-8".into(),
             agent_mcp_bin: PathBuf::from("botc-agent-mcp"),
             work_root: PathBuf::from("/tmp/botc-harness"),
             socket_path: PathBuf::from("/tmp/botc-harness/engine.sock"),
@@ -99,6 +143,53 @@ impl Default for HarnessConfig {
             no_memory: true,
         }
     }
+}
+
+impl HarnessConfig {
+    /// Models offered in the setup picker for `backend`.
+    pub fn models_for(&self, backend: Backend) -> &[String] {
+        match backend {
+            Backend::Grok => &self.available_models,
+            Backend::Claude => &self.claude_models,
+        }
+    }
+
+    /// Default model for `backend` — the pick a seat snaps to when its backend changes.
+    pub fn default_model(&self, backend: Backend) -> String {
+        match backend {
+            Backend::Grok => self.model.clone(),
+            Backend::Claude => self.claude_model.clone(),
+        }
+    }
+}
+
+/// Locate the `claude` (Claude Code) binary: `$PATH`, then `~/.local/bin/claude`,
+/// else the bare name (spawn will surface a clear error if truly absent).
+pub fn find_claude() -> PathBuf {
+    if let Ok(p) = which("claude") {
+        return p;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let p = Path::new(&home).join(".local/bin/claude");
+        if p.exists() {
+            return p;
+        }
+    }
+    PathBuf::from("claude")
+}
+
+/// Curated Claude model ids for the setup picker (there is no `claude models` CLI).
+/// Full ids only — the bare id is what lands in the corpus, so it must be stable and
+/// never the `opus`/`sonnet` alias. The first entry is the default.
+pub fn load_claude_models() -> Vec<String> {
+    [
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "claude-haiku-4-5-20251001",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// Parse the human-readable output of `grok models`.
@@ -344,6 +435,10 @@ impl ChildSlot {
 pub struct TickUsage {
     pub input_tokens: u64,
     pub cache_read_input_tokens: u64,
+    /// Claude cache-*write* tokens (`cache_creation_input_tokens`). Grok has no such
+    /// field and leaves this 0; for Claude it routinely dwarfs every other bucket, so
+    /// it is load-bearing for `total_tokens` — omitting it under-counts spend hugely.
+    pub cache_creation_input_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
     /// Full prompt+output including cache (per Grok headless docs).
@@ -355,6 +450,7 @@ impl TickUsage {
     pub fn accumulate(&mut self, other: &TickUsage) {
         self.input_tokens += other.input_tokens;
         self.cache_read_input_tokens += other.cache_read_input_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
         self.output_tokens += other.output_tokens;
         self.reasoning_tokens += other.reasoning_tokens;
         self.total_tokens += other.total_tokens;
@@ -368,13 +464,16 @@ impl TickUsage {
     }
 }
 
-/// Context window fill from session `signals.json` (post-tick).
+/// Context window fill (grok: session `signals.json`; claude: result `modelUsage`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextWindow {
     pub tokens_used: u64,
     pub window_tokens: u64,
-    /// Integer percent from Grok (`contextWindowUsage`), 0–100.
+    /// Integer percent, 0–100.
     pub usage_pct: u32,
+    /// How this reading was derived, so consumers don't average unlike quantities:
+    /// `"grok_signals"` (cumulative fill) vs `"claude_modelusage"` (per-request est.).
+    pub source: &'static str,
 }
 
 impl ContextWindow {
@@ -477,6 +576,8 @@ pub fn parse_tick_usage(v: &Value) -> Option<TickUsage> {
     Some(TickUsage {
         input_tokens: input,
         cache_read_input_tokens: cache,
+        // Grok folds cache writes into total_tokens already; no separate field.
+        cache_creation_input_tokens: 0,
         output_tokens: output,
         reasoning_tokens: reasoning,
         total_tokens: total,
@@ -527,6 +628,7 @@ pub fn read_session_context(workdir: &Path, session_id: &str) -> Option<ContextW
         tokens_used,
         window_tokens,
         usage_pct,
+        source: "grok_signals",
     })
 }
 
@@ -589,8 +691,16 @@ impl AgentPool {
                 AgentRole::Player { seat } => format!("seat{}", seat.0),
             };
             let workdir = cfg.work_root.join(&label);
-            fs::create_dir_all(workdir.join(".grok"))?;
-            write_agent_mcp_config(&workdir, cfg, &a.token, a.game_id, a.role)?;
+            match a.backend {
+                Backend::Grok => {
+                    fs::create_dir_all(workdir.join(".grok"))?;
+                    write_agent_mcp_config(&workdir, cfg, &a.token, a.game_id, a.role)?;
+                }
+                Backend::Claude => {
+                    fs::create_dir_all(workdir.join(".claude"))?;
+                    write_claude_mcp_config(&workdir, cfg, &a.token, a.game_id, a.role)?;
+                }
+            }
             let session_id = uuid::Uuid::new_v4().to_string();
             live.push(LiveAgent {
                 config: a,
@@ -625,7 +735,7 @@ impl AgentPool {
                     n_players,
                 ),
             };
-            match spawn_grok_tick(&self.cfg, agent, &prompt) {
+            match spawn_tick(&self.cfg, agent, &prompt) {
                 Ok(TickOutcome::Spawned) => n += 1,
                 Ok(TickOutcome::SkippedStillRunning) => {}
                 Err(e) => last_err = Some(e),
@@ -655,7 +765,7 @@ impl AgentPool {
                     public_summary,
                 ),
             };
-            match spawn_grok_tick(&self.cfg, agent, &prompt) {
+            match spawn_tick(&self.cfg, agent, &prompt) {
                 Ok(TickOutcome::Spawned) => n += 1,
                 Ok(TickOutcome::SkippedStillRunning) => {}
                 Err(e) => last_err = Some(e),
@@ -710,7 +820,7 @@ impl AgentPool {
                     )
                 }
             };
-            match spawn_grok_tick(&self.cfg, &mut self.agents[idx], &prompt) {
+            match spawn_tick(&self.cfg, &mut self.agents[idx], &prompt) {
                 Ok(TickOutcome::Spawned) => n += 1,
                 Ok(TickOutcome::SkippedStillRunning) => {}
                 Err(e) => last_err = Some(e),
@@ -847,6 +957,197 @@ fn copy_grok_auth(workdir: &Path) {
     }
 }
 
+// ---- Claude Code backend spawn plumbing (issue #69) ----
+
+/// Build the `claude` argv (flags only — the prompt is fed on **stdin**, avoiding
+/// arg-length limits and the variadic `--tools` swallowing it) for one headless tick.
+/// Pure + unit-tested. Corrected against `claude --help` v2.1.209: `--tools ""` disables
+/// ALL built-in tools (only the botc MCP tools remain); `--strict-mcp-config` +
+/// `--mcp-config` load ONLY our server.
+///
+/// ACCEPTED ASYMMETRY (#69): claude has no `--max-turns` flag, so unlike grok
+/// (`--max-turns 12`) a claude tick is not turn-capped — it self-terminates when done.
+/// In practice both backends make a handful of tool calls per tick, so grok's cap
+/// rarely bites; equalizing would need `--max-budget-usd` (declined) so this stands.
+pub fn build_claude_tick_args(
+    model: &str,
+    workdir: &Path,
+    session_id: &str,
+    session_started: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "-p".into(),
+        "--model".into(),
+        model.to_string(),
+        "--output-format".into(),
+        "stream-json".into(),
+        // Required alongside -p + stream-json, else claude refuses to stream events.
+        "--verbose".into(),
+        "--permission-mode".into(),
+        "bypassPermissions".into(),
+        // Keep ONLY `ToolSearch` from the built-in set — the meta-tool claude uses to
+        // discover/load the (deferred) botc MCP tools, analogous to grok's search_tool.
+        // Every file/shell/web built-in is dropped (confinement), but `--tools ""` would
+        // ALSO drop ToolSearch, leaving the MCP tools unreachable — the model then can't
+        // call them and fakes `<function_calls>` text instead.
+        "--tools".into(),
+        "ToolSearch".into(),
+        "--mcp-config".into(),
+        workdir.join(".mcp.json").display().to_string(),
+        "--strict-mcp-config".into(),
+        "--add-dir".into(),
+        workdir.display().to_string(),
+    ];
+    if session_started {
+        args.push("--resume".into());
+    } else {
+        args.push("--session-id".into());
+    }
+    args.push(session_id.to_string());
+    args
+}
+
+/// Isolate a claude child from the operator's global config/creds AND from the fact
+/// that the harness itself runs inside claude-code. HOME redirects `~/.claude.json`,
+/// `~/.claude`, `~/.cursor`; `CLAUDE_CONFIG_DIR` (which outranks HOME) is pinned to the
+/// isolated dir; inherited nested-session / egress-redirect vars are scrubbed so the
+/// child is a clean top-level session on the operator's own account.
+fn claude_env(cmd: &mut Command, iso_home: &Path) {
+    cmd.env("HOME", iso_home)
+        .env("CLAUDE_CONFIG_DIR", iso_home.join(".claude"))
+        .env_remove("XDG_CONFIG_HOME");
+    for var in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_EXECPATH",
+        "CLAUDE_AGENT_SDK_VERSION",
+        "CLAUDE_EFFORT",
+        "AI_AGENT",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+    ] {
+        cmd.env_remove(var);
+    }
+}
+
+/// Configure the `claude` [`Command`] for one tick (argv + isolated env + piped
+/// stdio). stdin is piped so the caller can feed the prompt; the argv carries no
+/// prompt, so the debug log (argv + prompt_first_line) leaks nothing.
+fn configure_claude_command(
+    cfg: &HarnessConfig,
+    agent: &LiveAgent,
+    label: &str,
+    prompt: &str,
+    session_id: &str,
+    session_started: bool,
+) -> Command {
+    let args = build_claude_tick_args(
+        &agent.config.model,
+        &agent.workdir,
+        session_id,
+        session_started,
+    );
+    crate::dlog!(
+        "SPAWN {label} backend=claude model={} mode={} session={} prompt_first_line={:?} argv=[{}]",
+        agent.config.model,
+        if session_started { "resume" } else { "fresh" },
+        session_id,
+        prompt.lines().next().unwrap_or(""),
+        args.join(" ")
+    );
+    let iso_home = agent
+        .workdir
+        .canonicalize()
+        .unwrap_or_else(|_| agent.workdir.clone());
+    let mut cmd = Command::new(&cfg.claude_bin);
+    cmd.args(&args);
+    claude_env(&mut cmd, &iso_home);
+    // Symmetry with grok's `--cwd workdir` + `--no-memory`: pin the child's working
+    // dir to the clean isolated workdir (which has no CLAUDE.md / .claude/settings.json)
+    // so claude discovers NO project memory or settings from wherever botc-tui was
+    // launched — matching grok's context confinement (and closing an isolation gap).
+    cmd.current_dir(&iso_home);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+/// Write a claude seat's per-game `.mcp.json` (only the botc stdio server) + its
+/// `agent.token`. `--strict-mcp-config` then ensures no global `~/.claude.json`
+/// servers load. Reuses the same `botc-agent-mcp` proxy invocation as grok.
+fn write_claude_mcp_config(
+    workdir: &Path,
+    cfg: &HarnessConfig,
+    token: &str,
+    game_id: u64,
+    role: AgentRole,
+) -> std::io::Result<()> {
+    let mcp_bin = resolve_agent_mcp_bin(cfg);
+    let token_path = workdir.join("agent.token");
+    fs::write(&token_path, token)?;
+    let role_s = match role {
+        AgentRole::Host => "host",
+        AgentRole::Player { .. } => "player",
+    };
+    let config = serde_json::json!({
+        "mcpServers": {
+            "botc": {
+                "type": "stdio",
+                "command": mcp_bin.display().to_string(),
+                "args": [
+                    "--socket", cfg.socket_path.display().to_string(),
+                    "--token-file", token_path.display().to_string(),
+                    "--game-id", game_id.to_string(),
+                    "--role", role_s,
+                ],
+                "env": {},
+            }
+        }
+    });
+    fs::write(
+        workdir.join(".mcp.json"),
+        serde_json::to_string_pretty(&config).unwrap_or_default(),
+    )?;
+    seed_claude_auth(workdir);
+    Ok(())
+}
+
+/// Seed the claude child's isolated config dir with the operator's subscription
+/// credential so a headless session authenticates after HOME/CLAUDE_CONFIG_DIR are
+/// redirected. No-op when `ANTHROPIC_API_KEY` is set (that path needs no on-disk
+/// secret). Best-effort, mode 0600, under the work root (removed on quit).
+fn seed_claude_auth(workdir: &Path) {
+    if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        crate::dlog!("CLAUDE AUTH copy skipped: no HOME in harness env");
+        return;
+    };
+    let src = PathBuf::from(home).join(".claude/.credentials.json");
+    let dst_dir = workdir.join(".claude");
+    let _ = fs::create_dir_all(&dst_dir);
+    let dst = dst_dir.join(".credentials.json");
+    if let Err(e) = fs::copy(&src, &dst) {
+        crate::dlog!(
+            "CLAUDE AUTH copy {} -> {} failed: {e}",
+            src.display(),
+            dst.display()
+        );
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o600));
+    }
+}
+
 fn resolve_agent_mcp_bin(cfg: &HarnessConfig) -> PathBuf {
     if cfg.agent_mcp_bin.is_absolute() && cfg.agent_mcp_bin.exists() {
         return cfg.agent_mcp_bin.clone();
@@ -916,12 +1217,38 @@ pub fn build_grok_tick_args(
     args
 }
 
-fn spawn_grok_tick(
+/// Per-backend stream-line dispatch (grok arm = the original grok parsers).
+fn establishes_session_for(backend: Backend, line: &str) -> bool {
+    match backend {
+        Backend::Grok => stream_line_establishes_session(line),
+        Backend::Claude => stream_line_establishes_session_claude(line),
+    }
+}
+
+fn parse_usage_for(backend: Backend, line: &str) -> Option<TickUsage> {
+    match backend {
+        Backend::Grok => parse_stream_line_usage(line),
+        Backend::Claude => parse_claude_stream_line_usage(line),
+    }
+}
+
+fn apply_event_for(backend: Backend, log: &Mutex<Vec<LogLine>>, line: &str) {
+    match backend {
+        Backend::Grok => apply_stream_event(log, line),
+        Backend::Claude => apply_claude_stream_event(log, line),
+    }
+}
+
+/// The single spawn seam: launch one headless tick for the seat's [`Backend`]. The
+/// running-gate, stream reader, and session/exit waiter are shared; only the command
+/// (binary + argv + env + stdin) and the per-format stream parsers differ per backend.
+fn spawn_tick(
     cfg: &HarnessConfig,
     agent: &mut LiveAgent,
     prompt: &str,
 ) -> std::io::Result<TickOutcome> {
     let label = agent_label(&agent.config.role);
+    let backend = agent.config.backend;
     if *agent.running.lock().unwrap() {
         crate::dlog!("SPAWN {label} SKIPPED (previous tick still running)");
         return Ok(TickOutcome::SkippedStillRunning);
@@ -933,44 +1260,57 @@ fn spawn_grok_tick(
     let session_started = *agent.session_started.lock().unwrap();
     let session_id = agent.session_id.lock().unwrap().clone();
 
-    let args = build_grok_tick_args(
-        cfg,
-        &agent.config.model,
-        &agent.workdir,
-        &prompt_file,
-        &session_id,
-        session_started,
-    );
-    crate::dlog!(
-        "SPAWN {label} model={} mode={} session={} prompt_first_line={:?} argv=[{}]",
-        agent.config.model,
-        if session_started { "resume" } else { "fresh" },
-        session_id,
-        prompt.lines().next().unwrap_or(""),
-        args.join(" ")
-    );
+    let bin = match backend {
+        Backend::Grok => cfg.grok_bin.clone(),
+        Backend::Claude => cfg.claude_bin.clone(),
+    };
+    let mut cmd = match backend {
+        Backend::Grok => {
+            let args = build_grok_tick_args(
+                cfg,
+                &agent.config.model,
+                &agent.workdir,
+                &prompt_file,
+                &session_id,
+                session_started,
+            );
+            crate::dlog!(
+                "SPAWN {label} model={} mode={} session={} prompt_first_line={:?} argv=[{}]",
+                agent.config.model,
+                if session_started { "resume" } else { "fresh" },
+                session_id,
+                prompt.lines().next().unwrap_or(""),
+                args.join(" ")
+            );
 
-    // Redirect the agent's grok config/auth/session dir to its workdir so it loads
-    // ONLY the per-game botc config written by `write_agent_mcp_config` — never the
-    // user's global ~/.grok/config.toml (github + PAT) or ~/.cursor/mcp.json
-    // (pyre-tracer). `--no-memory` does NOT exclude global MCP servers.
-    //   - HOME redirects the default config dir and ~/.cursor.
-    //   - GROK_HOME takes PRECEDENCE over HOME for grok's own config dir, so set it
-    //     explicitly to the isolated `.grok` — an inherited GROK_HOME (relocated
-    //     grok dirs, CI) would otherwise outrank HOME and re-leak the global config.
-    // Canonicalized to match grok's session-dir encoding (`grok_session_signals_path`).
-    let iso_home = agent
-        .workdir
-        .canonicalize()
-        .unwrap_or_else(|_| agent.workdir.clone());
-    let grok_dir = iso_home.join(".grok");
-    let mut cmd = Command::new(&cfg.grok_bin);
-    cmd.args(&args)
-        .env("HOME", &iso_home)
-        .env("GROK_HOME", &grok_dir)
-        .env_remove("XDG_CONFIG_HOME")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+            // Redirect the agent's grok config/auth/session dir to its workdir so it
+            // loads ONLY the per-game botc config written by `write_agent_mcp_config`
+            // — never the user's global ~/.grok/config.toml (github + PAT) or
+            // ~/.cursor/mcp.json (pyre-tracer). `--no-memory` does NOT exclude global
+            // MCP servers.
+            //   - HOME redirects the default config dir and ~/.cursor.
+            //   - GROK_HOME takes PRECEDENCE over HOME for grok's own config dir, so
+            //     set it explicitly to the isolated `.grok` — an inherited GROK_HOME
+            //     (relocated grok dirs, CI) would otherwise outrank HOME and re-leak.
+            // Canonicalized to match grok's session-dir encoding.
+            let iso_home = agent
+                .workdir
+                .canonicalize()
+                .unwrap_or_else(|_| agent.workdir.clone());
+            let grok_dir = iso_home.join(".grok");
+            let mut cmd = Command::new(&cfg.grok_bin);
+            cmd.args(&args)
+                .env("HOME", &iso_home)
+                .env("GROK_HOME", &grok_dir)
+                .env_remove("XDG_CONFIG_HOME")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            cmd
+        }
+        Backend::Claude => {
+            configure_claude_command(cfg, agent, &label, prompt, &session_id, session_started)
+        }
+    };
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -979,7 +1319,7 @@ fn spawn_grok_tick(
             push_full_line(
                 &mut g,
                 LineKind::System,
-                format!("ERROR failed to spawn {}: {e}", cfg.grok_bin.display()),
+                format!("ERROR failed to spawn {}: {e}", bin.display()),
             );
             return Err(e);
         }
@@ -1009,12 +1349,21 @@ fn spawn_grok_tick(
             let reader = std::io::BufReader::new(stdout);
             // Process each streaming-json event as it arrives → live display + usage.
             for line in reader.lines().map_while(Result::ok) {
-                if stream_line_establishes_session(&line) {
+                if establishes_session_for(backend, &line) {
                     established.store(true, Ordering::SeqCst);
                 }
-                if let Some(tick) = parse_stream_line_usage(&line) {
+                if let Some(tick) = parse_usage_for(backend, &line) {
                     let mut u = usage_slot.lock().unwrap();
                     u.record_tick(tick.clone());
+                    // Claude reports context in-stream (result.modelUsage); grok reads
+                    // signals.json post-exit in the waiter below. No-op for grok.
+                    if backend == Backend::Claude {
+                        if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                            if let Some(ctx) = claude_context_from_result(&v, &model) {
+                                u.context = Some(ctx);
+                            }
+                        }
+                    }
                     crate::dlog!(
                         "USAGE {agent_role_label} tick_total={} Σ={} turns={:?}",
                         tick.total_tokens,
@@ -1026,13 +1375,14 @@ fn spawn_grok_tick(
                         game_id,
                         &agent_role_label,
                         &model,
+                        backend.as_str(),
                         &tick,
                         u.context.as_ref(),
                         &u.game_total,
                         u.ticks_with_usage,
                     );
                 }
-                apply_stream_event(&log, &line);
+                apply_event_for(backend, &log, &line);
             }
         });
     }
@@ -1046,6 +1396,17 @@ fn spawn_grok_tick(
                 push_full_line(&mut g, LineKind::Stderr, line);
             }
         });
+    }
+
+    // Claude reads its prompt from stdin (avoids arg-length limits and the variadic
+    // --tools swallowing a trailing positional). The stdout reader thread above is
+    // already draining, so this write cannot deadlock even for a large prompt.
+    if backend == Backend::Claude {
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(prompt.as_bytes());
+            // Dropping stdin closes it → claude stops waiting and runs the turn.
+        }
     }
 
     child_slot.store(child);
@@ -1064,16 +1425,19 @@ fn spawn_grok_tick(
             }
             thread::sleep(Duration::from_millis(10));
         }
-        // Context window: read signals.json after the process exits (file is final).
-        let sid = session_id_for_ctx.lock().unwrap().clone();
-        if let Some(ctx) = read_session_context(&workdir, &sid) {
-            usage_slot_w.lock().unwrap().context = Some(ctx.clone());
-            crate::dlog!(
-                "CTX {exit_label} {}% used={} window={}",
-                ctx.usage_pct,
-                ctx.tokens_used,
-                ctx.window_tokens
-            );
+        // Context window: grok reads signals.json after exit (file is final); claude
+        // already set context in-stream from result.modelUsage.
+        if backend == Backend::Grok {
+            let sid = session_id_for_ctx.lock().unwrap().clone();
+            if let Some(ctx) = read_session_context(&workdir, &sid) {
+                usage_slot_w.lock().unwrap().context = Some(ctx.clone());
+                crate::dlog!(
+                    "CTX {exit_label} {}% used={} window={}",
+                    ctx.usage_pct,
+                    ctx.tokens_used,
+                    ctx.window_tokens
+                );
+            }
         }
         let established = session_established.load(Ordering::SeqCst);
         let was_started = *session_started_flag.lock().unwrap();
@@ -1252,6 +1616,157 @@ pub fn apply_stream_event(log: &Mutex<Vec<LogLine>>, line: &str) {
     }
 }
 
+// ---- Claude Code stream-json parsers (issue #69) ----
+//
+// `claude --print --output-format stream-json` emits one JSON object per line. Only
+// the terminal `type:"result"` line carries authoritative usage; `assistant` lines
+// repeat a partial `message.usage`, so counting them would multi-count. Verified
+// against the committed fixtures in `testdata/claude_stream_*.jsonl`.
+
+/// Sum Claude's four disjoint prompt/output token buckets into a [`TickUsage`].
+/// `cache_creation_input_tokens` is included and load-bearing — it can be orders of
+/// magnitude larger than the rest. Claude has no `total_tokens`, so it is always
+/// reconstructed here.
+fn claude_usage(usage: &Value) -> TickUsage {
+    let f = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let input = f("input_tokens");
+    let cache_read = f("cache_read_input_tokens");
+    let cache_creation = f("cache_creation_input_tokens");
+    let output = f("output_tokens");
+    TickUsage {
+        input_tokens: input,
+        cache_read_input_tokens: cache_read,
+        cache_creation_input_tokens: cache_creation,
+        output_tokens: output,
+        reasoning_tokens: 0,
+        total_tokens: input
+            .saturating_add(cache_read)
+            .saturating_add(cache_creation)
+            .saturating_add(output),
+        num_turns: None,
+    }
+}
+
+/// Usage from an already-parsed Claude line — only the terminal `type:"result"`.
+fn claude_result_usage(v: &Value) -> Option<TickUsage> {
+    if v.get("type").and_then(Value::as_str) != Some("result") {
+        return None;
+    }
+    let mut tick = claude_usage(v.get("usage")?);
+    if tick.total_tokens == 0 && tick.input_tokens == 0 && tick.output_tokens == 0 {
+        return None;
+    }
+    tick.num_turns = v.get("num_turns").and_then(Value::as_u64).map(|n| n as u32);
+    Some(tick)
+}
+
+/// Usage for one Claude tick from a stream-json line. Returns `Some` **only** for the
+/// terminal `result` event; `assistant` lines carry a duplicate `message.usage` and
+/// must return `None` so the spend is not multi-counted.
+pub fn parse_claude_stream_line_usage(line: &str) -> Option<TickUsage> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line).ok()?;
+    claude_result_usage(&v)
+}
+
+/// A Claude session is resumable once its terminal `type:"result"` line lands
+/// (mirrors grok's `end`/`max_turns_reached`). The first `system`/`init` line is too
+/// eager — marking the session resumable mid-tick would wedge `--resume` on a kill.
+pub fn stream_line_establishes_session_claude(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+    v.get("type").and_then(|t| t.as_str()) == Some("result")
+}
+
+/// Context-window fill for a Claude tick, from the `result` line's `modelUsage`,
+/// keyed by the configured model id (Claude may title the entry `<model>[1m]`). The
+/// window fill is prompt-side tokens (input + cache read + cache write); output does
+/// not occupy the window. Tagged `claude_modelusage` (a per-request estimate, unlike
+/// grok's cumulative `signals.json`).
+pub fn claude_context_from_result(v: &Value, model: &str) -> Option<ContextWindow> {
+    let mu = v.get("modelUsage")?.as_object()?;
+    let entry = mu
+        .iter()
+        .find(|(k, _)| k.as_str() == model || k.trim_end_matches("[1m]") == model)
+        .map(|(_, val)| val)?;
+    let g = |k: &str| entry.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let window_tokens = g("contextWindow");
+    let tokens_used = g("inputTokens")
+        .saturating_add(g("cacheReadInputTokens"))
+        .saturating_add(g("cacheCreationInputTokens"));
+    if tokens_used == 0 && window_tokens == 0 {
+        return None;
+    }
+    let usage_pct = if window_tokens > 0 {
+        (tokens_used.saturating_mul(100) / window_tokens) as u32
+    } else {
+        0
+    };
+    Some(ContextWindow {
+        tokens_used,
+        window_tokens,
+        usage_pct,
+        source: "claude_modelusage",
+    })
+}
+
+/// Parse one Claude `stream-json` line and append it to `log` live: walks the
+/// assistant message content blocks (text / thinking / tool_use) and surfaces the
+/// `result` as a turn-end note. `system`/`rate_limit_event`/`user` chatter is ignored.
+pub fn apply_claude_stream_event(log: &Mutex<Vec<LogLine>>, line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    let mut guard = log.lock().unwrap();
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        push_full_line(&mut guard, LineKind::Text, line.to_string());
+        return;
+    };
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("assistant") => {
+            let content = v
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array());
+            for block in content.into_iter().flatten() {
+                match block.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => append_chunk(
+                        &mut guard,
+                        LineKind::Text,
+                        block.get("text").and_then(|x| x.as_str()).unwrap_or(""),
+                    ),
+                    Some("thinking") => append_chunk(
+                        &mut guard,
+                        LineKind::Thought,
+                        block.get("thinking").and_then(|x| x.as_str()).unwrap_or(""),
+                    ),
+                    Some("tool_use") => {
+                        let name = block.get("name").and_then(|x| x.as_str()).unwrap_or("tool");
+                        push_full_line(&mut guard, LineKind::System, format!("· tool: {name}"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some("result") => {
+            let note = claude_result_usage(&v)
+                .map(|u| format!("— turn end · {} tok —", format_token_count(u.total_tokens)))
+                .unwrap_or_else(|| "— turn end —".into());
+            push_full_line(&mut guard, LineKind::System, note);
+        }
+        _ => {}
+    }
+}
+
 /// Best-effort: resolve grok binary.
 pub fn find_grok() -> PathBuf {
     if let Ok(p) = which("grok") {
@@ -1310,6 +1825,219 @@ pub fn sleep_ms(ms: u64) {
 mod tests {
     use super::*;
 
+    // ---- Claude stream-json parsers (issue #69), against the committed fixture ----
+
+    const CLAUDE_SUCCESS: &str = include_str!("testdata/claude_stream_success.jsonl");
+
+    fn claude_lines() -> Vec<&'static str> {
+        CLAUDE_SUCCESS
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .collect()
+    }
+
+    fn claude_first_of_type(ty: &str) -> &'static str {
+        claude_lines()
+            .into_iter()
+            .find(|l| {
+                serde_json::from_str::<Value>(l)
+                    .ok()
+                    .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+                    .as_deref()
+                    == Some(ty)
+            })
+            .unwrap_or_else(|| panic!("no {ty} line in fixture"))
+    }
+
+    #[test]
+    fn claude_usage_only_from_result_line() {
+        let u = parse_claude_stream_line_usage(claude_first_of_type("result"))
+            .expect("result line carries usage");
+        // input 10 + cache_read 0 + cache_creation 6894 + output 45 = 6949.
+        assert_eq!(
+            u.cache_creation_input_tokens, 6894,
+            "cache_creation captured"
+        );
+        assert_eq!(
+            u.total_tokens,
+            u.input_tokens
+                + u.cache_read_input_tokens
+                + u.cache_creation_input_tokens
+                + u.output_tokens
+        );
+        assert!(
+            u.total_tokens > u.input_tokens + u.output_tokens,
+            "cache_creation dominates the total ({})",
+            u.total_tokens
+        );
+        assert_eq!(u.reasoning_tokens, 0);
+        assert_eq!(u.num_turns, Some(1));
+        // assistant lines repeat message.usage — must NOT be counted.
+        assert!(parse_claude_stream_line_usage(claude_first_of_type("assistant")).is_none());
+        assert!(parse_claude_stream_line_usage(claude_first_of_type("system")).is_none());
+    }
+
+    #[test]
+    fn claude_session_established_only_on_result() {
+        assert!(stream_line_establishes_session_claude(
+            claude_first_of_type("result")
+        ));
+        // system/init, system/thinking_tokens, assistant, rate_limit_event: not terminal.
+        assert!(!stream_line_establishes_session_claude(
+            claude_first_of_type("system")
+        ));
+        assert!(!stream_line_establishes_session_claude(
+            claude_first_of_type("assistant")
+        ));
+        assert!(!stream_line_establishes_session_claude(
+            claude_first_of_type("rate_limit_event")
+        ));
+        assert!(!stream_line_establishes_session_claude("not json"));
+        assert!(!stream_line_establishes_session_claude(""));
+    }
+
+    #[test]
+    fn claude_context_matches_model_and_folds_1m() {
+        let result: Value = serde_json::from_str(claude_first_of_type("result")).unwrap();
+        let ctx = claude_context_from_result(&result, "claude-haiku-4-5-20251001").expect("ctx");
+        assert_eq!(ctx.window_tokens, 200_000);
+        assert_eq!(ctx.source, "claude_modelusage");
+        // inputTokens 537 + cacheRead 0 + cacheCreation 6894.
+        assert_eq!(ctx.tokens_used, 537 + 6894);
+        assert_eq!(ctx.usage_pct, ((537 + 6894) * 100 / 200_000) as u32);
+        // A different configured model must not match.
+        assert!(claude_context_from_result(&result, "claude-opus-4-8").is_none());
+        // [1m] fold: the modelUsage key carries the 1M-window marker; the config id doesn't.
+        let folded = serde_json::json!({
+            "type": "result",
+            "modelUsage": { "claude-opus-4-8[1m]": {
+                "inputTokens": 100, "cacheReadInputTokens": 0,
+                "cacheCreationInputTokens": 0, "contextWindow": 1_000_000
+            }}
+        });
+        let c = claude_context_from_result(&folded, "claude-opus-4-8").expect("folded match");
+        assert_eq!(c.window_tokens, 1_000_000);
+        assert_eq!(c.tokens_used, 100);
+    }
+
+    #[test]
+    fn claude_apply_event_renders_text_thinking_result() {
+        let log = Mutex::new(Vec::new());
+        for l in claude_lines() {
+            apply_claude_stream_event(&log, l);
+        }
+        let g = log.lock().unwrap();
+        assert!(
+            g.iter()
+                .any(|l| l.kind == LineKind::Text && l.text.contains("ok")),
+            "assistant text is rendered"
+        );
+        assert!(
+            g.iter().any(|l| l.kind == LineKind::Thought),
+            "thinking is rendered"
+        );
+        assert!(
+            g.iter()
+                .any(|l| l.kind == LineKind::System && l.text.contains("turn end")),
+            "result becomes a turn-end note"
+        );
+    }
+
+    #[test]
+    fn grok_usage_leaves_cache_creation_zero() {
+        let grok =
+            r#"{"type":"end","usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150}}"#;
+        let u = parse_stream_line_usage(grok).unwrap();
+        assert_eq!(u.cache_creation_input_tokens, 0);
+        assert_eq!(u.total_tokens, 150);
+    }
+
+    #[test]
+    fn claude_argv_has_required_flags_and_no_grok_flags() {
+        let wd = Path::new("/tmp/wd");
+        let has_pair =
+            |v: &[String], a: &str, b: &str| v.windows(2).any(|w| w[0] == a && w[1] == b);
+        let fresh = build_claude_tick_args("claude-opus-4-8", wd, "sid-123", false);
+        assert!(fresh.contains(&"-p".to_string()));
+        assert!(has_pair(&fresh, "--output-format", "stream-json"));
+        assert!(fresh.contains(&"--verbose".to_string()));
+        assert!(has_pair(&fresh, "--permission-mode", "bypassPermissions"));
+        assert!(has_pair(&fresh, "--model", "claude-opus-4-8"));
+        assert!(fresh.contains(&"--strict-mcp-config".to_string()));
+        assert!(fresh
+            .windows(2)
+            .any(|w| w[0] == "--mcp-config" && w[1].ends_with(".mcp.json")));
+        // `--tools ToolSearch` — only the MCP-discovery meta-tool survives (no
+        // file/shell/web built-ins), so the deferred botc MCP tools stay reachable.
+        let ti = fresh.iter().position(|a| a == "--tools").expect("--tools");
+        assert_eq!(
+            fresh[ti + 1],
+            "ToolSearch",
+            "--tools keeps ToolSearch for MCP access"
+        );
+        // Fresh vs resumed session flag.
+        assert!(has_pair(&fresh, "--session-id", "sid-123"));
+        assert!(!fresh.contains(&"--resume".to_string()));
+        let resumed = build_claude_tick_args("claude-opus-4-8", wd, "sid-123", true);
+        assert!(has_pair(&resumed, "--resume", "sid-123"));
+        assert!(!resumed.contains(&"--session-id".to_string()));
+        // No grok-only / claude-absent flags may leak in.
+        for bad in [
+            "--max-turns",
+            "--sandbox",
+            "--no-memory",
+            "--no-subagents",
+            "--disallowed-tools",
+            "streaming-json",
+            "--prompt-file",
+        ] {
+            assert!(!fresh.iter().any(|a| a == bad), "unexpected flag {bad}");
+        }
+    }
+
+    #[test]
+    fn claude_mcp_config_lists_only_botc() {
+        let dir = std::env::temp_dir().join(format!("botc_claude_mcp_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let cfg = HarnessConfig {
+            socket_path: PathBuf::from("/tmp/x.sock"),
+            agent_mcp_bin: PathBuf::from("botc-agent-mcp"),
+            ..Default::default()
+        };
+        write_claude_mcp_config(
+            &dir,
+            &cfg,
+            "tok-abc",
+            7,
+            AgentRole::Player { seat: SeatId(2) },
+        )
+        .unwrap();
+        let text = fs::read_to_string(dir.join(".mcp.json")).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let servers = v.get("mcpServers").and_then(|s| s.as_object()).unwrap();
+        // ONLY botc — with --strict-mcp-config this is the complete server set, so no
+        // global ~/.claude.json server can leak in.
+        assert_eq!(
+            servers.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["botc"]
+        );
+        let botc = &servers["botc"];
+        assert_eq!(botc["type"], "stdio");
+        let args: Vec<&str> = botc["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert!(args.windows(2).any(|w| w == ["--game-id", "7"]));
+        assert!(args.windows(2).any(|w| w == ["--role", "player"]));
+        assert_eq!(
+            fs::read_to_string(dir.join("agent.token")).unwrap(),
+            "tok-abc"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn parse_tick_usage_from_end_event() {
         let line = r#"{"type":"end","stopReason":"EndTurn","usage":{"input_tokens":100,"cache_read_input_tokens":900,"output_tokens":50,"reasoning_tokens":10,"total_tokens":1050},"num_turns":3}"#;
@@ -1347,6 +2075,7 @@ mod tests {
             tokens_used: 35_586,
             window_tokens: 512_000,
             usage_pct: 6,
+            source: "grok_signals",
         });
         let s = u.board_short();
         assert!(s.contains('Σ'), "{s}");
@@ -1646,6 +2375,7 @@ Available models:
                 token: "tok".into(),
                 game_id: 1,
                 model: "grok-build".into(),
+                backend: Backend::Grok,
             }],
         )
         .unwrap();
@@ -1708,6 +2438,7 @@ Available models:
                 token: "tok".into(),
                 game_id: 1,
                 model: "grok-build".into(),
+                backend: Backend::Grok,
             }],
         )
         .unwrap();
