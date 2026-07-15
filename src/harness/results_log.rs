@@ -92,6 +92,7 @@ fn tick_usage_json(t: &TickUsage) -> Value {
     json!({
         "input_tokens": t.input_tokens,
         "cache_read_input_tokens": t.cache_read_input_tokens,
+        "cache_creation_input_tokens": t.cache_creation_input_tokens,
         "output_tokens": t.output_tokens,
         "reasoning_tokens": t.reasoning_tokens,
         "total_tokens": t.total_tokens,
@@ -104,6 +105,7 @@ fn context_json(c: &ContextWindow) -> Value {
         "tokens_used": c.tokens_used,
         "window_tokens": c.window_tokens,
         "usage_pct": c.usage_pct,
+        "source": c.source,
     })
 }
 

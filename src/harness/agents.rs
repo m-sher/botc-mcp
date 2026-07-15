@@ -435,6 +435,10 @@ impl ChildSlot {
 pub struct TickUsage {
     pub input_tokens: u64,
     pub cache_read_input_tokens: u64,
+    /// Claude cache-*write* tokens (`cache_creation_input_tokens`). Grok has no such
+    /// field and leaves this 0; for Claude it routinely dwarfs every other bucket, so
+    /// it is load-bearing for `total_tokens` — omitting it under-counts spend hugely.
+    pub cache_creation_input_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
     /// Full prompt+output including cache (per Grok headless docs).
@@ -446,6 +450,7 @@ impl TickUsage {
     pub fn accumulate(&mut self, other: &TickUsage) {
         self.input_tokens += other.input_tokens;
         self.cache_read_input_tokens += other.cache_read_input_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
         self.output_tokens += other.output_tokens;
         self.reasoning_tokens += other.reasoning_tokens;
         self.total_tokens += other.total_tokens;
@@ -459,13 +464,16 @@ impl TickUsage {
     }
 }
 
-/// Context window fill from session `signals.json` (post-tick).
+/// Context window fill (grok: session `signals.json`; claude: result `modelUsage`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextWindow {
     pub tokens_used: u64,
     pub window_tokens: u64,
-    /// Integer percent from Grok (`contextWindowUsage`), 0–100.
+    /// Integer percent, 0–100.
     pub usage_pct: u32,
+    /// How this reading was derived, so consumers don't average unlike quantities:
+    /// `"grok_signals"` (cumulative fill) vs `"claude_modelusage"` (per-request est.).
+    pub source: &'static str,
 }
 
 impl ContextWindow {
@@ -568,6 +576,8 @@ pub fn parse_tick_usage(v: &Value) -> Option<TickUsage> {
     Some(TickUsage {
         input_tokens: input,
         cache_read_input_tokens: cache,
+        // Grok folds cache writes into total_tokens already; no separate field.
+        cache_creation_input_tokens: 0,
         output_tokens: output,
         reasoning_tokens: reasoning,
         total_tokens: total,
@@ -618,6 +628,7 @@ pub fn read_session_context(workdir: &Path, session_id: &str) -> Option<ContextW
         tokens_used,
         window_tokens,
         usage_pct,
+        source: "grok_signals",
     })
 }
 
@@ -1361,6 +1372,157 @@ pub fn apply_stream_event(log: &Mutex<Vec<LogLine>>, line: &str) {
     }
 }
 
+// ---- Claude Code stream-json parsers (issue #69) ----
+//
+// `claude --print --output-format stream-json` emits one JSON object per line. Only
+// the terminal `type:"result"` line carries authoritative usage; `assistant` lines
+// repeat a partial `message.usage`, so counting them would multi-count. Verified
+// against the committed fixtures in `testdata/claude_stream_*.jsonl`.
+
+/// Sum Claude's four disjoint prompt/output token buckets into a [`TickUsage`].
+/// `cache_creation_input_tokens` is included and load-bearing — it can be orders of
+/// magnitude larger than the rest. Claude has no `total_tokens`, so it is always
+/// reconstructed here.
+fn claude_usage(usage: &Value) -> TickUsage {
+    let f = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let input = f("input_tokens");
+    let cache_read = f("cache_read_input_tokens");
+    let cache_creation = f("cache_creation_input_tokens");
+    let output = f("output_tokens");
+    TickUsage {
+        input_tokens: input,
+        cache_read_input_tokens: cache_read,
+        cache_creation_input_tokens: cache_creation,
+        output_tokens: output,
+        reasoning_tokens: 0,
+        total_tokens: input
+            .saturating_add(cache_read)
+            .saturating_add(cache_creation)
+            .saturating_add(output),
+        num_turns: None,
+    }
+}
+
+/// Usage from an already-parsed Claude line — only the terminal `type:"result"`.
+fn claude_result_usage(v: &Value) -> Option<TickUsage> {
+    if v.get("type").and_then(Value::as_str) != Some("result") {
+        return None;
+    }
+    let mut tick = claude_usage(v.get("usage")?);
+    if tick.total_tokens == 0 && tick.input_tokens == 0 && tick.output_tokens == 0 {
+        return None;
+    }
+    tick.num_turns = v.get("num_turns").and_then(Value::as_u64).map(|n| n as u32);
+    Some(tick)
+}
+
+/// Usage for one Claude tick from a stream-json line. Returns `Some` **only** for the
+/// terminal `result` event; `assistant` lines carry a duplicate `message.usage` and
+/// must return `None` so the spend is not multi-counted.
+pub fn parse_claude_stream_line_usage(line: &str) -> Option<TickUsage> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line).ok()?;
+    claude_result_usage(&v)
+}
+
+/// A Claude session is resumable once its terminal `type:"result"` line lands
+/// (mirrors grok's `end`/`max_turns_reached`). The first `system`/`init` line is too
+/// eager — marking the session resumable mid-tick would wedge `--resume` on a kill.
+pub fn stream_line_establishes_session_claude(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+    v.get("type").and_then(|t| t.as_str()) == Some("result")
+}
+
+/// Context-window fill for a Claude tick, from the `result` line's `modelUsage`,
+/// keyed by the configured model id (Claude may title the entry `<model>[1m]`). The
+/// window fill is prompt-side tokens (input + cache read + cache write); output does
+/// not occupy the window. Tagged `claude_modelusage` (a per-request estimate, unlike
+/// grok's cumulative `signals.json`).
+pub fn claude_context_from_result(v: &Value, model: &str) -> Option<ContextWindow> {
+    let mu = v.get("modelUsage")?.as_object()?;
+    let entry = mu
+        .iter()
+        .find(|(k, _)| k.as_str() == model || k.trim_end_matches("[1m]") == model)
+        .map(|(_, val)| val)?;
+    let g = |k: &str| entry.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let window_tokens = g("contextWindow");
+    let tokens_used = g("inputTokens")
+        .saturating_add(g("cacheReadInputTokens"))
+        .saturating_add(g("cacheCreationInputTokens"));
+    if tokens_used == 0 && window_tokens == 0 {
+        return None;
+    }
+    let usage_pct = if window_tokens > 0 {
+        (tokens_used.saturating_mul(100) / window_tokens) as u32
+    } else {
+        0
+    };
+    Some(ContextWindow {
+        tokens_used,
+        window_tokens,
+        usage_pct,
+        source: "claude_modelusage",
+    })
+}
+
+/// Parse one Claude `stream-json` line and append it to `log` live: walks the
+/// assistant message content blocks (text / thinking / tool_use) and surfaces the
+/// `result` as a turn-end note. `system`/`rate_limit_event`/`user` chatter is ignored.
+pub fn apply_claude_stream_event(log: &Mutex<Vec<LogLine>>, line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    let mut guard = log.lock().unwrap();
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        push_full_line(&mut guard, LineKind::Text, line.to_string());
+        return;
+    };
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("assistant") => {
+            let content = v
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array());
+            for block in content.into_iter().flatten() {
+                match block.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => append_chunk(
+                        &mut guard,
+                        LineKind::Text,
+                        block.get("text").and_then(|x| x.as_str()).unwrap_or(""),
+                    ),
+                    Some("thinking") => append_chunk(
+                        &mut guard,
+                        LineKind::Thought,
+                        block.get("thinking").and_then(|x| x.as_str()).unwrap_or(""),
+                    ),
+                    Some("tool_use") => {
+                        let name = block.get("name").and_then(|x| x.as_str()).unwrap_or("tool");
+                        push_full_line(&mut guard, LineKind::System, format!("· tool: {name}"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some("result") => {
+            let note = claude_result_usage(&v)
+                .map(|u| format!("— turn end · {} tok —", format_token_count(u.total_tokens)))
+                .unwrap_or_else(|| "— turn end —".into());
+            push_full_line(&mut guard, LineKind::System, note);
+        }
+        _ => {}
+    }
+}
+
 /// Best-effort: resolve grok binary.
 pub fn find_grok() -> PathBuf {
     if let Ok(p) = which("grok") {
@@ -1419,6 +1581,133 @@ pub fn sleep_ms(ms: u64) {
 mod tests {
     use super::*;
 
+    // ---- Claude stream-json parsers (issue #69), against the committed fixture ----
+
+    const CLAUDE_SUCCESS: &str = include_str!("testdata/claude_stream_success.jsonl");
+
+    fn claude_lines() -> Vec<&'static str> {
+        CLAUDE_SUCCESS
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .collect()
+    }
+
+    fn claude_first_of_type(ty: &str) -> &'static str {
+        claude_lines()
+            .into_iter()
+            .find(|l| {
+                serde_json::from_str::<Value>(l)
+                    .ok()
+                    .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+                    .as_deref()
+                    == Some(ty)
+            })
+            .unwrap_or_else(|| panic!("no {ty} line in fixture"))
+    }
+
+    #[test]
+    fn claude_usage_only_from_result_line() {
+        let u = parse_claude_stream_line_usage(claude_first_of_type("result"))
+            .expect("result line carries usage");
+        // input 10 + cache_read 0 + cache_creation 6894 + output 45 = 6949.
+        assert_eq!(
+            u.cache_creation_input_tokens, 6894,
+            "cache_creation captured"
+        );
+        assert_eq!(
+            u.total_tokens,
+            u.input_tokens
+                + u.cache_read_input_tokens
+                + u.cache_creation_input_tokens
+                + u.output_tokens
+        );
+        assert!(
+            u.total_tokens > u.input_tokens + u.output_tokens,
+            "cache_creation dominates the total ({})",
+            u.total_tokens
+        );
+        assert_eq!(u.reasoning_tokens, 0);
+        assert_eq!(u.num_turns, Some(1));
+        // assistant lines repeat message.usage — must NOT be counted.
+        assert!(parse_claude_stream_line_usage(claude_first_of_type("assistant")).is_none());
+        assert!(parse_claude_stream_line_usage(claude_first_of_type("system")).is_none());
+    }
+
+    #[test]
+    fn claude_session_established_only_on_result() {
+        assert!(stream_line_establishes_session_claude(
+            claude_first_of_type("result")
+        ));
+        // system/init, system/thinking_tokens, assistant, rate_limit_event: not terminal.
+        assert!(!stream_line_establishes_session_claude(
+            claude_first_of_type("system")
+        ));
+        assert!(!stream_line_establishes_session_claude(
+            claude_first_of_type("assistant")
+        ));
+        assert!(!stream_line_establishes_session_claude(
+            claude_first_of_type("rate_limit_event")
+        ));
+        assert!(!stream_line_establishes_session_claude("not json"));
+        assert!(!stream_line_establishes_session_claude(""));
+    }
+
+    #[test]
+    fn claude_context_matches_model_and_folds_1m() {
+        let result: Value = serde_json::from_str(claude_first_of_type("result")).unwrap();
+        let ctx = claude_context_from_result(&result, "claude-haiku-4-5-20251001").expect("ctx");
+        assert_eq!(ctx.window_tokens, 200_000);
+        assert_eq!(ctx.source, "claude_modelusage");
+        // inputTokens 537 + cacheRead 0 + cacheCreation 6894.
+        assert_eq!(ctx.tokens_used, 537 + 6894);
+        assert_eq!(ctx.usage_pct, ((537 + 6894) * 100 / 200_000) as u32);
+        // A different configured model must not match.
+        assert!(claude_context_from_result(&result, "claude-opus-4-8").is_none());
+        // [1m] fold: the modelUsage key carries the 1M-window marker; the config id doesn't.
+        let folded = serde_json::json!({
+            "type": "result",
+            "modelUsage": { "claude-opus-4-8[1m]": {
+                "inputTokens": 100, "cacheReadInputTokens": 0,
+                "cacheCreationInputTokens": 0, "contextWindow": 1_000_000
+            }}
+        });
+        let c = claude_context_from_result(&folded, "claude-opus-4-8").expect("folded match");
+        assert_eq!(c.window_tokens, 1_000_000);
+        assert_eq!(c.tokens_used, 100);
+    }
+
+    #[test]
+    fn claude_apply_event_renders_text_thinking_result() {
+        let log = Mutex::new(Vec::new());
+        for l in claude_lines() {
+            apply_claude_stream_event(&log, l);
+        }
+        let g = log.lock().unwrap();
+        assert!(
+            g.iter()
+                .any(|l| l.kind == LineKind::Text && l.text.contains("ok")),
+            "assistant text is rendered"
+        );
+        assert!(
+            g.iter().any(|l| l.kind == LineKind::Thought),
+            "thinking is rendered"
+        );
+        assert!(
+            g.iter()
+                .any(|l| l.kind == LineKind::System && l.text.contains("turn end")),
+            "result becomes a turn-end note"
+        );
+    }
+
+    #[test]
+    fn grok_usage_leaves_cache_creation_zero() {
+        let grok =
+            r#"{"type":"end","usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150}}"#;
+        let u = parse_stream_line_usage(grok).unwrap();
+        assert_eq!(u.cache_creation_input_tokens, 0);
+        assert_eq!(u.total_tokens, 150);
+    }
+
     #[test]
     fn parse_tick_usage_from_end_event() {
         let line = r#"{"type":"end","stopReason":"EndTurn","usage":{"input_tokens":100,"cache_read_input_tokens":900,"output_tokens":50,"reasoning_tokens":10,"total_tokens":1050},"num_turns":3}"#;
@@ -1456,6 +1745,7 @@ mod tests {
             tokens_used: 35_586,
             window_tokens: 512_000,
             usage_pct: 6,
+            source: "grok_signals",
         });
         let s = u.board_short();
         assert!(s.contains('Σ'), "{s}");
