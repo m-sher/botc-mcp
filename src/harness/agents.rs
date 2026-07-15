@@ -1018,28 +1018,38 @@ pub fn build_grok_tick_args(
     args
 }
 
-/// The single spawn seam: dispatch one tick to the seat's [`Backend`]. Every caller
-/// routes through here so each backend's running-gate / stream-reader / waiter
-/// invariants live in exactly one place.
+/// Per-backend stream-line dispatch (grok arm = the original grok parsers).
+fn establishes_session_for(backend: Backend, line: &str) -> bool {
+    match backend {
+        Backend::Grok => stream_line_establishes_session(line),
+        Backend::Claude => stream_line_establishes_session_claude(line),
+    }
+}
+
+fn parse_usage_for(backend: Backend, line: &str) -> Option<TickUsage> {
+    match backend {
+        Backend::Grok => parse_stream_line_usage(line),
+        Backend::Claude => parse_claude_stream_line_usage(line),
+    }
+}
+
+fn apply_event_for(backend: Backend, log: &Mutex<Vec<LogLine>>, line: &str) {
+    match backend {
+        Backend::Grok => apply_stream_event(log, line),
+        Backend::Claude => apply_claude_stream_event(log, line),
+    }
+}
+
+/// The single spawn seam: launch one headless tick for the seat's [`Backend`]. The
+/// running-gate, stream reader, and session/exit waiter are shared; only the command
+/// (binary + argv + env + stdin) and the per-format stream parsers differ per backend.
 fn spawn_tick(
     cfg: &HarnessConfig,
     agent: &mut LiveAgent,
     prompt: &str,
 ) -> std::io::Result<TickOutcome> {
-    match agent.config.backend {
-        Backend::Grok => spawn_grok_tick(cfg, agent, prompt),
-        Backend::Claude => Err(std::io::Error::other(
-            "claude backend not yet wired (added in a later phase of #69)",
-        )),
-    }
-}
-
-fn spawn_grok_tick(
-    cfg: &HarnessConfig,
-    agent: &mut LiveAgent,
-    prompt: &str,
-) -> std::io::Result<TickOutcome> {
     let label = agent_label(&agent.config.role);
+    let backend = agent.config.backend;
     if *agent.running.lock().unwrap() {
         crate::dlog!("SPAWN {label} SKIPPED (previous tick still running)");
         return Ok(TickOutcome::SkippedStillRunning);
@@ -1051,44 +1061,59 @@ fn spawn_grok_tick(
     let session_started = *agent.session_started.lock().unwrap();
     let session_id = agent.session_id.lock().unwrap().clone();
 
-    let args = build_grok_tick_args(
-        cfg,
-        &agent.config.model,
-        &agent.workdir,
-        &prompt_file,
-        &session_id,
-        session_started,
-    );
-    crate::dlog!(
-        "SPAWN {label} model={} mode={} session={} prompt_first_line={:?} argv=[{}]",
-        agent.config.model,
-        if session_started { "resume" } else { "fresh" },
-        session_id,
-        prompt.lines().next().unwrap_or(""),
-        args.join(" ")
-    );
+    let bin = match backend {
+        Backend::Grok => cfg.grok_bin.clone(),
+        Backend::Claude => cfg.claude_bin.clone(),
+    };
+    let mut cmd = match backend {
+        Backend::Grok => {
+            let args = build_grok_tick_args(
+                cfg,
+                &agent.config.model,
+                &agent.workdir,
+                &prompt_file,
+                &session_id,
+                session_started,
+            );
+            crate::dlog!(
+                "SPAWN {label} model={} mode={} session={} prompt_first_line={:?} argv=[{}]",
+                agent.config.model,
+                if session_started { "resume" } else { "fresh" },
+                session_id,
+                prompt.lines().next().unwrap_or(""),
+                args.join(" ")
+            );
 
-    // Redirect the agent's grok config/auth/session dir to its workdir so it loads
-    // ONLY the per-game botc config written by `write_agent_mcp_config` — never the
-    // user's global ~/.grok/config.toml (github + PAT) or ~/.cursor/mcp.json
-    // (pyre-tracer). `--no-memory` does NOT exclude global MCP servers.
-    //   - HOME redirects the default config dir and ~/.cursor.
-    //   - GROK_HOME takes PRECEDENCE over HOME for grok's own config dir, so set it
-    //     explicitly to the isolated `.grok` — an inherited GROK_HOME (relocated
-    //     grok dirs, CI) would otherwise outrank HOME and re-leak the global config.
-    // Canonicalized to match grok's session-dir encoding (`grok_session_signals_path`).
-    let iso_home = agent
-        .workdir
-        .canonicalize()
-        .unwrap_or_else(|_| agent.workdir.clone());
-    let grok_dir = iso_home.join(".grok");
-    let mut cmd = Command::new(&cfg.grok_bin);
-    cmd.args(&args)
-        .env("HOME", &iso_home)
-        .env("GROK_HOME", &grok_dir)
-        .env_remove("XDG_CONFIG_HOME")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+            // Redirect the agent's grok config/auth/session dir to its workdir so it
+            // loads ONLY the per-game botc config written by `write_agent_mcp_config`
+            // — never the user's global ~/.grok/config.toml (github + PAT) or
+            // ~/.cursor/mcp.json (pyre-tracer). `--no-memory` does NOT exclude global
+            // MCP servers.
+            //   - HOME redirects the default config dir and ~/.cursor.
+            //   - GROK_HOME takes PRECEDENCE over HOME for grok's own config dir, so
+            //     set it explicitly to the isolated `.grok` — an inherited GROK_HOME
+            //     (relocated grok dirs, CI) would otherwise outrank HOME and re-leak.
+            // Canonicalized to match grok's session-dir encoding.
+            let iso_home = agent
+                .workdir
+                .canonicalize()
+                .unwrap_or_else(|_| agent.workdir.clone());
+            let grok_dir = iso_home.join(".grok");
+            let mut cmd = Command::new(&cfg.grok_bin);
+            cmd.args(&args)
+                .env("HOME", &iso_home)
+                .env("GROK_HOME", &grok_dir)
+                .env_remove("XDG_CONFIG_HOME")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            cmd
+        }
+        Backend::Claude => {
+            return Err(std::io::Error::other(
+                "claude backend not yet wired (added in phase 3b of #69)",
+            ));
+        }
+    };
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1097,7 +1122,7 @@ fn spawn_grok_tick(
             push_full_line(
                 &mut g,
                 LineKind::System,
-                format!("ERROR failed to spawn {}: {e}", cfg.grok_bin.display()),
+                format!("ERROR failed to spawn {}: {e}", bin.display()),
             );
             return Err(e);
         }
@@ -1112,7 +1137,6 @@ fn spawn_grok_tick(
     let child_slot = Arc::clone(&agent.child);
     let game_id = agent.config.game_id;
     let model = agent.config.model.clone();
-    let backend = agent.config.backend;
     let agent_role_label = label.clone();
     // #56: grok exits 1 on normal --max-turns; gate resume on stream evidence of a
     // real session (end / max_turns_reached), not process exit code.
@@ -1128,12 +1152,21 @@ fn spawn_grok_tick(
             let reader = std::io::BufReader::new(stdout);
             // Process each streaming-json event as it arrives → live display + usage.
             for line in reader.lines().map_while(Result::ok) {
-                if stream_line_establishes_session(&line) {
+                if establishes_session_for(backend, &line) {
                     established.store(true, Ordering::SeqCst);
                 }
-                if let Some(tick) = parse_stream_line_usage(&line) {
+                if let Some(tick) = parse_usage_for(backend, &line) {
                     let mut u = usage_slot.lock().unwrap();
                     u.record_tick(tick.clone());
+                    // Claude reports context in-stream (result.modelUsage); grok reads
+                    // signals.json post-exit in the waiter below. No-op for grok.
+                    if backend == Backend::Claude {
+                        if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                            if let Some(ctx) = claude_context_from_result(&v, &model) {
+                                u.context = Some(ctx);
+                            }
+                        }
+                    }
                     crate::dlog!(
                         "USAGE {agent_role_label} tick_total={} Σ={} turns={:?}",
                         tick.total_tokens,
@@ -1152,7 +1185,7 @@ fn spawn_grok_tick(
                         u.ticks_with_usage,
                     );
                 }
-                apply_stream_event(&log, &line);
+                apply_event_for(backend, &log, &line);
             }
         });
     }
@@ -1184,16 +1217,19 @@ fn spawn_grok_tick(
             }
             thread::sleep(Duration::from_millis(10));
         }
-        // Context window: read signals.json after the process exits (file is final).
-        let sid = session_id_for_ctx.lock().unwrap().clone();
-        if let Some(ctx) = read_session_context(&workdir, &sid) {
-            usage_slot_w.lock().unwrap().context = Some(ctx.clone());
-            crate::dlog!(
-                "CTX {exit_label} {}% used={} window={}",
-                ctx.usage_pct,
-                ctx.tokens_used,
-                ctx.window_tokens
-            );
+        // Context window: grok reads signals.json after exit (file is final); claude
+        // already set context in-stream from result.modelUsage.
+        if backend == Backend::Grok {
+            let sid = session_id_for_ctx.lock().unwrap().clone();
+            if let Some(ctx) = read_session_context(&workdir, &sid) {
+                usage_slot_w.lock().unwrap().context = Some(ctx.clone());
+                crate::dlog!(
+                    "CTX {exit_label} {}% used={} window={}",
+                    ctx.usage_pct,
+                    ctx.tokens_used,
+                    ctx.window_tokens
+                );
+            }
         }
         let established = session_established.load(Ordering::SeqCst);
         let was_started = *session_started_flag.lock().unwrap();
