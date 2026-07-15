@@ -1,4 +1,4 @@
-//! System / kickoff prompts for headless Grok player and host agents.
+//! System / kickoff prompts for headless player and host agents (grok or claude).
 
 use crate::game::SeatId;
 use crate::harness::scheduler::{HostTask, PlayerTask};
@@ -14,7 +14,8 @@ pub fn player_kickoff(display_name: &str, seat: SeatId, game_id: u64, n_players:
 - Players at table: {n_players}
 
 ## MCP tools (server name `botc`)
-You have MCP tools for this game. Discover them with search_tool if needed, then use_tool.
+You have MCP tools for this game on the `botc` server (some clients expose them as
+`mcp__botc__<tool>`). List your available tools if you can't see them, then call them directly.
 Your token is **already bound** in the MCP proxy — do not invent tokens. Always pass game_id={game_id}.
 Typical tools:
 - get_public_state / get_public_log — shared table

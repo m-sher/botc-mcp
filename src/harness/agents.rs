@@ -1978,6 +1978,49 @@ mod tests {
     }
 
     #[test]
+    fn claude_mcp_config_lists_only_botc() {
+        let dir = std::env::temp_dir().join(format!("botc_claude_mcp_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let cfg = HarnessConfig {
+            socket_path: PathBuf::from("/tmp/x.sock"),
+            agent_mcp_bin: PathBuf::from("botc-agent-mcp"),
+            ..Default::default()
+        };
+        write_claude_mcp_config(
+            &dir,
+            &cfg,
+            "tok-abc",
+            7,
+            AgentRole::Player { seat: SeatId(2) },
+        )
+        .unwrap();
+        let text = fs::read_to_string(dir.join(".mcp.json")).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let servers = v.get("mcpServers").and_then(|s| s.as_object()).unwrap();
+        // ONLY botc — with --strict-mcp-config this is the complete server set, so no
+        // global ~/.claude.json server can leak in.
+        assert_eq!(
+            servers.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["botc"]
+        );
+        let botc = &servers["botc"];
+        assert_eq!(botc["type"], "stdio");
+        let args: Vec<&str> = botc["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert!(args.windows(2).any(|w| w == ["--game-id", "7"]));
+        assert!(args.windows(2).any(|w| w == ["--role", "player"]));
+        assert_eq!(
+            fs::read_to_string(dir.join("agent.token")).unwrap(),
+            "tok-abc"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn parse_tick_usage_from_end_event() {
         let line = r#"{"type":"end","stopReason":"EndTurn","usage":{"input_tokens":100,"cache_read_input_tokens":900,"output_tokens":50,"reasoning_tokens":10,"total_tokens":1050},"num_turns":3}"#;
         let u = parse_stream_line_usage(line).expect("usage");
