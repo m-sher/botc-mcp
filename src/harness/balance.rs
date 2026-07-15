@@ -131,9 +131,10 @@ pub fn read_model_stats(path: &Path) -> HashMap<String, ModelStats> {
 /// only ones with an imbalance to correct); models with no history take the leftovers
 /// at random. Shuffled order + strict `<` gives a random tie-break.
 ///
-/// Both directions of the balance are this one matching — they differ only in which
-/// side is pinned to a seat: [`balanced_assignment`] pins the models (roles move),
-/// [`balanced_model_order`] pins the roles (models move).
+/// Used by [`balanced_assignment`] (`r`), where the seated models are pinned and the
+/// drawn roles move onto them. The other direction — letting the harness *choose* which
+/// models play a drawn role layout — is [`select_balanced_models`], which is a
+/// selection (with repeats) rather than a matching, so it does not share this code.
 fn match_models_to_chars(
     models: &[&str],
     chars: &[Character],
@@ -226,24 +227,54 @@ pub fn balanced_assignment(
         .collect()
 }
 
-/// The inverse of [`balanced_assignment`]: the seats' ROLES are pinned (the drawn
-/// layout) and the picked models are a pool that moves — this is what `m` (shuffle
-/// models) does. Returns `out[seat_i]` = index into `model_keys` of the model to place
-/// at seat `i`, chosen so each model's record stays balanced on the same axes.
+/// **Choose which models play**, given the drawn roles — the counterpart to
+/// [`balanced_assignment`]. This does NOT permute a hand-picked set: it *selects* from
+/// `candidates` (the models offered in the pickers that already have a completed game)
+/// so the corpus balance improves. Returns `out[seat_i]` = index into `candidates`.
 ///
-/// `seat_chars[i]` is the role at seat `i`; `model_keys` is the pool (same length).
-pub fn balanced_model_order(
+/// There are usually fewer eligible models than seats, so a candidate may take several
+/// seats and some may go unused. Greedy: walk the seats in random order and give each
+/// the candidate that most needs that seat's team / role type / role, **counting each
+/// assignment as we go** so a single model doesn't take every seat. `candidates` must
+/// be non-empty.
+pub fn select_balanced_models(
     seat_chars: &[Character],
-    model_keys: &[&str],
+    candidates: &[&str],
     stats: &HashMap<String, ModelStats>,
     rng: &mut impl Rng,
 ) -> Vec<usize> {
-    debug_assert_eq!(seat_chars.len(), model_keys.len());
-    // Chars are indexed by seat, so pick[j] is the seat for pool model j — invert it.
-    let pick = match_models_to_chars(model_keys, seat_chars, stats, rng);
+    assert!(!candidates.is_empty(), "need at least one eligible model");
+    // Running record = real history + what this game has already handed out.
+    let mut live: Vec<ModelStats> = candidates
+        .iter()
+        .map(|k| stats.get(*k).cloned().unwrap_or_default())
+        .collect();
+
+    let mut seat_order: Vec<usize> = (0..seat_chars.len()).collect();
+    seat_order.shuffle(rng);
     let mut out = vec![0usize; seat_chars.len()];
-    for (mj, &si) in pick.iter().enumerate() {
-        out[si] = mj;
+
+    for &si in &seat_order {
+        let (team, rtype, role) = keys(seat_chars[si]);
+        // Random candidate order so equal-cost ties resolve arbitrarily.
+        let mut cand_order: Vec<usize> = (0..candidates.len()).collect();
+        cand_order.shuffle(rng);
+        let mut best: Option<(usize, (u32, u32, u32))> = None;
+        for ci in cand_order {
+            let st = &live[ci];
+            let cost = (st.team_n(&team), st.type_n(&rtype), st.role_n(&role));
+            if best.is_none_or(|(_, bc)| cost < bc) {
+                best = Some((ci, cost));
+            }
+        }
+        let (ci, _) = best.expect("candidates is non-empty");
+        out[si] = ci;
+        // Fold the assignment in so the next seat sees the updated balance.
+        let st = &mut live[ci];
+        st.games += 1;
+        *st.team.entry(team).or_insert(0) += 1;
+        *st.role_type.entry(rtype).or_insert(0) += 1;
+        *st.role.entry(role).or_insert(0) += 1;
     }
     out
 }
@@ -474,9 +505,8 @@ mod tests {
     }
 
     #[test]
-    fn model_order_places_owed_evil_model_on_an_evil_seat() {
-        // Inverse direction (`m`): the ROLES are pinned per seat — seats 0-2 are
-        // Good/Townsfolk, seat 3 is the Minion, seat 4 the Demon — and the models move.
+    fn select_picks_owed_evil_model_for_the_evil_seats() {
+        // Roles pinned: seats 0-2 Good/Townsfolk, seat 3 Minion, seat 4 Demon.
         let seat_chars = vec![
             Character::Empath,
             Character::FortuneTeller,
@@ -484,51 +514,51 @@ mod tests {
             Character::Poisoner,
             Character::Imp,
         ];
-        // Strict owed-evil ordering by evil count: A(0) < D(1) < E(2) < C(3) < B(6),
-        // so the two Evil seats must go to A and D; B (always Evil) must not get one.
+        // Only TWO eligible candidates, so they must repeat across the five seats:
+        // A has never been Evil (owed Evil); B has only ever been Evil (owed Good).
         let stats = stats_with(vec![
-            ("A", model(&[("Good", "Townsfolk", "Empath", 6)])),
-            ("B", model(&[("Evil", "Minion", "Poisoner", 6)])),
-            (
-                "C",
-                model(&[
-                    ("Good", "Townsfolk", "Chef", 3),
-                    ("Evil", "Demon", "Imp", 3),
-                ]),
-            ),
-            (
-                "D",
-                model(&[
-                    ("Good", "Townsfolk", "Chef", 5),
-                    ("Evil", "Minion", "Poisoner", 1),
-                ]),
-            ),
-            (
-                "E",
-                model(&[
-                    ("Good", "Townsfolk", "Empath", 4),
-                    ("Evil", "Demon", "Imp", 2),
-                ]),
-            ),
+            ("A", model(&[("Good", "Townsfolk", "Empath", 8)])),
+            ("B", model(&[("Evil", "Minion", "Poisoner", 8)])),
         ]);
-        let pool = ["A", "B", "C", "D", "E"];
-        let mut rng = StdRng::seed_from_u64(11);
-        let order = balanced_model_order(&seat_chars, &pool, &stats, &mut rng);
-        // order[seat] = index into pool. Evil seats are 3 (Minion) and 4 (Demon).
-        let evil: Vec<&str> = [3usize, 4].iter().map(|&s| pool[order[s]]).collect();
+        let pool = ["A", "B"];
+        let mut rng = StdRng::seed_from_u64(21);
+        let pick = select_balanced_models(&seat_chars, &pool, &stats, &mut rng);
+        let evil: Vec<&str> = [3usize, 4].iter().map(|&s| pool[pick[s]]).collect();
         assert!(
-            evil.contains(&"A"),
-            "A (never Evil) must take an Evil seat, got {evil:?}"
+            evil.iter().all(|m| *m == "A"),
+            "the never-Evil model must take the Evil seats, got {evil:?}"
         );
+        // B (owed Good) should be picked up for Good seats rather than left unused.
+        let good: Vec<&str> = [0usize, 1, 2].iter().map(|&s| pool[pick[s]]).collect();
         assert!(
-            !evil.contains(&"B"),
-            "B (always Evil, owed Good) must not take an Evil seat, got {evil:?}"
+            good.contains(&"B"),
+            "the owed-Good model should take Good seats, got {good:?}"
         );
-        // It is a permutation: every pool model placed exactly once.
-        let mut used = order.clone();
-        used.sort();
-        used.dedup();
-        assert_eq!(used.len(), 5, "each model placed exactly once");
+    }
+
+    #[test]
+    fn select_spreads_seats_instead_of_giving_one_model_everything() {
+        // All-Townsfolk seats + two identical-history candidates: counting each
+        // assignment as we go must spread them rather than hand every seat to one.
+        let seat_chars = vec![
+            Character::Empath,
+            Character::FortuneTeller,
+            Character::Chef,
+            Character::Washerwoman,
+        ];
+        let stats = stats_with(vec![
+            ("A", model(&[("Good", "Townsfolk", "Empath", 1)])),
+            ("B", model(&[("Good", "Townsfolk", "Empath", 1)])),
+        ]);
+        let pool = ["A", "B"];
+        let mut rng = StdRng::seed_from_u64(3);
+        let pick = select_balanced_models(&seat_chars, &pool, &stats, &mut rng);
+        let used: std::collections::BTreeSet<usize> = pick.iter().copied().collect();
+        assert_eq!(
+            used.len(),
+            2,
+            "both candidates used, not one hogging all seats"
+        );
     }
 
     #[test]

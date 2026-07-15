@@ -211,8 +211,13 @@ impl App {
             results_public_cursor: 0,
             results_terminal_logged: false,
         };
-        // Draw an initial role assignment so the setup screen shows roles immediately.
+        // Draw an initial role assignment so the setup screen shows roles immediately,
+        // then let the balancer pick which eligible models fill those roles — booting
+        // straight into a balanced table instead of N copies of the CLI default (which
+        // typically has no completed games and so balances nothing). No-op, leaving the
+        // default picks in place, when nothing is eligible yet.
         app.reroll_roles();
+        app.shuffle_models();
         app
     }
 
@@ -273,13 +278,38 @@ impl App {
             crate::harness::balance::balanced_assignment(&seats, &models, &bag, &stats, &mut rng);
     }
 
-    /// Shuffle the picked models across the player seats so each model's record stays
-    /// balanced against the **current** role layout. This is the exact inverse of
-    /// [`Self::reroll_roles`] (`r`), which redraws the roles against the current models:
-    /// here the roles are pinned and the models move. Both use the same lexicographic
-    /// cost (team → role type → role, keyed by node_key). The Host has no role, so its
-    /// pick is left untouched; your picks are treated as a pool, so a model may land on
-    /// a different seat than you placed it.
+    /// The models the balancer may CHOOSE from: everything offered in the pickers
+    /// (grok's `grok models` + claude's curated list) that already has **≥1 completed
+    /// game**. A model with no valid games has no record to balance — pick it by hand
+    /// to give it a first game, after which it becomes eligible.
+    fn eligible_models(
+        &self,
+        stats: &std::collections::HashMap<String, crate::harness::balance::ModelStats>,
+    ) -> Vec<SeatChoice> {
+        let mut out = Vec::new();
+        for (backend, list) in [
+            (Backend::Grok, &self.cfg.available_models),
+            (Backend::Claude, &self.cfg.claude_models),
+        ] {
+            for m in list {
+                if stats.contains_key(&crate::harness::balance::node_key(backend.as_str(), m)) {
+                    out.push(SeatChoice {
+                        backend,
+                        model: m.clone(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Let the harness **choose which models play**, given the current roles, so the
+    /// eval corpus balances. It draws from [`Self::eligible_models`] — the *available*
+    /// models that have a valid (completed) game — rather than merely permuting your
+    /// picks, which would defeat the purpose. Having fewer eligible models than seats
+    /// is normal, so a model may take several seats. Counterpart to
+    /// [`Self::reroll_roles`] (`r`), which redraws the roles against whatever models
+    /// are currently seated. The Host has no role and is left untouched.
     fn shuffle_models(&mut self) {
         if self.setup_roles.len() != self.player_count
             || self.seat_choices.len() < self.player_count + 1
@@ -287,24 +317,40 @@ impl App {
             self.status = "no role preview yet — press r first".into();
             return;
         }
-        // Roles pinned per player seat (index i = seat i); the picks are the pool.
+        let stats =
+            crate::harness::balance::read_model_stats(&crate::harness::results_log::log_path());
+        let pool = self.eligible_models(&stats);
+        if pool.is_empty() {
+            self.status =
+                "no available model has a completed game yet — pick models by hand to seed one"
+                    .into();
+            return;
+        }
         let seat_chars: Vec<Character> =
             self.setup_roles.iter().map(|a| a.true_character).collect();
-        let pool: Vec<SeatChoice> = self.seat_choices[1..=self.player_count].to_vec();
         let keys: Vec<String> = pool
             .iter()
             .map(|c| crate::harness::balance::node_key(c.backend.as_str(), &c.model))
             .collect();
         let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-        let stats =
-            crate::harness::balance::read_model_stats(&crate::harness::results_log::log_path());
         let mut rng = rand::thread_rng();
-        let order =
-            crate::harness::balance::balanced_model_order(&seat_chars, &key_refs, &stats, &mut rng);
-        for (i, &mi) in order.iter().enumerate() {
-            self.seat_choices[1 + i] = pool[mi].clone();
+        let pick = crate::harness::balance::select_balanced_models(
+            &seat_chars,
+            &key_refs,
+            &stats,
+            &mut rng,
+        );
+        for (i, &ci) in pick.iter().enumerate() {
+            self.seat_choices[1 + i] = pool[ci].clone();
         }
-        self.status = "models shuffled onto the current roles (balanced)".into();
+        let used: std::collections::BTreeSet<&str> =
+            pick.iter().map(|&ci| pool[ci].model.as_str()).collect();
+        self.status = format!(
+            "balancer picked {}/{} eligible models: {}",
+            used.len(),
+            pool.len(),
+            used.into_iter().collect::<Vec<_>>().join(" · ")
+        );
     }
 
     fn selected_thinking_expanded(&self) -> bool {
