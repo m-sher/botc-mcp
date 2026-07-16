@@ -317,9 +317,8 @@ impl App {
             self.status = "no role preview yet — press r first".into();
             return;
         }
-        let stats =
-            crate::harness::balance::read_model_stats(&crate::harness::results_log::log_path());
-        let pool = self.eligible_models(&stats);
+        let hist = crate::harness::balance::read_history(&crate::harness::results_log::log_path());
+        let pool = self.eligible_models(&hist.models);
         if pool.is_empty() {
             self.status =
                 "no available model has a completed game yet — pick models by hand to seed one"
@@ -337,7 +336,7 @@ impl App {
         let pick = crate::harness::balance::select_balanced_models(
             &seat_chars,
             &key_refs,
-            &stats,
+            &hist,
             &mut rng,
         );
         for (i, &ci) in pick.iter().enumerate() {
@@ -345,12 +344,24 @@ impl App {
         }
         let used: std::collections::BTreeSet<&str> =
             pick.iter().map(|&ci| pool[ci].model.as_str()).collect();
-        self.status = format!(
-            "balancer picked {}/{} eligible models: {}",
-            used.len(),
-            pool.len(),
-            used.into_iter().collect::<Vec<_>>().join(" · ")
-        );
+        // The rater skips same-model pairs, so a one-model table yields no Bradley–Terry
+        // edge at all. The balancer guarantees ≥2 models whenever it can; if only one is
+        // eligible it cannot — say so rather than quietly seating a game the leaderboard
+        // will learn nothing from.
+        self.status = if used.len() < 2 {
+            format!(
+                "ONLY 1 eligible model ({}) — this table produces NO leaderboard data; \
+                 pick a second model by hand",
+                used.into_iter().collect::<Vec<_>>().join(" · ")
+            )
+        } else {
+            format!(
+                "balancer picked {}/{} eligible models: {}",
+                used.len(),
+                pool.len(),
+                used.into_iter().collect::<Vec<_>>().join(" · ")
+            )
+        };
     }
 
     fn selected_thinking_expanded(&self) -> bool {
