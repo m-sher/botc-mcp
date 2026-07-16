@@ -73,10 +73,13 @@ pub enum PlayerTask {
     /// A nomination is open and it is this seat's turn to vote (clockwise).
     /// `can_pass` = seat is dead and may abstain with `pass_vote` (living must
     /// vote yes/no — the engine rejects `pass_vote` from living seats).
+    /// `nominator_yes` = the nominator already has a yes in `votes` (false e.g. when
+    /// a Butler nominated and could not auto-yes yet) — prompt must not invent a tally.
     Vote {
         nomination: String,
         tally: String,
         can_pass: bool,
+        nominator_yes: bool,
     },
 }
 
@@ -203,6 +206,7 @@ pub fn plan_ticks(game: &Game, rotation: usize, stall: usize) -> Vec<SchedTarget
                     .find(|s| s.id == seat)
                     .map(|s| s.alive)
                     .unwrap_or(true);
+                let nominator_yes = nom.votes.iter().any(|(s, y)| *s == nom.by && *y);
                 vec![SchedTarget::Player {
                     seat,
                     task: PlayerTask::Vote {
@@ -210,6 +214,7 @@ pub fn plan_ticks(game: &Game, rotation: usize, stall: usize) -> Vec<SchedTarget
                         tally: tally_desc(game, nom),
                         // pass_vote is dead-only in the engine.
                         can_pass: !alive,
+                        nominator_yes,
                     },
                 }]
             } else {

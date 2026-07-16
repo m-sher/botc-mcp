@@ -339,8 +339,8 @@ pub fn player_task_tick(
              directed receives per player per discussion day; refuse targets already at the receive cap \
              (see `get_public_state.directed_say`).\n\
              - `nominate` `{\"game_id\": {gid}, \"target\": <seat number>}` — optional: if you already \
-             want someone executed, this immediately opens the vote on them (once per day) and counts \
-             as your automatic yes."
+             want someone executed, this opens the vote (once per day). Engine house rule: nominating \
+             usually records your yes automatically (Butler may still need a later vote turn)."
                 .to_string(),
         ),
         PlayerTask::Nominate => (
@@ -348,9 +348,9 @@ pub fn player_task_tick(
              If nobody nominates, the day ends with no execution."
                 .to_string(),
             "- `nominate` `{\"game_id\": {gid}, \"target\": <seat number>}` — puts that player up for \
-             an execution vote (you may nominate once per day). Nominating usually counts as your \
-             **yes** automatically (house rule) — you will not be asked to vote again unless you are \
-             the Butler waiting on your master's yes.\n\
+             an execution vote (you may nominate once per day). Engine house rule: this usually \
+             records your **yes** automatically so you skip the vote turn; the Butler ability can \
+             delay that until the master has voted yes (then you will be offered a Vote turn).\n\
              - OR `say` `{\"game_id\": {gid}, \"text\": \"...\"}` — state briefly why you're passing. \
              Do one of the two."
                 .to_string(),
@@ -359,14 +359,19 @@ pub fn player_task_tick(
             nomination,
             tally,
             can_pass,
+            nominator_yes,
         } => (
             format!(
-                "It is **day — a vote is in progress**: {nomination}. The nominator's yes is usually \
-                 already counted (unless they are a Butler still waiting on their master). Votes are \
+                "It is **day — a vote is in progress**: {nomination}. {nominator_note}Votes are \
                  counted one seat at a time around the table and **it is your turn to vote**.\n\n\
                  Votes so far: {tally}. \
                  If the yes votes reach **at least half of the living players**, the nominee goes to \
-                 the block and is executed at day's end."
+                 the block and is executed at day's end.",
+                nominator_note = if *nominator_yes {
+                    "The nominator's yes is already in the tally. "
+                } else {
+                    "The nominator has not (yet) recorded a yes — count only what is in the tally. "
+                }
             ),
             if *can_pass {
                 "- `vote` `{\"game_id\": {gid}, \"nominee\": <seat number>, \"support\": true|false}` — \
@@ -454,12 +459,17 @@ mod tests {
                 nomination: "P0 nominated P1 for execution".into(),
                 tally: "P0 YES — 1 of 6 eligible have acted".into(),
                 can_pass: false,
+                nominator_yes: true,
             },
             "phase: Day",
         );
         assert_guardrails(&vote);
         assert!(vote.contains("your turn to vote"));
         assert!(vote.contains("P0 YES"));
+        assert!(
+            vote.contains("nominator's yes is already"),
+            "should state nominator yes when flag true: {vote}"
+        );
         // Living voters must NOT be offered pass_vote (engine rejects it).
         assert!(!vote.contains("OR `pass_vote`"), "{vote}");
         assert!(vote.contains("at least half of the living players"));
@@ -471,8 +481,13 @@ mod tests {
                 nomination: "P0 nominated P1 for execution".into(),
                 tally: "no votes yet — 5 eligible voters".into(),
                 can_pass: true,
+                nominator_yes: false,
             },
             "phase: Day",
+        );
+        assert!(
+            ghost.contains("has not (yet) recorded a yes") || ghost.contains("not (yet)"),
+            "should not invent nominator yes: {ghost}"
         );
         assert!(
             ghost.contains("pass_vote"),
