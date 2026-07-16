@@ -128,7 +128,7 @@ Future (explicitly out of scope now): `whisper`, private rooms, evil-only chat.
 | --- | --- | --- |
 | `night_action` | player | Payload is generic choices (`target`, `targets`, `character_guess`, …). Server maps seat → true role → validate → resolve. |
 | `day_action` | player | e.g. `slay { target }` for Slayer once-per-game when legal |
-| `nominate` | player | Public; living only; once per day per nominator/nominee rules; counts as automatic **yes** (nominator does not vote again on their own nomination) |
+| `nominate` | player | Public; living only; once per day per nominator/nominee rules. **House rule (#73):** usually auto-yes for the nominator (cannot later vote no). Butler still needs master yes before their vote can land. |
 | `vote` | player | Public; living unlimited per day; dead one ghost vote total |
 
 No `use_ability(role=...)`. Role is never a client-supplied mechanical field.

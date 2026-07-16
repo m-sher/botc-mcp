@@ -348,8 +348,9 @@ pub fn player_task_tick(
              If nobody nominates, the day ends with no execution."
                 .to_string(),
             "- `nominate` `{\"game_id\": {gid}, \"target\": <seat number>}` — puts that player up for \
-             an execution vote (you may nominate once per day). Nominating counts as your **yes** \
-             vote automatically — you will not be asked to vote on your own nomination.\n\
+             an execution vote (you may nominate once per day). Nominating usually counts as your \
+             **yes** automatically (house rule) — you will not be asked to vote again unless you are \
+             the Butler waiting on your master's yes.\n\
              - OR `say` `{\"game_id\": {gid}, \"text\": \"...\"}` — state briefly why you're passing. \
              Do one of the two."
                 .to_string(),
@@ -360,9 +361,10 @@ pub fn player_task_tick(
             can_pass,
         } => (
             format!(
-                "It is **day — a vote is in progress**: {nomination}. The nominator's yes is already \
-                 counted. Votes are counted one seat at a time around the table and **it is your turn \
-                 to vote**.\n\nVotes so far: {tally}. \
+                "It is **day — a vote is in progress**: {nomination}. The nominator's yes is usually \
+                 already counted (unless they are a Butler still waiting on their master). Votes are \
+                 counted one seat at a time around the table and **it is your turn to vote**.\n\n\
+                 Votes so far: {tally}. \
                  If the yes votes reach **at least half of the living players**, the nominee goes to \
                  the block and is executed at day's end."
             ),

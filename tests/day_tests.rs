@@ -265,6 +265,84 @@ fn butler_yes_requires_master_yes() {
     vote(&mut g, &tokens[0], SeatId(4), true).unwrap();
 }
 
+/// #73 house rule + Butler: auto-yes must go through `vote()` legality.
+/// A living Butler who nominates cannot auto-yes before master has voted yes.
+#[test]
+fn butler_nominator_does_not_auto_yes_without_master() {
+    use botc_mcp::harness::scheduler::{plan_ticks, PlayerTask, SchedTarget};
+
+    let lobby = Game::create(names(5), 19).unwrap();
+    let host = lobby.host_token.clone();
+    let tokens = lobby.player_tokens.clone();
+    let mut g = lobby.game;
+    g.start_game(
+        &host,
+        StartOpts {
+            assignments: Some(vec![
+                RoleAssignment::normal(SeatId(0), Character::Butler),
+                RoleAssignment::normal(SeatId(1), Character::Soldier), // master
+                RoleAssignment::normal(SeatId(2), Character::Chef),
+                RoleAssignment::normal(SeatId(3), Character::Poisoner),
+                RoleAssignment::normal(SeatId(4), Character::Imp),
+            ]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    to_day1(&mut g, &host);
+    g.seats[0].poisoned = false;
+    g.seats[0].butler_master = Some(SeatId(1));
+
+    open_nominations(&mut g, &host).unwrap();
+    // Butler nominates Imp — auto-yes must NOT land without master yes.
+    nominate(&mut g, &tokens[0], SeatId(4)).unwrap();
+    let open = g.current_nomination.as_ref().expect("vote open");
+    assert!(
+        !open.votes.iter().any(|(s, _)| *s == SeatId(0)),
+        "Butler nominator must not auto-yes without master; votes={:?}",
+        open.votes
+    );
+    assert_eq!(open.by, SeatId(0));
+    assert_eq!(open.target, SeatId(4));
+
+    // Scheduler still offers the Butler a Vote turn (they are pending).
+    let plan = plan_ticks(&g, 0, 0);
+    let voters: Vec<u8> = plan
+        .iter()
+        .filter_map(|t| match t {
+            SchedTarget::Player {
+                seat,
+                task: PlayerTask::Vote { .. },
+            } => Some(seat.0),
+            _ => None,
+        })
+        .collect();
+    // Clockwise from nominee (4): next is 0 (Butler) after wrapping... seats 0..4,
+    // nominee 4 → start at 0. Butler is first pending.
+    assert!(
+        voters.contains(&0)
+            || plan.iter().any(|t| matches!(
+                t,
+                SchedTarget::Player {
+                    seat: SeatId(0),
+                    task: PlayerTask::Vote { .. }
+                }
+            )),
+        "Butler nominator must still be offered a Vote turn; plan={plan:?}"
+    );
+
+    // After master yes, Butler may yes (including as their delayed "auto" intent).
+    vote(&mut g, &tokens[1], SeatId(4), true).unwrap();
+    vote(&mut g, &tokens[0], SeatId(4), true).unwrap();
+    assert!(g
+        .current_nomination
+        .as_ref()
+        .unwrap()
+        .votes
+        .iter()
+        .any(|(s, y)| *s == SeatId(0) && *y));
+}
+
 #[test]
 fn cannot_vote_twice_on_same_nomination() {
     let lobby = Game::create(names(5), 16).unwrap();

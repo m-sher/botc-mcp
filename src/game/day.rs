@@ -119,24 +119,21 @@ fn commit_nomination_public(game: &mut Game, by: SeatId, target: SeatId) {
     game.public_log.push(PublicEvent::Nominated { by, target });
 }
 
-/// Record an open nomination and the nominator's automatic yes vote (#73).
+/// Open the vote window and try the nominator's automatic yes (#73).
 ///
-/// Nominating is an explicit call for execution, so the nominator does not take a
-/// separate vote turn — their hand is already up. Scheduler / `pending_voters_clockwise`
-/// skip seats already in `votes`, so the nominator is never offered a Vote task for
-/// their own nomination.
+/// Delegates to [`vote`] so Butler / ghost / double-vote legality stays in one place.
+/// A living Butler whose master has not yet voted yes cannot auto-yes yet — they simply
+/// take a normal Vote turn later under the master rule. Disabled Butler (poisoned/drunk)
+/// may auto-yes freely, matching `vote()`.
 fn open_nomination_with_nominator_yes(game: &mut Game, by: SeatId, target: SeatId) {
-    game.public_log.push(PublicEvent::VoteCast {
-        seat: by,
-        nominee: target,
-        support: true,
-    });
     game.current_nomination = Some(OpenNomination {
         by,
         target,
-        votes: vec![(by, true)],
+        votes: Vec::new(),
         passes: Vec::new(),
     });
+    // Ignore Err: e.g. Butler without master yes — nominator remains pending voter.
+    let _ = vote(game, by, target, true);
 }
 
 /// Player: open a nomination and start the vote window (or Virgin bounce).
