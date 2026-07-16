@@ -52,6 +52,11 @@ impl WakeActor {
     }
 }
 
+/// Max times the same outstanding wake may be redelivered without a completing
+/// tool. Caps the live #64 spin (wrong-tool → await_turn → same wake) before
+/// wall-clock stall escalation would fire.
+const MAX_WAKE_REDELIVERIES: u32 = 8;
+
 #[derive(Debug, Clone)]
 struct WakeEnvelope {
     seq: u64,
@@ -62,6 +67,8 @@ struct WakeEnvelope {
     /// Full wake text (same content as the old per-tick prompt).
     prompt_text: String,
     kind: String,
+    /// How many times this envelope has been returned to a waiting client.
+    deliveries: u32,
 }
 
 struct Inner {
@@ -392,6 +399,51 @@ fn try_deliver(
     // Redeliver outstanding if still planned for this actor.
     if let Some(env) = guard.outstanding.get(&actor).cloned() {
         if plan_still_contains(&plan, &env) {
+            if env.deliveries >= MAX_WAKE_REDELIVERIES {
+                // Too many redeliveries without a completing tool — skip this
+                // player turn so the table can move on (live #64 spin cap).
+                let directed = matches!(
+                    env.target,
+                    SchedTarget::Player {
+                        task: PlayerTask::Discuss {
+                            directed_reply: true,
+                            ..
+                        },
+                        ..
+                    }
+                );
+                let advances_rr = matches!(
+                    env.target,
+                    SchedTarget::Player {
+                        task: PlayerTask::Discuss {
+                            directed_reply: false,
+                            ..
+                        },
+                        ..
+                    } | SchedTarget::Player {
+                        task: PlayerTask::Nominate,
+                        ..
+                    }
+                );
+                guard.outstanding.remove(&actor);
+                guard.stall = 0;
+                guard.wait_sig = None;
+                if advances_rr {
+                    guard.rotation = guard.rotation.wrapping_add(1);
+                }
+                drop(st);
+                if directed {
+                    if let Ok(mut st) = store.try_lock() {
+                        if let Some(g) = st.get_mut(game_id) {
+                            g.pending_directed_wake = None;
+                        }
+                    }
+                }
+                return try_deliver(store, guard, actor, display_name);
+            }
+            let mut env = env;
+            env.deliveries = env.deliveries.saturating_add(1);
+            guard.outstanding.insert(actor, env.clone());
             // Summary only when delivering a wake (idle polls skip O(log) string build).
             let (summary, _) = public_summary(game);
             return Deliver::Wake(wake_json(&env, &summary));
@@ -418,6 +470,7 @@ fn try_deliver(
             target,
             prompt_text,
             kind,
+            deliveries: 1,
         };
         let out = wake_json(&env, &summary);
         guard.outstanding.insert(actor, env);
@@ -778,6 +831,40 @@ mod tests {
         let v = h.join().unwrap();
         let status = v["status"].as_str().unwrap();
         assert!(status == "idle" || status == "wake", "{v}");
+    }
+
+    #[test]
+    fn redelivery_cap_skips_mute_discuss_speaker() {
+        let (store, gid) = started_store();
+        let coord = WakeCoordinator::new();
+        coord.set_game_id(gid);
+        {
+            let mut st = store.lock().unwrap();
+            let g = st.get_mut(GameId(gid)).unwrap();
+            g.phase = Phase::Day {
+                day: 1,
+                stage: crate::game::DayStage::Discussion,
+            };
+            g.pending_night = None;
+            g.pending_host = None;
+            for s in &mut g.seats {
+                s.alive = true;
+            }
+        }
+        let actor = WakeActor::Player(SeatId(0));
+        let first = coord.await_turn(&store, actor, "P0", Duration::from_secs(1));
+        assert_eq!(first["status"], "wake", "{first}");
+        // Exhaust redeliveries without completing (wrong-tool / mute agent spin).
+        for _ in 0..MAX_WAKE_REDELIVERIES {
+            let v = coord.await_turn(&store, actor, "P0", Duration::from_secs(1));
+            // May still be wake for this actor until cap fires, or already skipped.
+            let _ = v;
+        }
+        assert!(
+            coord.rotation() >= 1,
+            "after MAX_WAKE_REDELIVERIES the discuss seat must be skipped (rot={})",
+            coord.rotation()
+        );
     }
 
     #[test]
