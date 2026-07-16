@@ -231,7 +231,14 @@ pub fn plan_ticks(game: &Game, rotation: usize, stall: usize) -> Vec<SchedTarget
                     .filter(|s| s.alive && !game.day_nominators.contains(&s.id))
                     .map(|s| s.id)
                     .collect();
-                let everyone_had_a_turn = stall >= eligible.len().max(2);
+                // End when every eligible seat has had a fair offer. Under the
+                // old per-tick harness, `stall` rose every ~2s maintain cycle.
+                // Continuous sessions only wall-clock-bump stall (~45s), so
+                // agents can "Pass."-say around the table forever (rot → 100+)
+                // while stall stays 0–1. Also accept `rotation` so one full lap
+                // of offers ends the day without waiting on the wall clock.
+                let need = eligible.len().max(2);
+                let everyone_had_a_turn = stall >= need || rotation >= need;
                 if eligible.is_empty() || everyone_had_a_turn {
                     return vec![SchedTarget::Host(HostTask::EndDay {
                         in_discussion: false,
@@ -606,6 +613,16 @@ mod tests {
             vec![SchedTarget::Host(HostTask::EndDay {
                 in_discussion: false
             })]
+        );
+        // Continuous-session path: one full lap of offers via rotation (even if
+        // wall-clock stall is still 0) must also hand the day to the host.
+        let by_rot = plan_ticks(&g, 6, 0);
+        assert_eq!(
+            by_rot,
+            vec![SchedTarget::Host(HostTask::EndDay {
+                in_discussion: false
+            })],
+            "rotation >= eligible must end the day without waiting on stall"
         );
     }
 

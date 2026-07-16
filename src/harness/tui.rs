@@ -1765,9 +1765,10 @@ fn draw_board_panel(f: &mut Frame, area: Rect, app: &mut App) {
 
     if let Some(pool) = app.agents.as_ref() {
         for (i, a) in pool.agents.iter().enumerate() {
-            // Three states under continuous sessions:
+            // Three states under continuous sessions — same ●/○ glyphs so
+            // terminal cell width matches (◐ is often wider/heavier in fonts):
             //   ● green  — alive + outstanding wake (mid-turn)
-            //   ◐ yellow — alive but parked in await_turn
+            //   ● yellow — alive but parked in await_turn
             //   ○ dim    — child down
             let running = *a.running.lock().unwrap();
             let actor = match a.config.role {
@@ -1784,7 +1785,8 @@ fn draw_board_panel(f: &mut Frame, area: Rect, app: &mut App) {
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
-                ("◐", Style::default().fg(Color::Yellow))
+                // Same filled circle as working; colour alone marks "parked".
+                ("●", Style::default().fg(Color::Yellow))
             };
             let selected = i == app.selected_agent;
             let mark = if selected { "▶" } else { " " };

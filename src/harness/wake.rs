@@ -220,12 +220,18 @@ impl WakeCoordinator {
                                     ..
                                 },
                             ..
+                        } => {
+                            g.rotation = g.rotation.wrapping_add(1);
                         }
-                        | SchedTarget::Player {
+                        SchedTarget::Player {
                             task: PlayerTask::Nominate,
                             ..
                         } => {
                             g.rotation = g.rotation.wrapping_add(1);
+                            // Action-based stall: each completed nominate offer
+                            // (including "Pass." via say) counts toward ending
+                            // the day — wall-clock stall alone is too slow.
+                            g.stall = g.stall.saturating_add(1);
                         }
                         _ => {}
                     }
@@ -373,6 +379,12 @@ fn try_deliver(
             guard.last_stall_bump = Some(now);
         }
     } else {
+        // Fresh wait (e.g. vote closed → noms idle again): restart the
+        // nominate-offer lap so rotation-based end-of-day doesn't fire
+        // immediately from a pre-vote rotation of 80+.
+        if sig.as_deref().is_some_and(|s| s.starts_with("noms_idle:")) {
+            guard.rotation = 0;
+        }
         guard.wait_sig = sig;
         guard.stall = 0;
         guard.last_stall_bump = Some(now);
