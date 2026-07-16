@@ -868,7 +868,7 @@ impl AgentPool {
             }
             let prompt =
                 prompts::reconnect_await_loop(&agent.config.display_name, agent.config.game_id);
-            match spawn_grok_tick(&self.cfg, agent, &prompt) {
+            match spawn_tick(&self.cfg, agent, &prompt) {
                 Ok(TickOutcome::Spawned) => {
                     agent.reconnects = agent.reconnects.saturating_add(1);
                     report.respawned += 1;

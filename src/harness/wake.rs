@@ -760,6 +760,48 @@ mod tests {
     }
 
     #[test]
+    fn directed_reply_say_does_not_advance_rotation() {
+        let (store, gid) = started_store();
+        let coord = WakeCoordinator::new();
+        coord.set_game_id(gid);
+        {
+            let mut st = store.lock().unwrap();
+            let g = st.get_mut(GameId(gid)).unwrap();
+            g.phase = Phase::Day {
+                day: 1,
+                stage: crate::game::DayStage::Discussion,
+            };
+            g.pending_night = None;
+            g.pending_host = None;
+            g.pending_directed_wake = Some(SeatId(3));
+            for s in &mut g.seats {
+                s.alive = true;
+            }
+        }
+        let actor = WakeActor::Player(SeatId(3));
+        let v = coord.await_turn(&store, actor, "P3", Duration::from_secs(2));
+        assert_eq!(v["status"], "wake", "{v}");
+        assert_eq!(v["kind"], "discuss", "{v}");
+        let rot_before = coord.rotation();
+        coord.note_tool_success(&store, actor, "say");
+        assert_eq!(
+            coord.rotation(),
+            rot_before,
+            "directed-reply must not burn a discussion RR slot"
+        );
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .get(GameId(gid))
+                .unwrap()
+                .pending_directed_wake
+                .is_none(),
+            "successful directed reply clears pending_directed_wake"
+        );
+    }
+
+    #[test]
     fn tool_completes_wake_matrix() {
         let night = SchedTarget::Player {
             seat: SeatId(0),
