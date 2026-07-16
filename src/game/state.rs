@@ -21,6 +21,10 @@ use crate::roles::{Character, CharacterType, Team};
 pub const MIN_PLAYERS: usize = 5;
 pub const MAX_PLAYERS: usize = 15;
 
+/// Max directed public `say`s **sent** or **received** per seat per discussion day (#75).
+/// Prevents infinite wake ping-pong while keeping the table log fully public.
+pub const DIRECTED_SAY_CAP: u32 = 6;
+
 impl From<Winner> for Team {
     fn from(w: Winner) -> Self {
         match w {
@@ -82,6 +86,13 @@ pub struct Game {
     pub current_nomination: Option<crate::game::day::OpenNomination>,
     /// Closed nominations today (yes tallies for leader comparison).
     pub closed_nominations: Vec<crate::game::day::ClosedNomination>,
+    /// Seat that should be woken next because someone directed a public `say` at them (#75).
+    /// Honoured only during Day Discussion by the harness scheduler.
+    pub pending_directed_wake: Option<SeatId>,
+    /// Directed says **sent** by each seat this discussion day (index = seat id).
+    pub directed_say_sent: Vec<u32>,
+    /// Directed says **received** by each seat this discussion day (index = seat id).
+    pub directed_say_received: Vec<u32>,
 }
 
 /// Result of opening a lobby: host token + player tokens in seat order.
@@ -191,6 +202,9 @@ impl Game {
                 day_nominees: Vec::new(),
                 current_nomination: None,
                 closed_nominations: Vec::new(),
+                pending_directed_wake: None,
+                directed_say_sent: vec![0; n],
+                directed_say_received: vec![0; n],
             },
             host_token,
             player_tokens,
@@ -230,8 +244,10 @@ impl Game {
             .collect()
     }
 
-    /// Public-only speech. No recipient field by design.
-    pub fn say(&mut self, seat: SeatId, text: String) -> Result<(), GameError> {
+    /// Public speech. Optional `to` addresses another seat **publicly** (still on the
+    /// shared log — never a private channel) and queues an immediate harness wake for
+    /// that seat during Discussion (#75).
+    pub fn say(&mut self, seat: SeatId, text: String, to: Option<SeatId>) -> Result<(), GameError> {
         // Public chat is a **day** activity only — at night players are asleep and
         // silent, and there is no talking in the lobby or after the game ends.
         // (Dead players may still speak during the day; no `alive` gate here.)
@@ -244,8 +260,64 @@ impl Game {
             .find(|s| s.id == seat)
             .map(|s| s.display_name.clone())
             .ok_or(GameError::NoSuchSeat)?;
-        self.public_log.push(PublicEvent::Chat { seat, name, text });
+
+        if let Some(target) = to {
+            // Directed address is only meaningful during Discussion (scheduler wakes
+            // the target). Reject outside Discussion so we never charge the cap for
+            // a no-op wake during nominations / etc.
+            if !matches!(
+                self.phase,
+                Phase::Day {
+                    stage: crate::game::DayStage::Discussion,
+                    ..
+                }
+            ) {
+                return Err(GameError::IllegalAction(
+                    "directed say (to) is only allowed during day discussion",
+                ));
+            }
+            if target == seat {
+                return Err(GameError::IllegalAction("cannot direct say at yourself"));
+            }
+            if self.seats.iter().all(|s| s.id != target) {
+                return Err(GameError::NoSuchSeat);
+            }
+            let si = seat.0 as usize;
+            let ti = target.0 as usize;
+            if si >= self.directed_say_sent.len() || ti >= self.directed_say_received.len() {
+                return Err(GameError::NoSuchSeat);
+            }
+            if self.directed_say_sent[si] >= DIRECTED_SAY_CAP {
+                return Err(GameError::IllegalAction(
+                    "directed say cap reached for this player (max 6 per discussion day)",
+                ));
+            }
+            if self.directed_say_received[ti] >= DIRECTED_SAY_CAP {
+                return Err(GameError::IllegalAction(
+                    "target has reached the directed-say receive cap (max 6 per discussion day)",
+                ));
+            }
+            self.directed_say_sent[si] += 1;
+            self.directed_say_received[ti] += 1;
+            // Queue wake (dead seats allowed — ghosts may speak in TB).
+            self.pending_directed_wake = Some(target);
+        }
+
+        self.public_log.push(PublicEvent::Chat {
+            seat,
+            name,
+            text,
+            to,
+        });
         Ok(())
+    }
+
+    /// Clear directed-say counters and pending wake (call at dawn / new discussion day).
+    pub fn reset_directed_say(&mut self) {
+        let n = self.seats.len();
+        self.directed_say_sent = vec![0; n];
+        self.directed_say_received = vec![0; n];
+        self.pending_directed_wake = None;
     }
 
     pub fn st_announce(&mut self, text: impl Into<String>) {

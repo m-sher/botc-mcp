@@ -118,7 +118,7 @@ Auth: every tool takes `token` (host or player). Server rejects wrong role for t
 
 | Tool | Auth | Behavior |
 | --- | --- | --- |
-| `say` | player (alive or dead) | Appends `{ seat, name, text, ts }` to **public** log. Visible to all via `get_public_log` / subscriptions. **No** `to_seat` parameter. |
+| `say` | player (alive or dead) | Appends `{ seat, name, text, to? }` to **public** log. Visible to all. Optional `to` publicly addresses a seat and immediately wakes them during Discussion (not a whisper). Cap: 6 directed sends and 6 receives per player per discussion day; counts on `get_public_state.directed_say`. |
 
 Future (explicitly out of scope now): `whisper`, private rooms, evil-only chat.
 
@@ -128,7 +128,7 @@ Future (explicitly out of scope now): `whisper`, private rooms, evil-only chat.
 | --- | --- | --- |
 | `night_action` | player | Payload is generic choices (`target`, `targets`, `character_guess`, …). Server maps seat → true role → validate → resolve. |
 | `day_action` | player | e.g. `slay { target }` for Slayer once-per-game when legal |
-| `nominate` | player | Public; living only; once per day per nominator/nominee rules |
+| `nominate` | player | Public; living only; once per day per nominator/nominee rules. **House rule (#73):** usually auto-yes for the nominator (cannot later vote no). Butler still needs master yes before their vote can land. |
 | `vote` | player | Public; living unlimited per day; dead one ghost vote total |
 
 No `use_ability(role=...)`. Role is never a client-supplied mechanical field.

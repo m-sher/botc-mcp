@@ -41,7 +41,8 @@ If you add a feature that can leak true identity to a Drunk seat (logs, errors, 
 
 - Auth every mutating/read tool with `host_token` or `player_token` (opaque secrets).
 - No `use_ability(role=...)`. Infer ability from the seat’s true Grimoire character.
-- `say` is public only — no `to_seat` / whisper parameters.
+- `say` is public only — never a private channel. Optional `to` publicly addresses
+  a seat and may wake them during discussion; it is still on the shared log.
 - Public sheet tools (`get_character_rules` for the pool) are fine; they are not “you are this role.”
 
 ## Docs layout

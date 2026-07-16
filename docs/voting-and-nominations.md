@@ -32,10 +32,12 @@ The **first** time the Virgin is nominated:
 ## Voting
 
 1. Votes are counted in **clockwise** order starting from the nominee; nominee is last.
-2. Living players may vote on **every** nomination that day (one vote each per nomination).
-3. Dead players may spend their **single** ghost vote on one nomination (any day remaining).
-4. Dead players may **pass** (abstain) without spending the ghost vote; once the ghost is spent they cannot vote again (yes or no).
-5. Storyteller tallies raised hands / declared votes.
+2. **Engine deviation from official BotC (#73):** the nominator's **yes** is cast automatically at nomination time (official play requires them to raise their hand like anyone else, and they may vote **no**). This engine records the yes immediately and will not let them flip to no later.
+3. **Exception — Butler:** a living Butler whose ability is active still cannot cast yes until their master has voted yes. If they nominate before that, the auto-yes is skipped and they take a normal Vote turn under the Butler rule.
+4. Other living players may vote on **every** nomination that day (one vote each per nomination).
+5. Dead players may spend their **single** ghost vote on one nomination (any day remaining).
+6. Dead players may **pass** (abstain) without spending the ghost vote; once the ghost is spent they cannot vote again (yes or no).
+7. Storyteller tallies raised hands / declared votes.
 
 ### Engine auto-close
 

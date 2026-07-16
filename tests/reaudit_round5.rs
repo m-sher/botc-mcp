@@ -148,8 +148,8 @@ fn day_auto_ends_when_nominations_exhausted() {
             stage: DayStage::Nominations
         }
     ));
-    // All living vote no → close; more noms remain.
-    for t in &tokens {
+    // Remaining living vote no (nominator already auto-yes) → close; more noms remain.
+    for t in tokens.iter().skip(1) {
         vote(&mut g, t, SeatId(1), false).unwrap();
     }
     assert!(
@@ -187,11 +187,12 @@ fn day_auto_ends_when_nominations_exhausted() {
             if g.current_nomination.is_none() {
                 break;
             }
+            // Nominator already auto-yes; ignore double-vote errors.
             let _ = vote(&mut g, t, SeatId(target), false);
         }
     }
 
-    // All five closed noms had 0 yes → no execution; everyone still alive; enter night 2.
+    // Each closed nom has only the nominator's auto-yes (below threshold) → no execution.
     assert!(
         matches!(g.phase, Phase::Night { night: 2, .. }),
         "day must auto-end into Night 2 with no execution; got {:?}",

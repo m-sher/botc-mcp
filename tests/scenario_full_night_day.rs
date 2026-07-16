@@ -118,8 +118,14 @@ fn scenario_full_n1_info_day_vote_n2_kill() {
     assert!(emp_priv.alive);
 
     // Public chat during day.
-    say(&mut g, &tokens[0], "I checked the Imp and Soldier".into()).unwrap();
-    say(&mut g, &tokens[1], "Empath zero".into()).unwrap();
+    say(
+        &mut g,
+        &tokens[0],
+        "I checked the Imp and Soldier".into(),
+        None,
+    )
+    .unwrap();
+    say(&mut g, &tokens[1], "Empath zero".into(), None).unwrap();
 
     let pub_day = get_public_state(&g, &tokens[0]).unwrap();
     assert!(pub_day.winner.is_none());

@@ -117,6 +117,9 @@ pub fn get_public_state(game: &Game, token: &Token) -> Result<PublicStateView, T
         phase: format!("{:?}", game.phase),
         seats: game.public_seats(),
         winner: game.winner,
+        directed_say_cap: crate::game::DIRECTED_SAY_CAP,
+        directed_say_sent: game.directed_say_sent.clone(),
+        directed_say_received: game.directed_say_received.clone(),
     })
 }
 
@@ -236,8 +239,14 @@ pub fn get_host_state(game: &Game, token: &Token) -> Result<HostStateView, ToolE
     })
 }
 
-/// Player speech → public log only. No `to` / whisper args.
-pub fn say(game: &mut Game, token: &Token, text: String) -> Result<EventId, ToolError> {
+/// Player speech → public log. Optional `to` is a **public** address (wakes that
+/// seat during Discussion); never a private channel.
+pub fn say(
+    game: &mut Game,
+    token: &Token,
+    text: String,
+    to: Option<SeatId>,
+) -> Result<EventId, ToolError> {
     let actor = game.tokens.resolve(token).ok_or(ToolError::Unauthorized)?;
     let seat = match actor {
         Actor::Player { seat } => seat,
@@ -247,7 +256,7 @@ pub fn say(game: &mut Game, token: &Token, text: String) -> Result<EventId, Tool
             ));
         }
     };
-    game.say(seat, text).map_err(ToolError::Game)?;
+    game.say(seat, text, to).map_err(ToolError::Game)?;
     Ok(game
         .public_log
         .since(0)

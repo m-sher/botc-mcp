@@ -28,6 +28,7 @@ pub use st_policy::{
     StChoiceMode,
 };
 pub use state::{
-    CreateGameResult, Game, Lobby, PublicSeatView, RoleAssignment, MAX_PLAYERS, MIN_PLAYERS,
+    CreateGameResult, Game, Lobby, PublicSeatView, RoleAssignment, DIRECTED_SAY_CAP, MAX_PLAYERS,
+    MIN_PLAYERS,
 };
 pub use win::{apply_demon_death, end_game, living_count as count_living, win_check};

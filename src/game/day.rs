@@ -119,12 +119,32 @@ fn commit_nomination_public(game: &mut Game, by: SeatId, target: SeatId) {
     game.public_log.push(PublicEvent::Nominated { by, target });
 }
 
+/// Open the vote window and try the nominator's automatic yes (#73).
+///
+/// Delegates to [`vote`] so Butler / ghost / double-vote legality stays in one place.
+/// A living Butler whose master has not yet voted yes cannot auto-yes yet — they simply
+/// take a normal Vote turn later under the master rule. Disabled Butler (poisoned/drunk)
+/// may auto-yes freely, matching `vote()`.
+fn open_nomination_with_nominator_yes(game: &mut Game, by: SeatId, target: SeatId) {
+    game.current_nomination = Some(OpenNomination {
+        by,
+        target,
+        votes: Vec::new(),
+        passes: Vec::new(),
+    });
+    // Ignore Err: e.g. Butler without master yes — nominator remains pending voter.
+    let _ = vote(game, by, target, true);
+}
+
 /// Player: open a nomination and start the vote window (or Virgin bounce).
 ///
 /// Allowed from Day Nominations, or from Discussion (auto-opens nominations first).
 ///
 /// All legality checks run **before** auto-opening Nominations from Discussion so a
 /// rejected nominate never mutates phase or the public log (#32).
+///
+/// On success (when a vote window opens), the nominator is recorded as an automatic
+/// **yes** — they do not need to call `vote` for their own nomination (#73).
 pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameError> {
     require_not_ended(game)?;
     game.require_no_pending_host()?;
@@ -193,22 +213,12 @@ pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameE
             }
         }
         // Disabled, or nominator does not register as Townsfolk: ability spent, vote proceeds.
-        game.current_nomination = Some(OpenNomination {
-            by,
-            target,
-            votes: Vec::new(),
-            passes: Vec::new(),
-        });
+        open_nomination_with_nominator_yes(game, by, target);
         return Ok(());
     }
 
     commit_nomination_public(game, by, target);
-    game.current_nomination = Some(OpenNomination {
-        by,
-        target,
-        votes: Vec::new(),
-        passes: Vec::new(),
-    });
+    open_nomination_with_nominator_yes(game, by, target);
     Ok(())
 }
 

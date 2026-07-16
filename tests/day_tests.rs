@@ -60,10 +60,18 @@ fn vote_threshold_six_living_needs_three() {
     to_day1(&mut g, &host);
 
     open_nominations(&mut g, &host).unwrap();
-    // Nominate seat 5 (Imp) by seat 0
+    // Nominate seat 5 (Imp) by seat 0 — nominator auto-yes (#73)
     nominate(&mut g, &tokens[0], SeatId(5)).unwrap();
-    // Two yes from living → not enough; close and check no leader path
-    vote(&mut g, &tokens[0], SeatId(5), true).unwrap();
+    assert!(
+        g.current_nomination
+            .as_ref()
+            .unwrap()
+            .votes
+            .iter()
+            .any(|(s, y)| *s == SeatId(0) && *y),
+        "nominator must auto-vote yes"
+    );
+    // One more yes from living → total 2, not enough for threshold
     vote(&mut g, &tokens[1], SeatId(5), true).unwrap();
     // Others no
     for tok in tokens.iter().take(6).skip(2) {
@@ -75,10 +83,9 @@ fn vote_threshold_six_living_needs_three() {
     assert_eq!(g.closed_nominations[0].yes_votes, 2);
     assert!(!meets_threshold(2, 6));
 
-    // New nom with 3 yes should pass threshold
+    // New nom with 3 yes should pass threshold (nominator auto-yes + 2 more)
     nominate(&mut g, &tokens[1], SeatId(4)).unwrap();
     vote(&mut g, &tokens[0], SeatId(4), true).unwrap();
-    vote(&mut g, &tokens[1], SeatId(4), true).unwrap();
     vote(&mut g, &tokens[2], SeatId(4), true).unwrap();
     for tok in tokens.iter().take(6).skip(3) {
         vote(&mut g, tok, SeatId(4), false).unwrap();
@@ -258,6 +265,84 @@ fn butler_yes_requires_master_yes() {
     vote(&mut g, &tokens[0], SeatId(4), true).unwrap();
 }
 
+/// #73 house rule + Butler: auto-yes must go through `vote()` legality.
+/// A living Butler who nominates cannot auto-yes before master has voted yes.
+#[test]
+fn butler_nominator_does_not_auto_yes_without_master() {
+    use botc_mcp::harness::scheduler::{plan_ticks, PlayerTask, SchedTarget};
+
+    let lobby = Game::create(names(5), 19).unwrap();
+    let host = lobby.host_token.clone();
+    let tokens = lobby.player_tokens.clone();
+    let mut g = lobby.game;
+    g.start_game(
+        &host,
+        StartOpts {
+            assignments: Some(vec![
+                RoleAssignment::normal(SeatId(0), Character::Butler),
+                RoleAssignment::normal(SeatId(1), Character::Soldier), // master
+                RoleAssignment::normal(SeatId(2), Character::Chef),
+                RoleAssignment::normal(SeatId(3), Character::Poisoner),
+                RoleAssignment::normal(SeatId(4), Character::Imp),
+            ]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    to_day1(&mut g, &host);
+    g.seats[0].poisoned = false;
+    g.seats[0].butler_master = Some(SeatId(1));
+
+    open_nominations(&mut g, &host).unwrap();
+    // Butler nominates Imp — auto-yes must NOT land without master yes.
+    nominate(&mut g, &tokens[0], SeatId(4)).unwrap();
+    let open = g.current_nomination.as_ref().expect("vote open");
+    assert!(
+        !open.votes.iter().any(|(s, _)| *s == SeatId(0)),
+        "Butler nominator must not auto-yes without master; votes={:?}",
+        open.votes
+    );
+    assert_eq!(open.by, SeatId(0));
+    assert_eq!(open.target, SeatId(4));
+
+    // Scheduler still offers the Butler a Vote turn (they are pending).
+    let plan = plan_ticks(&g, 0, 0);
+    let voters: Vec<u8> = plan
+        .iter()
+        .filter_map(|t| match t {
+            SchedTarget::Player {
+                seat,
+                task: PlayerTask::Vote { .. },
+            } => Some(seat.0),
+            _ => None,
+        })
+        .collect();
+    // Clockwise from nominee (4): next is 0 (Butler) after wrapping... seats 0..4,
+    // nominee 4 → start at 0. Butler is first pending.
+    assert!(
+        voters.contains(&0)
+            || plan.iter().any(|t| matches!(
+                t,
+                SchedTarget::Player {
+                    seat: SeatId(0),
+                    task: PlayerTask::Vote { .. }
+                }
+            )),
+        "Butler nominator must still be offered a Vote turn; plan={plan:?}"
+    );
+
+    // After master yes, Butler may yes (including as their delayed "auto" intent).
+    vote(&mut g, &tokens[1], SeatId(4), true).unwrap();
+    vote(&mut g, &tokens[0], SeatId(4), true).unwrap();
+    assert!(g
+        .current_nomination
+        .as_ref()
+        .unwrap()
+        .votes
+        .iter()
+        .any(|(s, y)| *s == SeatId(0) && *y));
+}
+
 #[test]
 fn cannot_vote_twice_on_same_nomination() {
     let lobby = Game::create(names(5), 16).unwrap();
@@ -282,6 +367,14 @@ fn cannot_vote_twice_on_same_nomination() {
     open_nominations(&mut g, &host).unwrap();
     nominate(&mut g, &tokens[0], SeatId(3)).unwrap();
 
+    // Nominator already auto-voted yes and cannot vote again.
+    let err_nom = vote(&mut g, &tokens[0], SeatId(3), false).unwrap_err();
+    let msg_nom = format!("{err_nom}");
+    assert!(
+        msg_nom.contains("already voted") || msg_nom.contains("one vote"),
+        "expected nominator double-vote rejection, got {err_nom:?}"
+    );
+
     vote(&mut g, &tokens[1], SeatId(3), true).unwrap();
     let err = vote(&mut g, &tokens[1], SeatId(3), false).unwrap_err();
     let msg = format!("{err}");
@@ -295,17 +388,27 @@ fn cannot_vote_twice_on_same_nomination() {
     assert_eq!(mine.len(), 1);
     assert!(mine[0].1);
 
-    // A different nomination later in the day still allows a new ballot.
+    // A different nomination later in the day still allows a new ballot
+    // (nominator of that nom auto-yeses; others may vote freely).
     close_vote(&mut g, &host).unwrap();
     nominate(&mut g, &tokens[1], SeatId(4)).unwrap();
-    vote(&mut g, &tokens[1], SeatId(4), false).unwrap();
+    assert!(
+        g.current_nomination
+            .as_ref()
+            .unwrap()
+            .votes
+            .iter()
+            .any(|(s, y)| *s == SeatId(1) && *y),
+        "new nominator auto-yes"
+    );
+    vote(&mut g, &tokens[0], SeatId(4), false).unwrap();
     assert!(g
         .current_nomination
         .as_ref()
         .unwrap()
         .votes
         .iter()
-        .any(|(s, y)| *s == SeatId(1) && !*y));
+        .any(|(s, y)| *s == SeatId(0) && !*y));
 }
 
 #[test]
@@ -331,7 +434,7 @@ fn host_close_vote_without_all_living() {
     to_day1(&mut g, &host);
     open_nominations(&mut g, &host).unwrap();
     nominate(&mut g, &tokens[0], SeatId(3)).unwrap();
-    vote(&mut g, &tokens[0], SeatId(3), true).unwrap();
+    // Nominator auto-yes is the only ballot so far
     // Host closes early — missing living votes count as no
     close_vote(&mut g, &host).unwrap();
     assert!(g.current_nomination.is_none());
@@ -383,8 +486,7 @@ fn poisoner_executed_clears_active_poison() {
 
     open_nominations(&mut g, &host).unwrap();
     nominate(&mut g, &tokens[0], SeatId(3)).unwrap();
-    // 5 living → need 3 yes (yes*2 >= living).
-    vote(&mut g, &tokens[0], SeatId(3), true).unwrap();
+    // 5 living → need 3 yes (yes*2 >= living). Nominator auto-yes + 2 more.
     vote(&mut g, &tokens[1], SeatId(3), true).unwrap();
     vote(&mut g, &tokens[2], SeatId(3), true).unwrap();
     vote(&mut g, &tokens[3], SeatId(3), false).unwrap();
@@ -433,7 +535,8 @@ fn dead_pass_vote_keeps_ghost_and_allows_auto_close() {
         "expected dead-only pass error, got {err:?}"
     );
 
-    for i in [0usize, 1, 3, 4] {
+    // Living voters except nominator (already auto-yes).
+    for i in [1usize, 3, 4] {
         vote(&mut g, &tokens[i], SeatId(4), false).unwrap();
     }
     assert!(g.current_nomination.is_some(), "open until ghost responds");

@@ -45,6 +45,7 @@ fn to_day1(g: &mut Game, host: &botc_mcp::auth::Token) {
 }
 
 /// All living cast `support` on the open nomination (auto-closes when all have voted).
+/// Skips seats that already voted (nominator auto-yes is already recorded).
 fn all_vote(g: &mut Game, tokens: &[botc_mcp::auth::Token], nominee: SeatId, support: bool) {
     let living: Vec<usize> = g
         .seats
@@ -53,6 +54,15 @@ fn all_vote(g: &mut Game, tokens: &[botc_mcp::auth::Token], nominee: SeatId, sup
         .map(|s| s.id.0 as usize)
         .collect();
     for i in living {
+        if g.current_nomination
+            .as_ref()
+            .is_some_and(|n| n.votes.iter().any(|(s, _)| s.0 as usize == i))
+        {
+            continue;
+        }
+        if g.current_nomination.is_none() {
+            break;
+        }
         vote(g, &tokens[i], nominee, support).unwrap();
     }
 }

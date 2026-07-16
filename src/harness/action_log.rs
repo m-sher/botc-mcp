@@ -214,11 +214,19 @@ fn flatten_text(s: &str) -> String {
 pub fn summarize(tool: &str, args: &Value) -> String {
     let payload = args.get("payload").unwrap_or(args);
     match tool {
-        "say" | "st_announce" => args
-            .get("text")
-            .and_then(|v| v.as_str())
-            .map(|t| format!("“{}”", flatten_text(t)))
-            .unwrap_or_default(),
+        "say" | "st_announce" => {
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(flatten_text)
+                .unwrap_or_default();
+            if tool == "say" {
+                if let Some(to) = seatp(args.get("to")) {
+                    return format!("→{to} “{text}”");
+                }
+            }
+            format!("“{text}”")
+        }
         "nominate" => seatp(args.get("target"))
             .map(|s| format!("→{s}"))
             .unwrap_or_default(),

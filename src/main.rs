@@ -48,7 +48,7 @@ mod smoke {
             day: 1,
             stage: DayStage::Discussion,
         };
-        tools::say(&mut game, &alice, "I am the Imp.".into()).unwrap();
+        tools::say(&mut game, &alice, "I am the Imp.".into(), None).unwrap();
 
         let log = tools::get_public_log(&game, &bob, 0).unwrap();
         assert!(log.iter().any(|(_, e)| matches!(

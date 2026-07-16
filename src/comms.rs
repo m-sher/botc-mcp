@@ -16,10 +16,15 @@ pub type EventId = u64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicEvent {
     /// Player speech — visible to every agent.
+    ///
+    /// Optional `to` addresses another seat **publicly** (not a whisper). The harness
+    /// may immediately wake that seat; the message remains on the shared log (#75).
     Chat {
         seat: SeatId,
         name: String,
         text: String,
+        /// When set, this was directed at another seat (still fully public).
+        to: Option<SeatId>,
     },
     StorytellerAnnounce {
         text: String,
@@ -200,6 +205,7 @@ mod tests {
             seat: SeatId(0),
             name: "Alice".into(),
             text: "hello".into(),
+            to: None,
         });
         assert_eq!(e1, 1);
         assert_eq!(e2, 2);
@@ -208,7 +214,7 @@ mod tests {
         assert_eq!(log.since(e2).len(), 0);
         assert!(matches!(
             log.since(e1)[0].1,
-            PublicEvent::Chat { text, .. } if text == "hello"
+            PublicEvent::Chat { text, to: None, .. } if text == "hello"
         ));
     }
 
@@ -220,6 +226,7 @@ mod tests {
                 seat: SeatId(0),
                 name: "A".into(),
                 text: "hi".into(),
+                to: Some(SeatId(2)),
             },
             PublicEvent::StorytellerAnnounce {
                 text: "Nominations open.".into(),

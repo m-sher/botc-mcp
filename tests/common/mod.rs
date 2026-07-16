@@ -66,6 +66,7 @@ pub fn to_day1(g: &mut Game, host: &Token) {
 }
 
 /// All living seats cast `support` on the open nomination (auto-closes when complete).
+/// Skips seats that already voted (nominator auto-yes is already recorded).
 pub fn all_vote(g: &mut Game, tokens: &[Token], nominee: SeatId, support: bool) {
     let living: Vec<usize> = g
         .seats
@@ -74,6 +75,15 @@ pub fn all_vote(g: &mut Game, tokens: &[Token], nominee: SeatId, support: bool) 
         .map(|s| s.id.0 as usize)
         .collect();
     for i in living {
+        if g.current_nomination
+            .as_ref()
+            .is_some_and(|n| n.votes.iter().any(|(s, _)| s.0 as usize == i))
+        {
+            continue;
+        }
+        if g.current_nomination.is_none() {
+            break;
+        }
         vote(g, &tokens[i], nominee, support).expect("vote");
     }
 }
