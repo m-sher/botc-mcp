@@ -1005,8 +1005,10 @@ impl App {
         }
     }
 
-    /// Labels of agents actively mid-turn (alive child + outstanding wake).
-    /// Process liveness alone is always true under continuous `await_turn`.
+    /// Labels of agents mid-turn: outstanding wake and not blocked in `await_turn`.
+    /// Process liveness alone is always true under continuous sessions; outstanding
+    /// alone stays set while a model re-polls await_turn after a wake — that must
+    /// not light up "working".
     fn working_labels(&self) -> Vec<String> {
         let Some(pool) = self.agents.as_ref() else {
             return Vec::new();
@@ -1021,7 +1023,7 @@ impl App {
                     AgentRole::Host => WakeActor::Host,
                     AgentRole::Player { seat } => WakeActor::Player(seat),
                 };
-                self.wake.has_outstanding(actor)
+                self.wake.has_outstanding(actor) && !self.wake.is_waiting(actor)
             })
             .map(|a| match a.config.role {
                 AgentRole::Host => "Host".into(),
@@ -1766,18 +1768,24 @@ fn draw_board_panel(f: &mut Frame, area: Rect, app: &mut App) {
     if let Some(pool) = app.agents.as_ref() {
         for (i, a) in pool.agents.iter().enumerate() {
             // Three states under continuous sessions — same ●/○ glyphs so
-            // terminal cell width matches (◐ is often wider/heavier in fonts):
-            //   ● green  — alive + outstanding wake (mid-turn)
-            //   ● yellow — alive but parked in await_turn
+            // terminal cell width matches:
+            //   ● green  — outstanding wake and *not* blocked in await_turn
+            //              (between wake delivery and completing action)
+            //   ● yellow — parked in await_turn, or alive with nothing to do
             //   ○ dim    — child down
+            // Outstanding alone is not enough: after a wake is handed out the
+            // model often re-enters await_turn (or sits mid-turn without tools);
+            // long-poll must read as parked, not "working".
             let running = *a.running.lock().unwrap();
             let actor = match a.config.role {
                 AgentRole::Host => WakeActor::Host,
                 AgentRole::Player { seat } => WakeActor::Player(seat),
             };
+            let parked = app.wake.is_waiting(actor);
+            let mid_turn = app.wake.has_outstanding(actor) && !parked;
             let (glyph, gstyle) = if !running {
                 ("○", dim)
-            } else if app.wake.has_outstanding(actor) {
+            } else if mid_turn {
                 (
                     "●",
                     Style::default()
@@ -1785,7 +1793,6 @@ fn draw_board_panel(f: &mut Frame, area: Rect, app: &mut App) {
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
-                // Same filled circle as working; colour alone marks "parked".
                 ("●", Style::default().fg(Color::Yellow))
             };
             let selected = i == app.selected_agent;

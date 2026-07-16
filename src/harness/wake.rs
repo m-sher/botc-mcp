@@ -479,8 +479,22 @@ fn try_deliver(
             }
             let mut env = env;
             env.deliveries = env.deliveries.saturating_add(1);
+            // Refresh prompt from the current plan target (e.g. updated vote tally)
+            // without changing wake_id / plan_key.
+            if let Some(target) = plan
+                .iter()
+                .find(|t| plan_key_of(t) == env.plan_key)
+                .cloned()
+            {
+                let (summary, host_hint) = public_summary(game);
+                env.prompt_text =
+                    render_prompt(display_name, game.id.0, &target, &summary, &host_hint);
+                env.target = target;
+                let out = wake_json(&env, &summary);
+                guard.outstanding.insert(actor, env);
+                return Deliver::Wake(out);
+            }
             guard.outstanding.insert(actor, env.clone());
-            // Summary only when delivering a wake (idle polls skip O(log) string build).
             let (summary, _) = public_summary(game);
             return Deliver::Wake(wake_json(&env, &summary));
         }
@@ -539,6 +553,23 @@ fn actor_of(t: &SchedTarget) -> WakeActor {
 fn plan_key_of(t: &SchedTarget) -> String {
     match t {
         SchedTarget::Host(h) => format!("host:{h:?}"),
+        // Vote tallies change as others vote — if the key included the live tally
+        // text, each ballot would drop the outstanding envelope and re-issue a
+        // "new" wake (activity flicker + confusing redelivery). Keep vote keys
+        // stable for the open nomination; refresh prompt text on redeliver.
+        SchedTarget::Player {
+            seat,
+            task:
+                PlayerTask::Vote {
+                    nomination,
+                    can_pass,
+                    nominator_yes,
+                    ..
+                },
+        } => format!(
+            "p{}:vote:{nomination}:pass={can_pass}:ny={nominator_yes}",
+            seat.0
+        ),
         SchedTarget::Player { seat, task } => format!("p{}:{task:?}", seat.0),
     }
 }
