@@ -118,7 +118,8 @@ rarely, a host fallback) with a targeted prompt that says why it was woken, whic
 legal, and what ends the turn (`src/harness/scheduler.rs`, `plan_ticks`).
 
 The host is **minimal**: it is woken only for genuine Storyteller decisions and stall
-fallbacks. The engine self-drives the rest — a player's `nominate` auto-opens the vote,
+fallbacks. The engine self-drives the rest — a player's `nominate` auto-opens the vote
+(and records the nominator as an automatic yes so they are not offered a Vote turn),
 `vote` auto-closes once everyone has acted, and the day auto-ends into night.
 
 | Game state | Ticked this turn |

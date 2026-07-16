@@ -318,7 +318,8 @@ pub fn player_task_tick(
              drop a careful read, or deliberately stay vague). Be concrete about *someone or something* \
              — not a content-free filler line — but do **not** treat a full role claim as mandatory.\n\
              - `nominate` `{\"game_id\": {gid}, \"target\": <seat number>}` — optional: if you already \
-             want someone executed, this immediately opens the vote on them (once per day)."
+             want someone executed, this immediately opens the vote on them (once per day) and counts \
+             as your automatic yes."
                 .to_string(),
         ),
         PlayerTask::Nominate => (
@@ -326,7 +327,8 @@ pub fn player_task_tick(
              If nobody nominates, the day ends with no execution."
                 .to_string(),
             "- `nominate` `{\"game_id\": {gid}, \"target\": <seat number>}` — puts that player up for \
-             an execution vote (you may nominate once per day).\n\
+             an execution vote (you may nominate once per day). Nominating counts as your **yes** \
+             vote automatically — you will not be asked to vote on your own nomination.\n\
              - OR `say` `{\"game_id\": {gid}, \"text\": \"...\"}` — state briefly why you're passing. \
              Do one of the two."
                 .to_string(),
@@ -337,8 +339,9 @@ pub fn player_task_tick(
             can_pass,
         } => (
             format!(
-                "It is **day — a vote is in progress**: {nomination}. Votes are counted one seat \
-                 at a time around the table and **it is your turn to vote**.\n\nVotes so far: {tally}. \
+                "It is **day — a vote is in progress**: {nomination}. The nominator's yes is already \
+                 counted. Votes are counted one seat at a time around the table and **it is your turn \
+                 to vote**.\n\nVotes so far: {tally}. \
                  If the yes votes reach **at least half of the living players**, the nominee goes to \
                  the block and is executed at day's end."
             ),

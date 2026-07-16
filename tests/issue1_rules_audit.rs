@@ -318,8 +318,9 @@ fn ghost_vote_not_auto_closed_when_only_living_voted() {
     open_nominations(&mut g, &host).unwrap();
     nominate(&mut g, &tokens[0], SeatId(4)).unwrap();
 
-    // All living vote — must NOT auto-close while dead ghost voter has not voted.
-    for i in [0usize, 1, 3, 4] {
+    // Remaining living vote — must NOT auto-close while dead ghost voter has not voted.
+    // Seat 0 already auto-yesed as nominator.
+    for i in [1usize, 3, 4] {
         vote(&mut g, &tokens[i], SeatId(4), i % 2 == 0).unwrap();
     }
     assert!(
@@ -334,7 +335,7 @@ fn ghost_vote_not_auto_closed_when_only_living_voted() {
         "should auto-close after ghost voted"
     );
 
-    // Host can still force-close early on a fresh nom.
+    // Host can still force-close early on a fresh nom (nominator auto-yes + one more).
     nominate(&mut g, &tokens[1], SeatId(3)).unwrap();
     vote(&mut g, &tokens[0], SeatId(3), true).unwrap();
     close_vote(&mut g, &host).unwrap();

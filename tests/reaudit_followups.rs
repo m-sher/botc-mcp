@@ -201,7 +201,8 @@ fn pass_then_ghost_yes_on_later_nomination() {
 
     open_nominations(&mut g, &host).unwrap();
     nominate(&mut g, &tokens[0], SeatId(4)).unwrap();
-    for i in [0usize, 1, 3, 4] {
+    // Remaining living (nominator already auto-yes).
+    for i in [1usize, 3, 4] {
         vote(&mut g, &tokens[i], SeatId(4), false).unwrap();
     }
     pass_vote(&mut g, &tokens[2]).unwrap();

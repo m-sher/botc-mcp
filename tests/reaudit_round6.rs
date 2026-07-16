@@ -90,7 +90,11 @@ fn dead_nominator_from_discussion_does_not_open_noms() {
     // Kill seat 0 via execution (majority + host end_nominations).
     open_nominations(&mut g, &host).unwrap();
     nominate(&mut g, &tokens[1], SeatId(0)).unwrap();
-    for t in &tokens {
+    // Nominator (seat 1) already auto-yes; remaining seats vote yes.
+    for (i, t) in tokens.iter().enumerate() {
+        if i == 1 {
+            continue;
+        }
         vote(&mut g, t, SeatId(0), true).unwrap();
     }
     botc_mcp::tools::end_nominations(&mut g, &host).unwrap();
@@ -250,7 +254,8 @@ fn auto_end_last_nom_all_no_is_no_execution() {
     //
     // 5 living, chain of 5 noms all voting no (same as round5 test, stricter asserts).
     nominate(&mut g, &tokens[0], SeatId(1)).unwrap();
-    for t in &tokens {
+    // Remaining living vote no (nominator auto-yes already recorded).
+    for t in tokens.iter().skip(1) {
         vote(&mut g, t, SeatId(1), false).unwrap();
     }
     for (by, target) in [(1u8, 2u8), (2, 3), (3, 4), (4, 0)] {
@@ -268,6 +273,7 @@ fn auto_end_last_nom_all_no_is_no_execution() {
             ) {
                 break;
             }
+            // Nominator already auto-yes; ignore double-vote errors.
             let _ = vote(&mut g, t, SeatId(target), false);
         }
     }

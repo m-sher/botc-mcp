@@ -293,6 +293,9 @@ fn tally_desc(game: &Game, nom: &OpenNomination) -> String {
 
 /// Seats still to vote, in clockwise order starting after the nominee, among
 /// those eligible (living, or dead with a ghost vote) who have not voted/passed.
+///
+/// The nominator's automatic yes is already in `nom.votes`, so they never appear
+/// here and the scheduler will not return them a Vote task for their own nomination.
 fn pending_voters_clockwise(game: &Game, nom: &OpenNomination) -> Vec<SeatId> {
     let done: HashSet<SeatId> = nom
         .votes
@@ -565,6 +568,11 @@ mod tests {
         // eligible unvoted seat is P2 (P1 itself may vote, but voting starts at
         // nominee+1; P2 comes first). No host co-scheduled before a stall.
         assert_eq!(voter_seats(&plan), vec![2]);
+        // Nominator (P0) must never be offered a Vote turn on their own nomination.
+        assert!(
+            !voter_seats(&plan).contains(&0),
+            "nominator must not be asked to vote"
+        );
         assert!(
             !plan.iter().any(|t| matches!(t, SchedTarget::Host(_))),
             "host must not race pending voters"
@@ -576,6 +584,24 @@ mod tests {
                 ..
             } => assert!(tally.contains("P0 YES"), "tally missing: {tally}"),
             t => panic!("expected Vote, got {t:?}"),
+        }
+    }
+
+    #[test]
+    fn nominator_never_appears_in_pending_voters() {
+        let g = open_vote_game(); // P0 nom P1, P0 auto-yes
+        let pending = pending_voters_clockwise(&g, g.current_nomination.as_ref().unwrap());
+        assert!(
+            !pending.contains(&SeatId(0)),
+            "nominator already voted yes; pending={pending:?}"
+        );
+        // Full vote cycle never schedules the nominator.
+        for stall in 0..10 {
+            let plan = plan_ticks(&g, 0, stall);
+            assert!(
+                !voter_seats(&plan).contains(&0),
+                "stall={stall}: nominator scheduled to vote"
+            );
         }
     }
 
