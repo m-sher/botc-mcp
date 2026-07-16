@@ -145,11 +145,14 @@ pub fn plan_ticks(game: &Game, rotation: usize, stall: usize) -> Vec<SchedTarget
             if let Some(wake) = game.pending_directed_wake {
                 if stall < STALL_ESCALATE {
                     let round = rotation / living.len();
+                    // Same last_round signal as RR so a directed reply late in the
+                    // day is not told "there's more time" when the day is ending.
+                    let last_round = round + 1 >= DISCUSSION_ROUNDS;
                     return vec![SchedTarget::Player {
                         seat: wake,
                         task: PlayerTask::Discuss {
                             round,
-                            last_round: false,
+                            last_round,
                             directed_reply: true,
                         },
                     }];

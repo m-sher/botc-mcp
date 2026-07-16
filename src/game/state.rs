@@ -262,6 +262,20 @@ impl Game {
             .ok_or(GameError::NoSuchSeat)?;
 
         if let Some(target) = to {
+            // Directed address is only meaningful during Discussion (scheduler wakes
+            // the target). Reject outside Discussion so we never charge the cap for
+            // a no-op wake during nominations / etc.
+            if !matches!(
+                self.phase,
+                Phase::Day {
+                    stage: crate::game::DayStage::Discussion,
+                    ..
+                }
+            ) {
+                return Err(GameError::IllegalAction(
+                    "directed say (to) is only allowed during day discussion",
+                ));
+            }
             if target == seat {
                 return Err(GameError::IllegalAction("cannot direct say at yourself"));
             }
@@ -285,7 +299,7 @@ impl Game {
             }
             self.directed_say_sent[si] += 1;
             self.directed_say_received[ti] += 1;
-            // Queue wake; harness scheduler honours this during Discussion only.
+            // Queue wake (dead seats allowed — ghosts may speak in TB).
             self.pending_directed_wake = Some(target);
         }
 

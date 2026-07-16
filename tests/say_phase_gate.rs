@@ -107,3 +107,53 @@ fn directed_say_is_public_and_caps_per_player() {
     let err = g.say(SeatId(2), "me".into(), Some(SeatId(2))).unwrap_err();
     assert!(format!("{err}").to_lowercase().contains("yourself"));
 }
+
+#[test]
+fn directed_say_rejected_outside_discussion() {
+    let mut g = game7();
+    g.phase = Phase::Day {
+        day: 1,
+        stage: DayStage::Nominations,
+    };
+    let err = g.say(SeatId(0), "hey".into(), Some(SeatId(1))).unwrap_err();
+    assert!(
+        format!("{err}").to_lowercase().contains("discussion")
+            || format!("{err:?}").to_lowercase().contains("discussion"),
+        "expected discussion-only error, got {err:?}"
+    );
+    // Cap not charged.
+    assert_eq!(g.directed_say_sent[0], 0);
+    assert_eq!(g.directed_say_received[1], 0);
+    // Undirected still ok in nominations.
+    assert!(g.say(SeatId(0), "to the table".into(), None).is_ok());
+}
+
+#[test]
+fn directed_say_may_wake_dead_seat() {
+    use botc_mcp::harness::scheduler::{plan_ticks, PlayerTask, SchedTarget};
+
+    let mut g = game7();
+    g.phase = Phase::Day {
+        day: 1,
+        stage: DayStage::Discussion,
+    };
+    g.seats[3].alive = false;
+    g.seats[3].ghost_vote_available = true;
+
+    g.say(SeatId(0), "ghost, any last words?".into(), Some(SeatId(3)))
+        .unwrap();
+    assert_eq!(g.pending_directed_wake, Some(SeatId(3)));
+    assert_eq!(g.directed_say_received[3], 1);
+
+    let plan = plan_ticks(&g, 0, 0);
+    match &plan[0] {
+        SchedTarget::Player {
+            seat,
+            task: PlayerTask::Discuss { directed_reply, .. },
+        } => {
+            assert_eq!(*seat, SeatId(3));
+            assert!(*directed_reply, "dead seat still gets directed reply wake");
+        }
+        t => panic!("expected directed Discuss for ghost, got {t:?}"),
+    }
+}

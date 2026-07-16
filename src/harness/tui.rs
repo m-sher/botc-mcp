@@ -967,13 +967,13 @@ impl App {
                 directed_reply,
             )
         };
-        // Clear consumed / stalled directed wakes under a short write lock.
-        {
+        // Stalled directed wake: drop so RR can continue (plan already falls through).
+        // Successful directed spawns clear after spawn — same "only consume when
+        // someone actually ran" rule as tick_rotation.
+        if stall >= crate::harness::scheduler::STALL_ESCALATE {
             let mut st = self.store.lock().unwrap();
             if let Some(g) = st.get_mut(GameId(gid)) {
-                if directed_reply || stall >= crate::harness::scheduler::STALL_ESCALATE {
-                    g.pending_directed_wake = None;
-                }
+                g.pending_directed_wake = None;
             }
         }
         self.wait_sig = sig.clone();
@@ -1038,7 +1038,14 @@ impl App {
                     if spawned > 0 {
                         // Directed replies are extra wakes — do not burn a round-robin
                         // slot so everyone still gets DISCUSSION_ROUNDS fair turns.
-                        if !directed_reply {
+                        // Clear the wake only after a successful spawn so a failed
+                        // spawn does not swallow the directed question.
+                        if directed_reply {
+                            let mut st = self.store.lock().unwrap();
+                            if let Some(g) = st.get_mut(GameId(gid)) {
+                                g.pending_directed_wake = None;
+                            }
+                        } else {
                             self.tick_rotation = self.tick_rotation.wrapping_add(1);
                         }
                     } else {
