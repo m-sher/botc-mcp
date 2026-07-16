@@ -30,7 +30,7 @@ use crate::harness::agents::{
 };
 use crate::harness::scheduler::{plan_ticks, SchedTarget};
 use crate::harness::socket::SocketServer;
-use crate::harness::wake::WakeCoordinator;
+use crate::harness::wake::{WakeActor, WakeCoordinator};
 use crate::mcp_server::{self, SharedStore};
 use crate::roles::{Character, CharacterType};
 use crate::tools;
@@ -1005,14 +1005,24 @@ impl App {
         }
     }
 
-    /// Labels of agents whose Grok child is currently running.
-    fn running_labels(&self) -> Vec<String> {
+    /// Labels of agents actively mid-turn (alive child + outstanding wake).
+    /// Process liveness alone is always true under continuous `await_turn`.
+    fn working_labels(&self) -> Vec<String> {
         let Some(pool) = self.agents.as_ref() else {
             return Vec::new();
         };
         pool.agents
             .iter()
-            .filter(|a| *a.running.lock().unwrap())
+            .filter(|a| {
+                if !*a.running.lock().unwrap() {
+                    return false;
+                }
+                let actor = match a.config.role {
+                    AgentRole::Host => WakeActor::Host,
+                    AgentRole::Player { seat } => WakeActor::Player(seat),
+                };
+                self.wake.has_outstanding(actor)
+            })
             .map(|a| match a.config.role {
                 AgentRole::Host => "Host".into(),
                 AgentRole::Player { seat } => format!("P{}", seat.0),
@@ -1020,10 +1030,10 @@ impl App {
             .collect()
     }
 
-    /// Game-progress spans for the top bar: phase · whose turn · tick mode · running.
+    /// Game-progress spans for the top bar: phase · whose turn · tick mode · activity.
     fn status_spans(&self) -> Vec<Span<'static>> {
         let phase = self.phase_label();
-        let running = self.running_labels();
+        let working = self.working_labels();
         let turn = if self.last_targets.is_empty() {
             "—".to_string()
         } else {
@@ -1035,6 +1045,8 @@ impl App {
         } else {
             "manual (Space=nudge)".to_string()
         };
+        // Mode toggle is not "activity" — keep neutral (DarkGray) so green is
+        // reserved for seats that actually hold an outstanding wake.
         let mut spans = vec![
             Span::styled(
                 format!(" {phase} "),
@@ -1045,24 +1057,17 @@ impl App {
             Span::raw("· turn "),
             Span::styled(format!("{turn} "), Style::default().fg(Color::Yellow)),
             Span::raw("· "),
-            Span::styled(
-                format!("{tick} "),
-                if self.auto_tick {
-                    Style::default().fg(Color::Green)
-                } else {
-                    Style::default().fg(Color::Yellow)
-                },
-            ),
+            Span::styled(format!("{tick} "), Style::default().fg(Color::DarkGray)),
             Span::raw("· "),
         ];
-        if running.is_empty() {
+        if working.is_empty() {
             spans.push(Span::styled(
-                format!("idle · last turn {ago}s ago"),
+                format!("idle · last activity {ago}s ago"),
                 Style::default().fg(Color::DarkGray),
             ));
         } else {
             spans.push(Span::styled(
-                format!("▶ running: {}", running.join(",")),
+                format!("▶ working: {}", working.join(",")),
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
@@ -1760,8 +1765,18 @@ fn draw_board_panel(f: &mut Frame, area: Rect, app: &mut App) {
 
     if let Some(pool) = app.agents.as_ref() {
         for (i, a) in pool.agents.iter().enumerate() {
+            // Three states under continuous sessions:
+            //   ● green  — alive + outstanding wake (mid-turn)
+            //   ◐ yellow — alive but parked in await_turn
+            //   ○ dim    — child down
             let running = *a.running.lock().unwrap();
-            let (glyph, gstyle) = if running {
+            let actor = match a.config.role {
+                AgentRole::Host => WakeActor::Host,
+                AgentRole::Player { seat } => WakeActor::Player(seat),
+            };
+            let (glyph, gstyle) = if !running {
+                ("○", dim)
+            } else if app.wake.has_outstanding(actor) {
                 (
                     "●",
                     Style::default()
@@ -1769,7 +1784,7 @@ fn draw_board_panel(f: &mut Frame, area: Rect, app: &mut App) {
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
-                ("○", dim)
+                ("◐", Style::default().fg(Color::Yellow))
             };
             let selected = i == app.selected_agent;
             let mark = if selected { "▶" } else { " " };

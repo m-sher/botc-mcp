@@ -166,6 +166,19 @@ impl WakeCoordinator {
         self.inner.lock().unwrap().waiters.contains_key(&actor)
     }
 
+    /// True when this actor has been handed a wake it has not yet completed
+    /// (mid-turn). Steadier activity signal than `!is_waiting` (which briefly
+    /// flips false in the idle re-poll gap between soft idles).
+    pub fn has_outstanding(&self, actor: WakeActor) -> bool {
+        self.inner.lock().unwrap().outstanding.contains_key(&actor)
+    }
+
+    /// Labels of actors mid-turn (outstanding wake not yet completed).
+    pub fn working_labels(&self) -> Vec<String> {
+        let g = self.inner.lock().unwrap();
+        g.outstanding.keys().map(|a| a.label()).collect()
+    }
+
     /// True when every listed actor is blocked in `await_turn` (all idle).
     pub fn all_waiting(&self, actors: &[WakeActor]) -> bool {
         let g = self.inner.lock().unwrap();
@@ -776,6 +789,14 @@ mod tests {
         let v1 = coord.await_turn(&store, actor, &name, Duration::from_secs(2));
         assert_eq!(v1["status"], "wake", "{v1}");
         let id1 = v1["wake_id"].as_str().unwrap().to_string();
+        assert!(
+            coord.has_outstanding(actor),
+            "delivered wake must be outstanding (TUI activity signal)"
+        );
+        assert!(
+            coord.working_labels().iter().any(|l| l == &actor.label()),
+            "working_labels should list the mid-turn actor"
+        );
         let v2 = coord.await_turn(&store, actor, &name, Duration::from_secs(2));
         assert_eq!(v2["status"], "wake", "{v2}");
         assert_eq!(
