@@ -190,6 +190,10 @@ impl WakeCoordinator {
     /// extra wakes), clear `pending_directed_wake` when that wake completes, and
     /// notify waiters.
     ///
+    /// Phase-changing tools (`open_nominations`, `end_nominations`, …) also drop
+    /// **all** outstanding wakes so a concurrent seat cannot keep acting on a
+    /// superseded turn after the stage has moved (live #66 wrong-phase race).
+    ///
     /// Call only after the tool has released the store lock (socket path does).
     pub fn note_tool_success(&self, store: &SharedStore, actor: WakeActor, tool: &str) {
         let mut clear_directed = false;
@@ -227,6 +231,13 @@ impl WakeCoordinator {
                     }
                     g.outstanding.remove(&actor);
                 }
+            }
+            // Stage transitions invalidate every in-flight wake; agents re-poll
+            // await_turn and get a fresh plan for the new stage.
+            if tool_invalidates_all_wakes(tool) {
+                g.outstanding.clear();
+                g.stall = 0;
+                g.wait_sig = None;
             }
         }
         if clear_directed {
@@ -601,13 +612,29 @@ fn tool_completes_wake(tool: &str, target: &SchedTarget) -> bool {
         SchedTarget::Host(HostTask::AdvanceNight) => tool == "skip_night_action",
         SchedTarget::Host(HostTask::SkipStuckWake { .. }) => tool == "skip_night_action",
         SchedTarget::Host(HostTask::CloseVoting) => tool == "close_vote",
+        // Discussion→Nominations only: never treat end_nominations as completing
+        // this wake (that would encourage collapsing the nomination window).
         SchedTarget::Host(HostTask::EndDay {
             in_discussion: true,
-        }) => tool == "open_nominations" || tool == "end_nominations",
+        }) => tool == "open_nominations",
         SchedTarget::Host(HostTask::EndDay {
             in_discussion: false,
         }) => tool == "end_nominations",
     }
+}
+
+/// Tools that change day/night stage (or end a game segment) and must drop every
+/// outstanding wake so concurrent agents cannot act on a superseded turn.
+fn tool_invalidates_all_wakes(tool: &str) -> bool {
+    matches!(
+        tool,
+        "open_nominations"
+            | "end_nominations"
+            | "close_vote"
+            | "start_game"
+            | "skip_night_action"
+            | "host_decide"
+    )
 }
 
 /// Stage fingerprint for rotation reset. Day keys include **living count** so a
@@ -967,6 +994,41 @@ mod tests {
             coord.rotation(),
             1,
             "mute speaker must be skipped after STALL_ESCALATE"
+        );
+    }
+
+    #[test]
+    fn phase_change_clears_all_outstanding_wakes() {
+        let (store, gid) = started_store();
+        let coord = WakeCoordinator::new();
+        coord.set_game_id(gid);
+        {
+            let mut st = store.lock().unwrap();
+            let g = st.get_mut(GameId(gid)).unwrap();
+            g.phase = Phase::Day {
+                day: 1,
+                stage: crate::game::DayStage::Nominations,
+            };
+            g.pending_night = None;
+            g.pending_host = None;
+            for s in &mut g.seats {
+                s.alive = true;
+            }
+        }
+        // Hand P0 a nominate wake.
+        let actor = WakeActor::Player(SeatId(0));
+        let v = coord.await_turn(&store, actor, "P0", Duration::from_secs(2));
+        assert_eq!(v["status"], "wake", "{v}");
+        assert!(coord.has_outstanding(actor));
+        // Host ends the day — supersedes every in-flight player wake.
+        coord.note_tool_success(&store, WakeActor::Host, "end_nominations");
+        assert!(
+            !coord.has_outstanding(actor),
+            "end_nominations must drop superseded nominate wakes"
+        );
+        assert!(
+            coord.working_labels().is_empty(),
+            "no mid-turn actors after phase-busting tool"
         );
     }
 

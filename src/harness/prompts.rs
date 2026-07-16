@@ -252,13 +252,18 @@ pub fn host_task_tick(
         }
         HostTask::EndDay { in_discussion } => {
             if *in_discussion {
-                "The table has finished its discussion rounds and **nobody nominated** — end the \
-                 day. Call `open_nominations`, then `end_nominations`. The engine tallies any \
-                 execution and moves everyone into the night automatically."
+                // Single action only: opening Nominations lets concurrent player
+                // sessions take nominate turns. Bundling end_nominations in the same
+                // wake collapses that window before models can act (live #66 race).
+                "The table has finished its discussion rounds and **nobody nominated** during \
+                 talk. Open the nomination stage so each living seat gets a turn: call \
+                 **`open_nominations` only**, then call `await_turn` again. Do **not** call \
+                 `end_nominations` in this wake — the harness will re-wake you to end the day \
+                 after everyone has had a nomination chance (or after a stall)."
                     .to_string()
             } else {
                 "Every player has had their chance to nominate and the table is done — end the \
-                 day. Call `end_nominations`. The engine executes the vote leader (if any), \
+                 day. Call **`end_nominations` only**. The engine executes the vote leader (if any), \
                  announces it, and moves everyone into the night automatically."
                     .to_string()
             }
@@ -570,7 +575,16 @@ mod tests {
             "h",
         );
         assert!(from_disc.contains("open_nominations"), "{from_disc}");
-        assert!(from_disc.contains("end_nominations"));
+        assert!(
+            from_disc.contains("open_nominations` only")
+                || from_disc.to_lowercase().contains("do **not** call"),
+            "must forbid bundling end_nominations: {from_disc}"
+        );
+        assert!(
+            !from_disc.contains("then `end_nominations`")
+                && !from_disc.contains("then end_nominations"),
+            "must not instruct open+end in one wake: {from_disc}"
+        );
         let from_noms = host_task_tick(
             7,
             &HostTask::EndDay {
@@ -580,7 +594,7 @@ mod tests {
             "h",
         );
         assert!(from_noms.contains("end_nominations"));
-        assert!(!from_noms.contains("Call `open_nominations`"));
+        assert!(!from_noms.contains("open_nominations"), "{from_noms}");
     }
 
     #[test]

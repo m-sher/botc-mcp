@@ -39,9 +39,10 @@ pub enum HostTask {
     SkipStuckWake { seat: SeatId },
     /// A vote is open but stopped progressing; close/tally it.
     CloseVoting,
-    /// The table is done with the day (talk rounds spent / nobody nominating);
-    /// end the day. `in_discussion` = still in Discussion (host must
-    /// `open_nominations` first, then `end_nominations`).
+    /// The table is done with the day (talk rounds spent / nobody nominating).
+    /// `in_discussion` = still in Discussion → host should call **only**
+    /// `open_nominations` (players then get Nominate wakes); otherwise host
+    /// should call `end_nominations` to close the day into night.
     EndDay { in_discussion: bool },
 }
 
