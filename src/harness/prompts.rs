@@ -290,33 +290,54 @@ pub fn player_task_tick(
              This is the ONLY action available to you right now — submit it and you're done."
                 .to_string(),
         ),
-        PlayerTask::Discuss { round, last_round } => (
-            format!(
-                "It is **day — open discussion**, and it is **your turn to speak** (talk round \
-                 {n}{last}). Players speak one at a time around the table; everything said so far \
-                 is in the snapshot below. When the table is done talking, the day moves to \
-                 nominations and an execution vote.\n\n\
-                 You are **not** required to claim a role. Choose what (if anything) to reveal with \
-                 timing in mind: a “safe” claim can look like someone dodging death; a strong town \
-                 claim can paint a target; holding out can look shady if the table needs your read. \
-                 Weigh what others will do with your words — nominations, night kills, who they trust. \
-                 Soft claims, partial info, redirects, and even a deliberate misclaim are all on the \
-                 table when they serve your win condition.\n\n\
-                 **Everyone can lie**, especially about things the table cannot audit. A seat saying \
-                 they were never woken at night is free to invent that — night contact is private, so \
-                 no one else can confirm or deny it. Do not treat unverifiable claims as hard fact; \
-                 you may also use such claims yourself when it helps your team.",
-                n = round + 1,
-                last = if *last_round {
-                    ", the FINAL talk round — after this the day moves on"
-                } else {
-                    ""
-                }
-            ),
+        PlayerTask::Discuss {
+            round,
+            last_round,
+            directed_reply,
+        } => (
+            if *directed_reply {
+                "It is **day — open discussion**, and **someone just publicly addressed you** \
+                 (`say` with `to` your seat). Everyone can still read the message; you are woken \
+                 immediately so you can answer. This is an **extra** turn and does **not** replace \
+                 your fair share of talk rounds.\n\n\
+                 Check `get_public_state` → `directed_say` (cap + per-seat sent/received counts) \
+                 before you direct a reply — do not target a seat that is already at the receive cap, \
+                 and do not send if you are at the send cap."
+                    .to_string()
+            } else {
+                format!(
+                    "It is **day — open discussion**, and it is **your turn to speak** (talk round \
+                     {n}{last}). Players speak one at a time around the table; everything said so far \
+                     is in the snapshot below. When the table is done talking, the day moves to \
+                     nominations and an execution vote.\n\n\
+                     You are **not** required to claim a role. Choose what (if anything) to reveal with \
+                     timing in mind: a “safe” claim can look like someone dodging death; a strong town \
+                     claim can paint a target; holding out can look shady if the table needs your read. \
+                     Weigh what others will do with your words — nominations, night kills, who they trust. \
+                     Soft claims, partial info, redirects, and even a deliberate misclaim are all on the \
+                     table when they serve your win condition.\n\n\
+                     **Everyone can lie**, especially about things the table cannot audit. A seat saying \
+                     they were never woken at night is free to invent that — night contact is private, so \
+                     no one else can confirm or deny it. Do not treat unverifiable claims as hard fact; \
+                     you may also use such claims yourself when it helps your team.\n\n\
+                     Optional: publicly address one seat with `say.to` to wake them immediately (still \
+                     fully public). Check `directed_say` on public state for the cap and counts first.",
+                    n = round + 1,
+                    last = if *last_round {
+                        ", the FINAL talk round — after this the day moves on"
+                    } else {
+                        ""
+                    }
+                )
+            },
             "- `say` `{\"game_id\": {gid}, \"text\": \"<what you tell the table>\"}` — **required this \
              turn**: advance the social game (press a contradiction, float a theory, answer a question, \
              drop a careful read, or deliberately stay vague). Be concrete about *someone or something* \
              — not a content-free filler line — but do **not** treat a full role claim as mandatory.\n\
+             - Optional `to`: `{\"game_id\": {gid}, \"text\": \"...\", \"to\": <seat>}` — same public \
+             message, but **immediately wakes that seat** (not a whisper). Max 6 directed sends and 6 \
+             directed receives per player per discussion day; refuse targets already at the receive cap \
+             (see `get_public_state.directed_say`).\n\
              - `nominate` `{\"game_id\": {gid}, \"target\": <seat number>}` — optional: if you already \
              want someone executed, this immediately opens the vote on them (once per day) and counts \
              as your automatic yes."
@@ -464,6 +485,7 @@ mod tests {
             &PlayerTask::Discuss {
                 round: 1,
                 last_round: true,
+                directed_reply: false,
             },
             "phase: Day",
         );
@@ -545,6 +567,7 @@ mod tests {
             &PlayerTask::Discuss {
                 round: 0,
                 last_round: false,
+                directed_reply: false,
             },
             "phase: Day",
         );

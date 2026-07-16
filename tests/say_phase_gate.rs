@@ -14,14 +14,14 @@ fn say_is_day_only() {
 
     // Lobby (fresh game, not started): no talking.
     assert!(matches!(
-        g.say(SeatId(0), "hi".into()),
+        g.say(SeatId(0), "hi".into(), None),
         Err(GameError::WrongPhase)
     ));
 
     // First night: silent.
     g.phase = Phase::FirstNight { cursor: 0 };
     assert!(matches!(
-        g.say(SeatId(0), "psst, who is evil?".into()),
+        g.say(SeatId(0), "psst, who is evil?".into(), None),
         Err(GameError::WrongPhase)
     ));
 
@@ -31,7 +31,7 @@ fn say_is_day_only() {
         cursor: 0,
     };
     assert!(matches!(
-        g.say(SeatId(3), "night whisper".into()),
+        g.say(SeatId(3), "night whisper".into(), None),
         Err(GameError::WrongPhase)
     ));
 
@@ -40,12 +40,70 @@ fn say_is_day_only() {
         day: 1,
         stage: DayStage::Discussion,
     };
-    assert!(g.say(SeatId(0), "good morning".into()).is_ok());
+    assert!(g.say(SeatId(0), "good morning".into(), None).is_ok());
 
     // Day / nominations: allowed (players defend / accuse).
     g.phase = Phase::Day {
         day: 1,
         stage: DayStage::Nominations,
     };
-    assert!(g.say(SeatId(1), "I think P3 is the Imp".into()).is_ok());
+    assert!(g
+        .say(SeatId(1), "I think P3 is the Imp".into(), None)
+        .is_ok());
+}
+
+#[test]
+fn directed_say_is_public_and_caps_per_player() {
+    use botc_mcp::comms::PublicEvent;
+    use botc_mcp::game::DIRECTED_SAY_CAP;
+
+    let mut g = game7();
+    g.phase = Phase::Day {
+        day: 1,
+        stage: DayStage::Discussion,
+    };
+
+    g.say(SeatId(0), "P1 what did you see?".into(), Some(SeatId(1)))
+        .unwrap();
+    assert_eq!(g.pending_directed_wake, Some(SeatId(1)));
+    assert_eq!(g.directed_say_sent[0], 1);
+    assert_eq!(g.directed_say_received[1], 1);
+    assert!(g.public_log.since(0).iter().any(|(_, e)| matches!(
+        e,
+        PublicEvent::Chat {
+            seat: SeatId(0),
+            to: Some(SeatId(1)),
+            ..
+        }
+    )));
+
+    // Cap: fill received on seat 1 to the limit, then one more fails.
+    g.pending_directed_wake = None;
+    g.directed_say_received[1] = DIRECTED_SAY_CAP;
+    let err = g
+        .say(SeatId(2), "again".into(), Some(SeatId(1)))
+        .unwrap_err();
+    assert!(
+        format!("{err}").to_lowercase().contains("cap")
+            || format!("{err:?}").to_lowercase().contains("cap"),
+        "expected receive cap error, got {err:?}"
+    );
+
+    // Cap: fill sent on seat 0, then further directed fails.
+    g.directed_say_received[1] = 0;
+    g.directed_say_sent[0] = DIRECTED_SAY_CAP;
+    let err = g
+        .say(SeatId(0), "too many".into(), Some(SeatId(3)))
+        .unwrap_err();
+    assert!(
+        format!("{err}").to_lowercase().contains("cap")
+            || format!("{err:?}").to_lowercase().contains("cap"),
+        "expected send cap error, got {err:?}"
+    );
+
+    // Undirected still works at send cap.
+    assert!(g.say(SeatId(0), "to the table".into(), None).is_ok());
+    // Self-target rejected.
+    let err = g.say(SeatId(2), "me".into(), Some(SeatId(2))).unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("yourself"));
 }

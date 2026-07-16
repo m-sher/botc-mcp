@@ -912,7 +912,7 @@ impl App {
         };
         // Read all we need under one short lock: the plan, the prompt context,
         // and whether the game is over. Do NOT hold the lock while spawning grok.
-        let (plan, summary, hint, ended, sig, stall, state_dbg) = {
+        let (plan, summary, hint, ended, sig, stall, state_dbg, directed_reply) = {
             let st = self.store.lock().unwrap();
             let Some(g) = st.get(GameId(gid)) else {
                 return;
@@ -933,15 +933,28 @@ impl App {
                 0
             };
             let plan = plan_ticks(g, self.tick_rotation, stall);
+            let directed_reply = plan.iter().any(|t| {
+                matches!(
+                    t,
+                    SchedTarget::Player {
+                        task: crate::harness::scheduler::PlayerTask::Discuss {
+                            directed_reply: true,
+                            ..
+                        },
+                        ..
+                    }
+                )
+            });
             let (summary, hint) = game_summary_and_hint(g);
             let state_dbg = format!(
-                "phase={:?} pending_host={:?} pending_night={:?} nom={:?}",
+                "phase={:?} pending_host={:?} pending_night={:?} nom={:?} dir_wake={:?}",
                 g.phase,
                 g.pending_host.as_ref().map(|p| p.kind_str()),
                 g.pending_night.as_ref().map(|w| w.seat.0),
                 g.current_nomination
                     .as_ref()
                     .map(|n| (n.by.0, n.target.0, n.votes.len())),
+                g.pending_directed_wake.map(|s| s.0),
             );
             (
                 plan,
@@ -951,8 +964,18 @@ impl App {
                 sig,
                 stall,
                 state_dbg,
+                directed_reply,
             )
         };
+        // Clear consumed / stalled directed wakes under a short write lock.
+        {
+            let mut st = self.store.lock().unwrap();
+            if let Some(g) = st.get_mut(GameId(gid)) {
+                if directed_reply || stall >= crate::harness::scheduler::STALL_ESCALATE {
+                    g.pending_directed_wake = None;
+                }
+            }
+        }
         self.wait_sig = sig.clone();
         self.stall = stall;
 
@@ -1013,9 +1036,11 @@ impl App {
                     );
                     crate::dlog!("TICK -> tick_scheduled spawned {spawned}/{}", plan.len());
                     if spawned > 0 {
-                        // Consume the turn slot only when someone actually ran —
-                        // a failed spawn must not silently skip a speaker.
-                        self.tick_rotation = self.tick_rotation.wrapping_add(1);
+                        // Directed replies are extra wakes — do not burn a round-robin
+                        // slot so everyone still gets DISCUSSION_ROUNDS fair turns.
+                        if !directed_reply {
+                            self.tick_rotation = self.tick_rotation.wrapping_add(1);
+                        }
                     } else {
                         // Event-driven auto would re-fire immediately while idle; if a
                         // tick spawns nothing (broken grok / all errored), stop auto to
@@ -1246,6 +1271,12 @@ fn fmt_public_event(e: &crate::comms::PublicEvent) -> String {
     // begins — which makes agents think a message was "cut off" or reorder events.
     let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     match e {
+        Chat {
+            seat,
+            text,
+            to: Some(target),
+            ..
+        } => format!("P{} → P{}: {}", seat.0, target.0, one_line(text)),
         Chat { seat, text, .. } => format!("P{}: {}", seat.0, one_line(text)),
         StorytellerAnnounce { text } => format!("Storyteller: {}", one_line(text)),
         Nominated { by, target } => format!("P{} nominated P{}", by.0, target.0),

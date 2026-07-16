@@ -260,7 +260,17 @@ fn tool_schema(name: &str) -> Value {
             },
             "required": ["topic"],
         }),
-        "say" | "st_announce" | "host_queue_lie" => json!({
+        "say" => json!({
+            "type": "object",
+            "properties": {
+                "game_id": game_id,
+                "token": token,
+                "text": { "type": "string", "description": "The message text (always public to the whole table)" },
+                "to": seat("optional: publicly address this seat; immediately wakes them during discussion (still fully public; max 6 directed sends/receives per player per discussion day)"),
+            },
+            "required": ["game_id", "text"],
+        }),
+        "st_announce" | "host_queue_lie" => json!({
             "type": "object",
             "properties": {
                 "game_id": game_id,
@@ -344,7 +354,7 @@ fn tool_description(name: &str) -> &'static str {
         "list_rules_topics" => "Public list of gameplay rules topics players may read",
         "get_rules_topic" => "Load one public rules doc by topic id (e.g. gameplay_loop, voting)",
         "get_host_state" => "Host-only grimoire (true roles, markers, pending wake, seed, secret_salt)",
-        "say" => "Player public table talk (no whispers)",
+        "say" => "Player public table talk; optional `to` seat publicly addresses them and wakes them (not a whisper; directed cap 6/player/discussion)",
         "st_announce" => "Host public storyteller announcement",
         "night_action" => "Player night choice for current pending wake",
         "day_action" => "Player day ability (Slayer slay)",
@@ -720,6 +730,12 @@ fn tool_get_public_state(store: &SharedStore, args: Value) -> Result<Value, RpcE
                 "ghost_vote_available": s.ghost_vote_available,
             })).collect::<Vec<_>>(),
             "winner": view.winner.map(winner_json),
+            "directed_say": {
+                "cap": view.directed_say_cap,
+                "sent": view.directed_say_sent,
+                "received": view.directed_say_received,
+                "note": "Optional say.to publicly addresses a seat and wakes them during discussion. Each seat may send or receive at most `cap` directed says per discussion day. Check counts before directing.",
+            },
         }))
     })
 }
@@ -887,11 +903,15 @@ fn tool_say(store: &SharedStore, args: Value) -> Result<Value, RpcError> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| invalid_params("say requires text"))?
         .to_string();
+    let to = match args.get("to") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(seat_id(v)?),
+    };
     with_store_mut(store, |st| {
         let game = st
             .get_mut(game_id)
             .ok_or_else(|| tool_err(ToolError::BadRequest("unknown game_id")))?;
-        let event_id = tools::say(game, &token, text).map_err(tool_err)?;
+        let event_id = tools::say(game, &token, text, to).map_err(tool_err)?;
         Ok(json!({ "event_id": event_id }))
     })
 }
@@ -1243,9 +1263,20 @@ fn choice_schema_json(s: &ChoiceSchema) -> Value {
 
 fn public_event_json(e: &PublicEvent) -> Value {
     match e {
-        PublicEvent::Chat { seat, name, text } => json!({
-            "type": "chat", "seat": seat.0, "name": name, "text": text
-        }),
+        PublicEvent::Chat {
+            seat,
+            name,
+            text,
+            to,
+        } => {
+            let mut o = json!({
+                "type": "chat", "seat": seat.0, "name": name, "text": text
+            });
+            if let Some(t) = to {
+                o.as_object_mut().unwrap().insert("to".into(), json!(t.0));
+            }
+            o
+        }
         PublicEvent::StorytellerAnnounce { text } => {
             json!({ "type": "storyteller_announce", "text": text })
         }

@@ -61,7 +61,13 @@ pub enum PlayerTask {
     NightWake { prompt: String },
     /// Day discussion: it is this seat's turn to speak (round-robin, one at a
     /// time). `last_round` = final talk round before the day moves on.
-    Discuss { round: usize, last_round: bool },
+    /// `directed_reply` = woken because someone publicly addressed them with
+    /// `say.to` — does **not** consume a round-robin rotation slot.
+    Discuss {
+        round: usize,
+        last_round: bool,
+        directed_reply: bool,
+    },
     /// Nominations stage: this seat may nominate now (or decline).
     Nominate,
     /// A nomination is open and it is this seat's turn to vote (clockwise).
@@ -122,6 +128,11 @@ pub fn plan_ticks(game: &Game, rotation: usize, stall: usize) -> Vec<SchedTarget
             // woken — the day is player-driven (any player's `nominate`
             // auto-opens nominations). The caller resets `rotation` to 0 when
             // the stage begins, so round = rotation / living-count.
+            //
+            // Directed public `say.to` queues `pending_directed_wake`: that seat
+            // is offered an immediate extra turn (does not burn round-robin).
+            // After STALL_ESCALATE stalled cycles, fall through so a mute target
+            // cannot freeze the table (caller should clear the pending wake).
             let living: Vec<SeatId> = game
                 .seats
                 .iter()
@@ -130,6 +141,19 @@ pub fn plan_ticks(game: &Game, rotation: usize, stall: usize) -> Vec<SchedTarget
                 .collect();
             if living.is_empty() {
                 return vec![];
+            }
+            if let Some(wake) = game.pending_directed_wake {
+                if stall < STALL_ESCALATE {
+                    let round = rotation / living.len();
+                    return vec![SchedTarget::Player {
+                        seat: wake,
+                        task: PlayerTask::Discuss {
+                            round,
+                            last_round: false,
+                            directed_reply: true,
+                        },
+                    }];
+                }
             }
             let round = rotation / living.len();
             if round >= DISCUSSION_ROUNDS {
@@ -143,6 +167,7 @@ pub fn plan_ticks(game: &Game, rotation: usize, stall: usize) -> Vec<SchedTarget
                 task: PlayerTask::Discuss {
                     round,
                     last_round: round + 1 == DISCUSSION_ROUNDS,
+                    directed_reply: false,
                 },
             }]
         }
@@ -210,13 +235,14 @@ pub fn plan_ticks(game: &Game, rotation: usize, stall: usize) -> Vec<SchedTarget
 }
 
 /// A stable signature of what the engine is currently waiting on, for stall
-/// detection. `None` in phases that shouldn't stall-escalate (lobby, discussion
-/// — talk rounds are bounded by [`DISCUSSION_ROUNDS`], not by stalling — and
-/// ended). The caller compares this cycle's signature to the previous one: same
-/// non-`None` signature => increment the stall count; otherwise reset it.
-/// Vote signatures include the vote/pass count so each landed vote resets the
-/// stall; the nominations-idle signature includes the nominator/nominee counts
-/// so each new nomination resets it.
+/// detection. `None` in phases that shouldn't stall-escalate (lobby, undirected
+/// discussion — talk rounds are bounded by [`DISCUSSION_ROUNDS`], not by stalling —
+/// and ended). Directed discussion wakes *do* stall-escalate so a mute target
+/// cannot freeze the table. The caller compares this cycle's signature to the
+/// previous one: same non-`None` signature => increment the stall count;
+/// otherwise reset it. Vote signatures include the vote/pass count so each landed
+/// vote resets the stall; the nominations-idle signature includes the
+/// nominator/nominee counts so each new nomination resets it.
 pub fn wait_signature(game: &Game) -> Option<String> {
     match &game.phase {
         Phase::FirstNight { .. } | Phase::Night { .. } => {
@@ -228,6 +254,12 @@ pub fn wait_signature(game: &Game) -> Option<String> {
                     .map(|w| format!("night_wake:{}", w.seat.0))
             }
         }
+        Phase::Day {
+            stage: DayStage::Discussion,
+            ..
+        } => game
+            .pending_directed_wake
+            .map(|s| format!("dir_wake:{}", s.0)),
         Phase::Day {
             day,
             stage: DayStage::Nominations,
@@ -469,11 +501,17 @@ mod tests {
         // Second round: same order, round=1 and flagged as last (DISCUSSION_ROUNDS=2).
         match &plan_ticks(&g, 7, 0)[0] {
             SchedTarget::Player {
-                task: PlayerTask::Discuss { round, last_round },
+                task:
+                    PlayerTask::Discuss {
+                        round,
+                        last_round,
+                        directed_reply,
+                    },
                 ..
             } => {
                 assert_eq!(*round, 1);
                 assert!(*last_round);
+                assert!(!*directed_reply);
             }
             t => panic!("expected Discuss, got {t:?}"),
         }
@@ -668,8 +706,43 @@ mod tests {
     }
 
     #[test]
+    fn directed_wake_interrupts_discussion_without_host() {
+        let mut g = new_game(7);
+        g.phase = Phase::Day {
+            day: 1,
+            stage: DayStage::Discussion,
+        };
+        g.pending_directed_wake = Some(SeatId(4));
+        let plan = plan_ticks(&g, 0, 0);
+        assert_eq!(plan.len(), 1);
+        match &plan[0] {
+            SchedTarget::Player {
+                seat,
+                task: PlayerTask::Discuss { directed_reply, .. },
+            } => {
+                assert_eq!(*seat, SeatId(4));
+                assert!(*directed_reply);
+            }
+            t => panic!("expected directed Discuss, got {t:?}"),
+        }
+        // After stall escalate, fall through to normal rotation (P0).
+        let plan = plan_ticks(&g, 0, STALL_ESCALATE);
+        match &plan[0] {
+            SchedTarget::Player {
+                seat,
+                task: PlayerTask::Discuss { directed_reply, .. },
+            } => {
+                assert_eq!(*seat, SeatId(0));
+                assert!(!*directed_reply);
+            }
+            t => panic!("expected RR Discuss after stall, got {t:?}"),
+        }
+        assert_eq!(wait_signature(&g).as_deref(), Some("dir_wake:4"));
+    }
+
+    #[test]
     fn wait_signature_tracks_the_current_block() {
-        // Discussion: no stall signature (rounds bound it instead).
+        // Discussion: no stall signature unless a directed wake is pending.
         let mut g = new_game(7);
         g.phase = Phase::Day {
             day: 1,

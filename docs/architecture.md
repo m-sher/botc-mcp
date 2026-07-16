@@ -118,7 +118,7 @@ Auth: every tool takes `token` (host or player). Server rejects wrong role for t
 
 | Tool | Auth | Behavior |
 | --- | --- | --- |
-| `say` | player (alive or dead) | Appends `{ seat, name, text, ts }` to **public** log. Visible to all via `get_public_log` / subscriptions. **No** `to_seat` parameter. |
+| `say` | player (alive or dead) | Appends `{ seat, name, text, to? }` to **public** log. Visible to all. Optional `to` publicly addresses a seat and immediately wakes them during Discussion (not a whisper). Cap: 6 directed sends and 6 receives per player per discussion day; counts on `get_public_state.directed_say`. |
 
 Future (explicitly out of scope now): `whisper`, private rooms, evil-only chat.
 

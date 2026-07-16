@@ -127,7 +127,7 @@ fallbacks. The engine self-drives the rest — a player's `nominate` auto-opens 
 | Lobby | Host → `start_game` (normally already done by the TUI at launch) |
 | Night, `pending_host` set | Host → resolve that one Storyteller decision |
 | Night, `pending_night` set | **only that seat** → its night action (targeted wake prompt) |
-| Day / Discussion | **one living player at a time**, seat order, `DISCUSSION_ROUNDS` (2) full table rounds — no host |
+| Day / Discussion | **one living player at a time**, seat order, `DISCUSSION_ROUNDS` (2) full table rounds — no host. A public `say.to` inserts an immediate extra wake for the target (does not consume a RR slot; directed send/receive cap 6 each) |
 | Day / Discussion, rounds spent | Host → `open_nominations` + `end_nominations` (close the day) |
 | Day / Nominations, no open vote | one living player who hasn't nominated yet (rotating) — no host |
 | Day / Nominations, vote open | **one voter at a time, clockwise from the nominee**, shown the tally so far |

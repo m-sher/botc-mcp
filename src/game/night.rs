@@ -798,6 +798,7 @@ pub fn dawn(game: &mut Game) {
     // Undertaker already ran this night; clear execution marker for the new day.
     game.executed_today = None;
     crate::game::day::reset_day_vote_state(game);
+    game.reset_directed_say();
     game.public_log.push(PublicEvent::PhaseChanged {
         summary: format!("Day {day} — Discussion"),
     });

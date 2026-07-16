@@ -9,6 +9,12 @@ pub struct PublicStateView {
     pub phase: String,
     pub seats: Vec<PublicSeatView>,
     pub winner: Option<Winner>,
+    /// Max directed public says per seat (sent or received) this discussion day.
+    pub directed_say_cap: u32,
+    /// Per-seat directed says sent this discussion day (index = seat id).
+    pub directed_say_sent: Vec<u32>,
+    /// Per-seat directed says received this discussion day (index = seat id).
+    pub directed_say_received: Vec<u32>,
 }
 
 /// Structured “you must act” info (acting seat only; never leaks other seats’ wakes).
