@@ -242,7 +242,9 @@ fn dispatch(
                 invoke_await_turn(store, wake, &req.arguments)
             } else {
                 let r = mcp_server::invoke_named_tool(store, name, req.arguments.clone());
-                if r.is_ok() {
+                // MCP wraps tool failures as Ok({ isError: true }) — do NOT treat
+                // those as completing a wake (live #64 bug: wrong-tool spam).
+                if tool_call_succeeded(&r) {
                     if let Some(ref tok) = token {
                         if let Some(actor) = resolve_wake_actor(store, tok, &req.arguments) {
                             wake.note_tool_success(store, actor, name);
@@ -252,6 +254,9 @@ fn dispatch(
                 r
             };
             let (ok, err, result_preview) = match &outcome {
+                Ok(v) if mcp_result_is_error(v) => {
+                    (false, Some(mcp_error_message(v)), Some(v.to_string()))
+                }
                 Ok(v) => (true, None, Some(v.to_string())),
                 Err(e) => (false, Some(e.clone()), None),
             };
@@ -367,6 +372,25 @@ fn invoke_await_turn(
     }))
 }
 
+/// True when `invoke_named_tool` produced a genuine success (not MCP isError).
+fn tool_call_succeeded(r: &Result<Value, String>) -> bool {
+    matches!(r, Ok(v) if !mcp_result_is_error(v))
+}
+
+fn mcp_result_is_error(v: &Value) -> bool {
+    v.get("isError").and_then(|b| b.as_bool()).unwrap_or(false)
+}
+
+fn mcp_error_message(v: &Value) -> String {
+    v.get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|item| item.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("tool error")
+        .to_string()
+}
+
 /// Client used by `botc-agent-mcp` to call the harness.
 pub struct SocketClient {
     stream: UnixStream,
@@ -428,7 +452,22 @@ impl SocketClient {
 mod tests {
     use super::*;
     use crate::mcp_server;
+    use serde_json::json;
     use std::time::Instant;
+
+    #[test]
+    fn is_error_payload_is_not_a_successful_tool_call() {
+        let ok = json!({"content": [], "isError": false});
+        let err = json!({
+            "content": [{ "type": "text", "text": "not your wake" }],
+            "isError": true
+        });
+        assert!(tool_call_succeeded(&Ok(ok)));
+        assert!(!tool_call_succeeded(&Ok(err.clone())));
+        assert!(!tool_call_succeeded(&Err("transport".into())));
+        assert!(mcp_result_is_error(&err));
+        assert_eq!(mcp_error_message(&err), "not your wake");
+    }
 
     #[test]
     fn stop_after_socket_unlinked_does_not_deadlock() {

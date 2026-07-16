@@ -168,6 +168,9 @@ pub fn plan_ticks(game: &Game, rotation: usize, stall: usize) -> Vec<SchedTarget
                     in_discussion: true,
                 })];
             }
+            // Mute / wrong-tool speakers: the wake coordinator advances `rotation`
+            // once stall hits STALL_ESCALATE (see `wait_signature` disc:* keys).
+            // Host is still not woken mid-discussion.
             vec![SchedTarget::Player {
                 seat: living[rotation % living.len()],
                 task: PlayerTask::Discuss {
@@ -243,15 +246,18 @@ pub fn plan_ticks(game: &Game, rotation: usize, stall: usize) -> Vec<SchedTarget
 }
 
 /// A stable signature of what the engine is currently waiting on, for stall
-/// detection. `None` in phases that shouldn't stall-escalate (lobby, undirected
-/// discussion — talk rounds are bounded by [`DISCUSSION_ROUNDS`], not by stalling —
-/// and ended). Directed discussion wakes *do* stall-escalate so a mute target
-/// cannot freeze the table. The caller compares this cycle's signature to the
-/// previous one: same non-`None` signature => increment the stall count;
-/// otherwise reset it. Vote signatures include the vote/pass count so each landed
-/// vote resets the stall; the nominations-idle signature includes the
-/// nominator/nominee counts so each new nomination resets it.
-pub fn wait_signature(game: &Game) -> Option<String> {
+/// detection. `None` only in lobby / ended (nothing to escalate).
+///
+/// Discussion is keyed on the current round-robin speaker (`rotation`) so a mute
+/// or wrong-tool agent cannot freeze the table forever — same stall path as night
+/// wakes. Directed discussion wakes use `dir_wake:{seat}` instead.
+///
+/// The caller compares this cycle's signature to the previous one: same non-`None`
+/// signature => increment the stall count; otherwise reset it. Vote signatures
+/// include the vote/pass count so each landed vote resets the stall; the
+/// nominations-idle signature includes the nominator/nominee counts so each new
+/// nomination resets it.
+pub fn wait_signature(game: &Game, rotation: usize) -> Option<String> {
     match &game.phase {
         Phase::FirstNight { .. } | Phase::Night { .. } => {
             if let Some(ph) = &game.pending_host {
@@ -263,11 +269,34 @@ pub fn wait_signature(game: &Game) -> Option<String> {
             }
         }
         Phase::Day {
+            day,
             stage: DayStage::Discussion,
             ..
-        } => game
-            .pending_directed_wake
-            .map(|s| format!("dir_wake:{}", s.0)),
+        } => {
+            if let Some(s) = game.pending_directed_wake {
+                return Some(format!("dir_wake:{}", s.0));
+            }
+            let living: Vec<SeatId> = game
+                .seats
+                .iter()
+                .filter(|s| s.alive)
+                .map(|s| s.id)
+                .collect();
+            if living.is_empty() {
+                return None;
+            }
+            let round = rotation / living.len();
+            if round >= DISCUSSION_ROUNDS {
+                // Host should end the day — stall signature pins that wait.
+                return Some(format!("disc_end:{day}:{}", living.len()));
+            }
+            let speaker = living[rotation % living.len()];
+            Some(format!(
+                "disc:{day}:r{rotation}:p{}:{}",
+                speaker.0,
+                living.len()
+            ))
+        }
         Phase::Day {
             day,
             stage: DayStage::Nominations,
@@ -745,39 +774,48 @@ mod tests {
             }
             t => panic!("expected RR Discuss after stall, got {t:?}"),
         }
-        assert_eq!(wait_signature(&g).as_deref(), Some("dir_wake:4"));
+        assert_eq!(wait_signature(&g, 0).as_deref(), Some("dir_wake:4"));
     }
 
     #[test]
     fn wait_signature_tracks_the_current_block() {
-        // Discussion: no stall signature unless a directed wake is pending.
+        // Discussion: keyed on current RR speaker so mute agents stall-escalate.
         let mut g = new_game(7);
         g.phase = Phase::Day {
             day: 1,
             stage: DayStage::Discussion,
         };
-        assert_eq!(wait_signature(&g), None);
+        let sig0 = wait_signature(&g, 0);
+        assert!(
+            sig0.as_deref().unwrap().starts_with("disc:1:r0:p"),
+            "{sig0:?}"
+        );
+        assert_ne!(
+            wait_signature(&g, 1),
+            sig0,
+            "next speaker changes signature"
+        );
         // Open vote: keyed on the nomination AND vote progress — a landed vote
         // changes the signature, resetting the stall counter.
         let mut gv = open_vote_game();
-        assert_eq!(wait_signature(&gv).as_deref(), Some("vote:0-1:1:7"));
+        assert_eq!(wait_signature(&gv, 0).as_deref(), Some("vote:0-1:1:7"));
         gv.current_nomination
             .as_mut()
             .unwrap()
             .votes
             .push((SeatId(2), false));
-        assert_eq!(wait_signature(&gv).as_deref(), Some("vote:0-1:2:7"));
+        assert_eq!(wait_signature(&gv, 0).as_deref(), Some("vote:0-1:2:7"));
         // A mid-stage death (Slayer) changes the roster → signature changes →
         // the fairness window restarts.
         gv.seats[6].alive = false;
-        assert_eq!(wait_signature(&gv).as_deref(), Some("vote:0-1:2:6"));
+        assert_eq!(wait_signature(&gv, 0).as_deref(), Some("vote:0-1:2:6"));
         gv.seats[6].alive = true;
         // Nominations with no open vote: idle signature keyed on nomination
         // counts — a new nomination resets the stall.
         gv.current_nomination = None;
-        let sig_a = wait_signature(&gv);
+        let sig_a = wait_signature(&gv, 0);
         assert!(sig_a.as_deref().unwrap().starts_with("noms_idle:1:"));
         gv.day_nominators.push(SeatId(3));
-        assert_ne!(wait_signature(&gv), sig_a);
+        assert_ne!(wait_signature(&gv, 0), sig_a);
     }
 }

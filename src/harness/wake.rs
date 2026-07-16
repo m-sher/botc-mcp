@@ -330,7 +330,7 @@ fn try_deliver(
     }
 
     // Stall bump on stable wait signature (wall clock).
-    let sig = wait_signature(game);
+    let sig = wait_signature(game, guard.rotation);
     let now = Instant::now();
     if sig.is_some() && sig == guard.wait_sig {
         let due = guard
@@ -362,8 +362,29 @@ fn try_deliver(
             // Store busy — soft idle; next poll retries the clear.
             Err(_) => return Deliver::Idle,
         }
+        guard.stall = 0;
+        guard.wait_sig = None;
         // Re-enter once without the directed wake so this deliver sees the RR plan.
         return try_deliver(store, guard, actor, display_name);
+    }
+
+    // Stalled undirected discussion speaker: skip them so a mute / wrong-tool
+    // agent cannot spin redelivery forever (live #64 bug).
+    if guard.stall >= crate::harness::scheduler::STALL_ESCALATE
+        && game.pending_directed_wake.is_none()
+        && matches!(
+            game.phase,
+            Phase::Day {
+                stage: crate::game::DayStage::Discussion,
+                ..
+            }
+        )
+    {
+        guard.rotation = guard.rotation.wrapping_add(1);
+        guard.stall = 0;
+        guard.wait_sig = None;
+        guard.outstanding.clear();
+        guard.last_stall_bump = Some(now);
     }
 
     let plan = plan_ticks(game, guard.rotation, guard.stall);
@@ -760,6 +781,88 @@ mod tests {
     }
 
     #[test]
+    fn wrong_tool_does_not_complete_discuss_wake() {
+        let (store, gid) = started_store();
+        let coord = WakeCoordinator::new();
+        coord.set_game_id(gid);
+        {
+            let mut st = store.lock().unwrap();
+            let g = st.get_mut(GameId(gid)).unwrap();
+            g.phase = Phase::Day {
+                day: 1,
+                stage: crate::game::DayStage::Discussion,
+            };
+            g.pending_night = None;
+            g.pending_host = None;
+            for s in &mut g.seats {
+                s.alive = true;
+            }
+        }
+        let actor = WakeActor::Player(SeatId(0));
+        let v = coord.await_turn(&store, actor, "P0", Duration::from_secs(2));
+        assert_eq!(v["status"], "wake", "{v}");
+        assert_eq!(v["kind"], "discuss");
+        // Misbehaving agent answers with night_action — must not clear the wake.
+        coord.note_tool_success(&store, actor, "night_action");
+        assert!(
+            coord.inner.lock().unwrap().outstanding.contains_key(&actor),
+            "wrong tool must leave discuss wake outstanding"
+        );
+        let v2 = coord.await_turn(&store, actor, "P0", Duration::from_secs(2));
+        assert_eq!(v2["status"], "wake", "{v2}");
+        assert_eq!(
+            v2["wake_id"], v["wake_id"],
+            "same discuss wake redelivered after wrong tool"
+        );
+    }
+
+    #[test]
+    fn mute_discussion_speaker_skipped_after_stall() {
+        let (store, gid) = started_store();
+        let coord = WakeCoordinator::new();
+        coord.set_game_id(gid);
+        {
+            let mut st = store.lock().unwrap();
+            let g = st.get_mut(GameId(gid)).unwrap();
+            g.phase = Phase::Day {
+                day: 1,
+                stage: crate::game::DayStage::Discussion,
+            };
+            g.pending_night = None;
+            g.pending_host = None;
+            for s in &mut g.seats {
+                s.alive = true;
+            }
+        }
+        // Deliver P0's discuss wake, then force stall past escalate without say.
+        let _ = coord.await_turn(
+            &store,
+            WakeActor::Player(SeatId(0)),
+            "P0",
+            Duration::from_secs(1),
+        );
+        assert_eq!(coord.rotation(), 0);
+        {
+            let mut g = coord.inner.lock().unwrap();
+            g.stall = STALL_ESCALATE;
+            g.wait_sig = Some("disc:1:r0:p0:5".into());
+            g.last_stall_bump = Some(Instant::now());
+        }
+        // Any await_turn poll runs try_deliver, which should skip the mute seat.
+        let _ = coord.await_turn(
+            &store,
+            WakeActor::Player(SeatId(1)),
+            "P1",
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            coord.rotation(),
+            1,
+            "mute speaker must be skipped after STALL_ESCALATE"
+        );
+    }
+
+    #[test]
     fn directed_reply_say_does_not_advance_rotation() {
         let (store, gid) = started_store();
         let coord = WakeCoordinator::new();
@@ -841,7 +944,7 @@ mod tests {
             g.stall = STALL_ESCALATE;
             let sig = {
                 let st = store.lock().unwrap();
-                wait_signature(st.get(GameId(gid)).unwrap())
+                wait_signature(st.get(GameId(gid)).unwrap(), 0)
             };
             g.wait_sig = sig;
             g.last_stall_bump = Some(Instant::now());
