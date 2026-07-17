@@ -326,10 +326,10 @@ impl App {
         }
         let used: std::collections::BTreeSet<&str> =
             pick.iter().map(|&ci| pool[ci].model.as_str()).collect();
-        // The rater skips same-model pairs, so a one-model table yields no Bradley–Terry
-        // edge at all. The balancer guarantees ≥2 models whenever it can; if only one is
-        // eligible it cannot — say so rather than quietly seating a game the leaderboard
-        // will learn nothing from.
+        // A one-model table has zero team contrast, so it teaches the rater nothing. The
+        // balancer guarantees ≥2 models whenever it can; if only one is eligible it
+        // cannot — say so rather than quietly seating a game the leaderboard will learn
+        // nothing from.
         self.status = if used.len() < 2 {
             format!(
                 "ONLY 1 eligible model ({}) — this table produces NO leaderboard data; \

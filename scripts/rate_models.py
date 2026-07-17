@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Rate models from botc-results.jsonl (finished games only).
 
-Multiplayer team outcomes → pairwise Bradley–Terry:
-  each winning-seat model "beats" each losing-seat model (same-model pairs skipped).
+Multiplayer team outcomes → additive Bradley–Terry:
+  each game is one team-vs-team contest whose winner is the positive class, and a
+  team's strength is the mean rating of its seats, so
+  P(winning team wins) = sigmoid(mean_win_rating − mean_lose_rating).
+  A strong teammate raises the team mean, so a weaker seat earns little credit for
+  a win the team was already expected to take.
 Batch MAP fit with Gaussian prior around 1500 Elo. Writes ratings.json for the
 publisher (or prints JSON with --stdout).
 
@@ -67,27 +71,31 @@ def node_key(backend, model) -> str:
     return f"{backend}:{model}"
 
 
-def expand_pairwise(
+def build_contests(
     ends: list[dict],
 ) -> tuple[
-    list[tuple[str, str, float]],
+    list[dict[str, float]],
     dict[str, int],
     dict[str, list[int]],
     dict[str, dict[str, int]],
 ]:
-    """Return (pairs, games_played, seat_wins/losses, role_side_counts).
+    """Return (designs, games_played, seat_wins/losses, role_side_counts).
 
-    weight is the number of seat-pairs (integer, stored as float for BT).
-    role_side_counts is display-only: per-model seat counts by team and
+    Each contested game yields one design vector mapping model → (share of
+    winning-team seats) − (share of losing-team seats), where share is a model's
+    seat count over its team's seat count. The linear predictor Σ weight·rating is
+    then mean_win_rating − mean_lose_rating. Games with no cross-team contrast are
+    skipped. role_side_counts is display-only: per-model seat counts by team and
     character_type (does not feed the BT fit).
     """
-    pair_w = defaultdict(float)  # (w, l) -> count
+    designs = []  # list of {model: weight} per contested game
     games = defaultdict(int)
     seat_wl = defaultdict(lambda: [0, 0])  # model -> [seat_wins, seat_losses]
     matrix = defaultdict(lambda: {c: 0 for c in MATRIX_COLS})
 
     for g in ends:
-        winners, losers = [], []
+        win_ct = defaultdict(int)  # model -> winning-seat count this game
+        los_ct = defaultdict(int)  # model -> losing-seat count this game
         seen = set()
         for s in g["seats"]:
             m = node_key(s.get("backend"), s.get("model"))
@@ -97,10 +105,10 @@ def expand_pairwise(
                 games[m] += 1
                 seen.add(m)
             if s.get("won") is True:
-                winners.append(m)
+                win_ct[m] += 1
                 seat_wl[m][0] += 1
             elif s.get("won") is False:
-                losers.append(m)
+                los_ct[m] += 1
                 seat_wl[m][1] += 1
             # Matrix tallies every seated appearance (independent of win/loss).
             team = (s.get("team") or "").strip()
@@ -109,15 +117,19 @@ def expand_pairwise(
             ctype = (s.get("character_type") or "").strip()
             if ctype in matrix[m]:
                 matrix[m][ctype] += 1
-        for w in winners:
-            for l in losers:
-                if w == l:
-                    continue
-                pair_w[(w, l)] += 1.0
+        nwin, nlose = sum(win_ct.values()), sum(los_ct.values())
+        if nwin == 0 or nlose == 0:
+            continue
+        x = defaultdict(float)
+        for m, c in win_ct.items():
+            x[m] += c / nwin
+        for m, c in los_ct.items():
+            x[m] -= c / nlose
+        # A model on both teams partially cancels; drop exact zeros.
+        designs.append({m: w for m, w in x.items() if w != 0.0})
 
-    pairs = [(w, l, c) for (w, l), c in pair_w.items() if c > 0]
     return (
-        pairs,
+        designs,
         dict(games),
         {k: v for k, v in seat_wl.items()},
         {k: dict(v) for k, v in matrix.items()},
@@ -126,59 +138,52 @@ def expand_pairwise(
 
 def fit_bt(
     models: list[str],
-    pairs: list[tuple[str, str, float]],
+    designs: list[dict[str, float]],
     init: float = INIT,
     level_sigma: float = LEVEL_SIGMA,
-    max_iter: int = 80,
-    tol: float = 1e-9,
+    max_iter: int = 200,
+    tol: float = 1e-10,
 ) -> tuple[dict[str, float], dict[str, float], bool]:
-    """Newton MAP on natural-scale ratings; return (elo, sigma_elo, converged)."""
+    """Newton MAP on natural-scale ratings; return (elo, sigma_elo, converged).
+
+    Each design is one game's {model: team-share weight}; the winning team is the
+    positive class, so the log-likelihood is logistic in eta = Σ weight·rating.
+    """
     if not models:
         return {}, {}, True
     idx = {m: i for i, m in enumerate(models)}
     n = len(models)
     r = [0.0] * n  # natural units relative to INIT
     prior_prec = (SCALE / level_sigma) ** 2
+    # Pre-resolve each game's weights to (index, weight) term lists.
+    games = [[(idx[m], w) for m, w in d.items() if m in idx] for d in designs]
 
-    # Pre-aggregate: for each ordered pair weight of wins of i over j
-    W = [[0.0] * n for _ in range(n)]
-    for w, l, c in pairs:
-        if w not in idx or l not in idx:
-            continue
-        W[idx[w]][idx[l]] += c
-
-    converged = False
-    for _ in range(max_iter):
+    def assemble() -> tuple[list[float], list[list[float]]]:
+        # Gradient and negative Hessian of the log-posterior at the current r.
         g = [-prior_prec * r[i] for i in range(n)]
         H = [[0.0] * n for _ in range(n)]
         for i in range(n):
             H[i][i] = prior_prec
+        for terms in games:
+            eta = sum(w * r[i] for i, w in terms)
+            # stable sigmoid; p = P(winning team wins)
+            if eta >= 0:
+                p = 1.0 / (1.0 + math.exp(-eta))
+            else:
+                e = math.exp(eta)
+                p = e / (1.0 + e)
+            resid = 1.0 - p  # observed (win) minus expected
+            for i, wi in terms:
+                g[i] += resid * wi
+            h = p * (1.0 - p)
+            for i, wi in terms:
+                for j, wj in terms:
+                    H[i][j] += h * wi * wj
+        return g, H
 
-        for i in range(n):
-            for j in range(n):
-                if i == j:
-                    continue
-                n_ij = W[i][j] + W[j][i]
-                if n_ij <= 0:
-                    continue
-                # p_ij = P(i beats j) = sigmoid(r_i - r_j)
-                diff = r[i] - r[j]
-                # stable sigmoid
-                if diff >= 0:
-                    p = 1.0 / (1.0 + math.exp(-diff))
-                else:
-                    e = math.exp(diff)
-                    p = e / (1.0 + e)
-                # gradient of loglik for wins of i over j: W[i][j] * (1 - p)
-                # and for wins of j over i contributes when we visit (j,i)
-                # Combined: observed wins_i_vs_j - n_ij * p
-                obs = W[i][j]
-                g[i] += obs - n_ij * p
-                # Hessian: -n_ij * p * (1-p) on diag, + same off-diag
-                h = n_ij * p * (1.0 - p)
-                H[i][i] += h
-                H[i][j] -= h
-
+    converged = False
+    for _ in range(max_iter):
+        g, H = assemble()
         # Solve H dr = g  (dense Gaussian elimination; n is small)
         try:
             dr = _solve(H, g)
@@ -191,28 +196,8 @@ def fit_bt(
             converged = True
             break
 
-    # Laplace σ from diag of inv(H) after final assembly
-    g = [0.0] * n  # unused
-    H = [[0.0] * n for _ in range(n)]
-    for i in range(n):
-        H[i][i] = prior_prec
-    for i in range(n):
-        for j in range(n):
-            if i == j:
-                continue
-            n_ij = W[i][j] + W[j][i]
-            if n_ij <= 0:
-                continue
-            diff = r[i] - r[j]
-            if diff >= 0:
-                p = 1.0 / (1.0 + math.exp(-diff))
-            else:
-                e = math.exp(diff)
-                p = e / (1.0 + e)
-            h = n_ij * p * (1.0 - p)
-            H[i][i] += h
-            H[i][j] -= h
-
+    # Laplace σ from diag of inv(H) at the final estimate.
+    _, H = assemble()
     try:
         inv_diag = _inv_diag(H)
     except ZeroDivisionError:
@@ -259,9 +244,9 @@ def _inv_diag(A: list[list[float]]) -> list[float]:
 
 
 def build_book(ends: list[dict], init: float = INIT) -> dict:
-    pairs, games, seat_wl, matrix = expand_pairwise(ends)
+    designs, games, seat_wl, matrix = build_contests(ends)
     models = sorted(games.keys())
-    elo, sigma, ok = fit_bt(models, pairs, init=init)
+    elo, sigma, ok = fit_bt(models, designs, init=init)
     ratings = {}
     for m in models:
         sw, sl = seat_wl.get(m, [0, 0])
@@ -281,7 +266,7 @@ def build_book(ends: list[dict], init: float = INIT) -> dict:
     return {
         "fitted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "games_rated": len(ends),
-        "pairwise_edges": len(pairs),
+        "contests": len(designs),
         "converged": ok,
         "init": init,
         "matrix_columns": {
