@@ -195,7 +195,7 @@ pub(crate) fn resolve_mayor_host_choice(
             if !is_demon_killable(game, target) {
                 return KillResult::Survived;
             }
-            // Avoid bouncing onto Imp or chaining active Mayors (legacy bounce policy).
+            // Avoid bouncing onto Imp or chaining active Mayors.
             let Some(s) = game.seats.iter().find(|x| x.id == target) else {
                 return KillResult::Survived;
             };

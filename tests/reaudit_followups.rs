@@ -1,4 +1,4 @@
-//! Follow-up re-audit fixes (#3–#20).
+//! Additional Trouble Brewing rules invariants.
 
 use botc_mcp::comms::PrivateMessage;
 use botc_mcp::game::ability::{register, resolve_night_step, try_demon_kill, KillResult};
@@ -49,7 +49,7 @@ fn to_day1(g: &mut Game, host: &botc_mcp::auth::Token) {
     ));
 }
 
-/// #3 Acting seat never appears in WW pair seats.
+/// Acting seat never appears in WW pair seats.
 #[test]
 fn washerwoman_pair_excludes_acting_seat() {
     let (mut g, host, tokens) = start_scripted(
@@ -89,7 +89,7 @@ fn washerwoman_pair_excludes_acting_seat() {
     let _ = tokens;
 }
 
-/// #4 same seed+salt → same bag / same substream.
+/// Same seed+salt → same bag / same substream.
 #[test]
 fn same_seed_and_salt_same_bag_and_substream() {
     use botc_mcp::game::setup::build_bag;
@@ -133,7 +133,7 @@ fn same_seed_and_salt_same_bag_and_substream() {
     );
 }
 
-/// #5 Spy misreg as Townsfolk prefers in-play TF tokens (not WW face when excluded).
+/// Spy misreg as Townsfolk prefers in-play TF tokens (not WW face when excluded).
 #[test]
 fn spy_type_owner_prefers_in_play_and_excludes_actor_face() {
     let (g, _, _) = start_scripted(
@@ -181,7 +181,7 @@ fn all_tf_contains(c: Character) -> bool {
     botc_mcp::roles::all_townsfolk().contains(&c)
 }
 
-/// #6 pass_vote auto-close path covered in day_tests; ensure ghost retained after pass + later yes.
+/// pass_vote auto-close path covered in day_tests; ensure ghost retained after pass + later yes.
 #[test]
 fn pass_then_ghost_yes_on_later_nomination() {
     let (mut g, host, tokens) = start_scripted(
@@ -214,7 +214,7 @@ fn pass_then_ghost_yes_on_later_nomination() {
     assert!(!g.seats[2].ghost_vote_available);
 }
 
-/// #7 Mayor bounce can kill Minion (host kill_other).
+/// Mayor bounce can kill Minion (host kill_other).
 #[test]
 fn mayor_bounce_can_kill_minion() {
     use botc_mcp::game::{HostDecision, MayorRedirectChoice};
@@ -253,7 +253,7 @@ fn mayor_bounce_can_kill_minion() {
     assert!(g.seats[0].alive, "Mayor survives bounce");
 }
 
-/// #8 Slayer kills Recluse when registration_mode forces misreg as Demon.
+/// Slayer kills Recluse when registration_mode forces misreg as Demon.
 #[test]
 fn slayer_can_kill_recluse_registering_as_demon() {
     let lobby = botc_mcp::game::Game::create_with_salt(names(5), 104, 0).unwrap();
@@ -289,7 +289,7 @@ fn slayer_can_kill_recluse_registering_as_demon() {
     assert!(g.seats[4].alive, "Imp still alive; no SW path from Recluse");
 }
 
-/// #12 spent ghost rejects all votes (also day_tests).
+/// Spent ghost rejects all votes (also day_tests).
 #[test]
 fn spent_ghost_rejects_all_votes() {
     let (mut g, host, tokens) = start_scripted(
@@ -313,7 +313,7 @@ fn spent_ghost_rejects_all_votes() {
     assert!(pass_vote(&mut g, &tokens[2]).is_err());
 }
 
-/// #13 other-night queue does not pre-list Ravenkeeper from deaths_tonight.
+/// Other-night queue does not pre-list Ravenkeeper from deaths_tonight.
 #[test]
 fn other_night_queue_omits_prelisted_ravenkeeper() {
     let (mut g, _, _) = start_scripted(
@@ -336,7 +336,7 @@ fn other_night_queue_omits_prelisted_ravenkeeper() {
     );
 }
 
-/// #11 / #19 stable mix differs by salt/label; pin golden mix(1,2,"setup").
+/// Stable mix differs by salt/label; pin golden mix(1,2,"setup").
 #[test]
 fn mix_stable_and_salt_sensitive() {
     use botc_mcp::rng::mix;
@@ -346,7 +346,7 @@ fn mix_stable_and_salt_sensitive() {
     assert_eq!(mix(1, 2, "setup"), 0x7351_1a5b_7da1_f833);
 }
 
-/// #15 Ravenkeeper never learns their own face from Spy misreg.
+/// Ravenkeeper never learns their own face from Spy misreg.
 #[test]
 fn ravenkeeper_spy_misreg_excludes_viewer_face() {
     let (g, _, _) = start_scripted(
@@ -384,7 +384,7 @@ fn last_night_result(g: &Game, seat: SeatId) -> String {
         .expect("night result")
 }
 
-/// #16 Investigator sole Spy always gets a real minion (Spy) — never pure lie.
+/// Investigator sole Spy always gets a real minion (Spy) — never pure lie.
 #[test]
 fn investigator_sole_spy_always_truthful_minion() {
     for seed in 300..380u64 {
@@ -417,7 +417,7 @@ fn investigator_sole_spy_always_truthful_minion() {
     }
 }
 
-/// #16 Librarian sole Recluse is truthful (cannot hide as sole outsider).
+/// Librarian sole Recluse is truthful (cannot hide as sole outsider).
 #[test]
 fn librarian_sole_recluse_truthful() {
     let (mut g, _, _) = start_scripted(
@@ -446,7 +446,7 @@ fn librarian_sole_recluse_truthful() {
     );
 }
 
-/// #16 Librarian with no outsiders gets 0 message (not a lie pair).
+/// Librarian with no outsiders gets 0 message (not a lie pair).
 #[test]
 fn librarian_zero_outsiders_message() {
     let (mut g, _, _) = start_scripted(
@@ -471,7 +471,7 @@ fn librarian_zero_outsiders_message() {
     );
 }
 
-/// #16 sole TF Washerwoman still gets a pair naming their character (not pure lie).
+/// Sole TF Washerwoman still gets a pair naming their character (not pure lie).
 #[test]
 fn washerwoman_sole_tf_names_self_token() {
     let (mut g, _, _) = start_scripted(
@@ -496,7 +496,7 @@ fn washerwoman_sole_tf_names_self_token() {
     );
 }
 
-/// #17 poisoned Spy/Recluse cannot misregister (unit covered in register.rs; integration).
+/// Poisoned Spy/Recluse cannot misregister (unit covered in register.rs; integration).
 #[test]
 fn poisoned_spy_register_character_always_spy() {
     let (mut g, _, _) = start_scripted(
@@ -530,7 +530,7 @@ fn poisoned_spy_register_character_always_spy() {
     }
 }
 
-/// #18 Mayor bounce host kill_mayor when no soft bounce targets.
+/// Mayor bounce host kill_mayor when no soft bounce targets.
 #[test]
 fn mayor_bounce_empty_kills_mayor() {
     use botc_mcp::game::{HostDecision, MayorRedirectChoice};
@@ -569,7 +569,7 @@ fn mayor_bounce_empty_kills_mayor() {
     assert!(!g.seats[0].alive, "Mayor dies on host kill_mayor");
 }
 
-/// #16 healthy Investigator path still works with two minions.
+/// Healthy Investigator path still works with two minions.
 #[test]
 fn investigator_healthy_names_a_minion_token() {
     let (mut g, _, _) = start_scripted(
@@ -594,7 +594,7 @@ fn investigator_healthy_names_a_minion_token() {
     );
 }
 
-/// Direct register_character viewer exclusion (#15) via resolve_night_step Ravenkeeper.
+/// Direct register_character viewer exclusion via resolve_night_step Ravenkeeper.
 #[test]
 fn ravenkeeper_resolve_excludes_own_token_from_spy() {
     let (mut g, _, _) = start_scripted(

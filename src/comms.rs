@@ -18,7 +18,7 @@ pub enum PublicEvent {
     /// Player speech — visible to every agent.
     ///
     /// Optional `to` addresses another seat **publicly** (not a whisper). The harness
-    /// may immediately wake that seat; the message remains on the shared log (#75).
+    /// may immediately wake that seat; the message remains on the shared log.
     Chat {
         seat: SeatId,
         name: String,

@@ -60,7 +60,7 @@ fn vote_threshold_six_living_needs_three() {
     to_day1(&mut g, &host);
 
     open_nominations(&mut g, &host).unwrap();
-    // Nominate seat 5 (Imp) by seat 0 — nominator auto-yes (#73)
+    // Nominate seat 5 (Imp) by seat 0 — nominator auto-yes
     nominate(&mut g, &tokens[0], SeatId(5)).unwrap();
     assert!(
         g.current_nomination
@@ -265,7 +265,7 @@ fn butler_yes_requires_master_yes() {
     vote(&mut g, &tokens[0], SeatId(4), true).unwrap();
 }
 
-/// #73 house rule + Butler: auto-yes must go through `vote()` legality.
+/// House rule + Butler: auto-yes must go through `vote()` legality.
 /// A living Butler who nominates cannot auto-yes before master has voted yes.
 #[test]
 fn butler_nominator_does_not_auto_yes_without_master() {

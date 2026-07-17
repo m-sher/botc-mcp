@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn clip_chars_is_utf8_safe() {
-        // A multi-byte char straddling the cap must not panic (old code byte-sliced).
+        // A multi-byte char straddling the cap must not panic.
         let s = "a".repeat(10) + "“quoted”✓";
         let c = clip_chars(&s, 12);
         assert!(c.chars().count() <= 12);

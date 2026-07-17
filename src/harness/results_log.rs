@@ -194,8 +194,8 @@ pub fn seats_snapshot(game: &Game, agents: &[AgentConfig]) -> Vec<Value> {
                 .iter()
                 .find(|a| matches!(a.role, AgentRole::Player { seat } if seat == s.id));
             let model = agent.map(|a| a.model.as_str()).unwrap_or("");
-            // Additive identity field (issue #69). Missing/legacy → "grok" so the
-            // ranking key composes to the bare model, matching pre-#69 records.
+            // Backend identity field. Missing/legacy → "grok" so the
+            // ranking key composes to the bare model.
             let backend = agent.map(|a| a.backend.as_str()).unwrap_or("grok");
             let true_c = s.true_character;
             let believed = s.believed_character.or(true_c);

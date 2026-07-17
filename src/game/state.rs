@@ -21,7 +21,7 @@ use crate::roles::{Character, CharacterType, Team};
 pub const MIN_PLAYERS: usize = 5;
 pub const MAX_PLAYERS: usize = 15;
 
-/// Max directed public `say`s **sent** or **received** per seat per discussion day (#75).
+/// Max directed public `say`s **sent** or **received** per seat per discussion day.
 /// Prevents infinite wake ping-pong while keeping the table log fully public.
 pub const DIRECTED_SAY_CAP: u32 = 6;
 
@@ -86,7 +86,7 @@ pub struct Game {
     pub current_nomination: Option<crate::game::day::OpenNomination>,
     /// Closed nominations today (yes tallies for leader comparison).
     pub closed_nominations: Vec<crate::game::day::ClosedNomination>,
-    /// Seat that should be woken next because someone directed a public `say` at them (#75).
+    /// Seat that should be woken next because someone directed a public `say` at them.
     /// Honoured only during Day Discussion by the harness scheduler.
     pub pending_directed_wake: Option<SeatId>,
     /// Directed says **sent** by each seat this discussion day (index = seat id).
@@ -246,7 +246,7 @@ impl Game {
 
     /// Public speech. Optional `to` addresses another seat **publicly** (still on the
     /// shared log — never a private channel) and queues an immediate harness wake for
-    /// that seat during Discussion (#75).
+    /// that seat during Discussion.
     pub fn say(&mut self, seat: SeatId, text: String, to: Option<SeatId>) -> Result<(), GameError> {
         // Public chat is a **day** activity only — at night players are asleep and
         // silent, and there is no talking in the lobby or after the game ends.
@@ -512,7 +512,7 @@ impl Game {
         self.host_lie_queue.pop_front()
     }
 
-    /// Reject gameplay mutations while a Storyteller decision is outstanding (#36–#38).
+    /// Reject gameplay mutations while a Storyteller decision is outstanding.
     ///
     /// Only `host_decide` / `skip_night_action` may proceed while `pending_host` is set.
     pub fn require_no_pending_host(&self) -> Result<(), GameError> {
@@ -723,7 +723,7 @@ fn validate_demon_bluffs_override(
 /// Drop bluffs that match any Drunk face; fill back to 3 from not-in-play good chars.
 ///
 /// Empty input is left empty: 5–6 player games have no bluff trio (`n >= 7` only),
-/// so a `drunk_faces` override must not fabricate bluffs (#33).
+/// so a `drunk_faces` override must not fabricate bluffs.
 fn refilter_demon_bluffs_for_faces(
     rng: &crate::rng::SeededRng,
     bag_set: &[Character],
@@ -733,7 +733,7 @@ fn refilter_demon_bluffs_for_faces(
     use crate::roles::{all_outsiders, all_townsfolk};
     use rand::seq::SliceRandom;
 
-    // Only re-filter a previously populated set (7+). Never invent bluffs from empty.
+    // Only re-filter an already-populated set (7+). Never invent bluffs from empty.
     if bluffs.is_empty() {
         return bluffs;
     }

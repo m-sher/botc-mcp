@@ -1,4 +1,4 @@
-//! Re-audit round 5: #27 starpass pause leak, #28 day auto-end, #29 bluffs vs drunk faces, #30 lie queue clear.
+//! Starpass pause visibility, day auto-end, demon bluffs vs drunk faces, lie queue clearing.
 
 use botc_mcp::game::{
     DayStage, Game, HostDecision, NightActionPayload, NightStep, Phase, RoleAssignment, SeatId,
@@ -73,7 +73,7 @@ fn advance_to_imp_kill(
     }
 }
 
-/// #27: during starpass host pause, get_public_state shows Imp still alive.
+/// During starpass host pause, get_public_state shows Imp still alive.
 #[test]
 fn starpass_pause_imp_still_public_alive() {
     let (mut g, host, tokens) = start_scripted(
@@ -122,7 +122,7 @@ fn starpass_pause_imp_still_public_alive() {
     assert_eq!(g.seats[2].true_character, Some(Character::Imp));
 }
 
-/// #28: day ends without host end_nominations once nominations are exhausted.
+/// Day ends without host end_nominations once nominations are exhausted.
 #[test]
 fn day_auto_ends_when_nominations_exhausted() {
     // 5 living: each nominates once (chain). All votes no → NoExecution → night 2.
@@ -209,7 +209,7 @@ fn day_auto_ends_when_nominations_exhausted() {
     );
 }
 
-/// #29: drunk face override is excluded from demon bluffs.
+/// Drunk face override is excluded from demon bluffs.
 #[test]
 fn drunk_face_override_not_in_demon_bluffs() {
     // 7p so bluffs are generated. Drunk face override to a TF not in bag.
@@ -241,7 +241,7 @@ fn drunk_face_override_not_in_demon_bluffs() {
     }
 }
 
-/// #30: host_lie_queue cleared at dawn.
+/// host_lie_queue cleared at dawn.
 #[test]
 fn host_lie_queue_cleared_at_dawn() {
     let (mut g, host, _) = start_scripted(
