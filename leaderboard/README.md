@@ -7,7 +7,7 @@ Live web leaderboard of model ratings from the multi-agent harness results log.
 | Piece | Path | Role |
 | --- | --- | --- |
 | **Results log** | `botc-results.jsonl` (TUI) | Append-only finished games (`game_end` with per-seat `model` + `won`) |
-| **Rater** | `scripts/rate_models.py` | Batch Bradley–Terry MAP over pairwise seat expansions → `leaderboard/ratings.json` |
+| **Rater** | `scripts/rate_models.py` | Batch Bradley–Terry MAP over team-vs-team game outcomes → `leaderboard/ratings.json` |
 | **Publisher** | `scripts/publish_leaderboard.py` | Re-rate + POST to Worker when display content changes |
 | **Worker** | `leaderboard/worker.js` | `GET /api/leaderboard`, `POST /api/publish`, static page |
 | **Page** | `leaderboard/public/index.html` | Polls API every 30s, ranked table + ± bars |
@@ -15,7 +15,7 @@ Live web leaderboard of model ratings from the multi-agent harness results log.
 ### Rating logic (short)
 
 1. Take finished games only (`event == game_end`).
-2. Each winning seat’s model “beats” each losing seat’s model (same-model pairs skipped).
+2. Treat each game as one team-vs-team contest; a team's strength is the mean rating of its seats, so P(winning team wins) = sigmoid(mean_win − mean_lose). A strong teammate raises the team mean, so a weaker seat earns little credit for an expected win.
 3. Fit a stationary Bradley–Terry model on the Elo scale with a soft Gaussian prior at 1500.
 4. Report MAP rating ± Laplace 1σ and games played.
 
