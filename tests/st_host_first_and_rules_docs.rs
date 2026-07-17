@@ -153,7 +153,7 @@ fn st_choice_mode_random_auto_resolves_pair_info() {
     )));
 }
 
-/// #39 / #41: day-time Virgin/Spy registration is immediate (no day-blocking pause).
+/// Day-time Virgin/Spy registration is immediate (no day-blocking pause).
 #[test]
 fn virgin_spy_registration_immediate_no_day_pause() {
     let (mut g, host, tokens) = start_scripted(
@@ -186,7 +186,7 @@ fn virgin_spy_registration_immediate_no_day_pause() {
     assert!(!g.seats[1].alive);
 }
 
-/// #41: Slayer→Recluse does not block the day; registration_mode controls outcome.
+/// Slayer→Recluse does not block the day; registration_mode controls outcome.
 #[test]
 fn slayer_recluse_immediate_registration_mode() {
     let (mut g, host, tokens) = start_scripted(
@@ -220,7 +220,7 @@ fn slayer_recluse_immediate_registration_mode() {
     assert!(matches!(g.phase, Phase::Night { night: 2, .. }));
 }
 
-/// Night host pause still blocks day mutations (#36/#37).
+/// Night host pause still blocks day mutations.
 #[test]
 fn night_info_pending_blocks_day_mutations() {
     let (mut g, host, tokens) = start_scripted(
@@ -252,7 +252,7 @@ fn night_info_pending_blocks_day_mutations() {
     let _ = host;
 }
 
-/// #40: Fortune Teller always pauses in host-first (not only when Recluse is picked).
+/// Fortune Teller always pauses in host-first (not only when Recluse is picked).
 #[test]
 fn fortune_teller_always_pauses_host_first() {
     let (mut g, host, tokens) = start_scripted(

@@ -276,7 +276,7 @@ fn resolve_pair_role(
             return Ok(push_result(game, seat, text));
         }
         // 2. Owners empty after registration (zero registering outsiders/minions of the
-        //    requested type — sole Recluse/Spy can no longer hide from Lib/Inv):
+        //    requested type — sole Recluse/Spy cannot hide from Lib/Inv):
         //    optional "0 of type" zero_message.
         if let Some(z) = zero_message {
             return Ok(push_result(game, seat, z.to_string()));
@@ -431,7 +431,7 @@ fn chef_true_count(game: &Game) -> u8 {
     if n < 2 {
         return 0;
     }
-    // Single registration per seat for this whole Chef detection (issue #1 #8).
+    // Single registration per seat for this whole Chef detection.
     // Evil–Recluse–Evil can only be 0 or 2, never a middle "1" from re-rolling the Recluse.
     let evil: Vec<bool> = game
         .seats

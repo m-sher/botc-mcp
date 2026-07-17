@@ -119,7 +119,7 @@ fn commit_nomination_public(game: &mut Game, by: SeatId, target: SeatId) {
     game.public_log.push(PublicEvent::Nominated { by, target });
 }
 
-/// Open the vote window and try the nominator's automatic yes (#73).
+/// Open the vote window and try the nominator's automatic yes.
 ///
 /// Delegates to [`vote`] so Butler / ghost / double-vote legality stays in one place.
 /// A living Butler whose master has not yet voted yes cannot auto-yes yet — they simply
@@ -141,10 +141,10 @@ fn open_nomination_with_nominator_yes(game: &mut Game, by: SeatId, target: SeatI
 /// Allowed from Day Nominations, or from Discussion (auto-opens nominations first).
 ///
 /// All legality checks run **before** auto-opening Nominations from Discussion so a
-/// rejected nominate never mutates phase or the public log (#32).
+/// rejected nominate never mutates phase or the public log.
 ///
 /// On success (when a vote window opens), the nominator is recorded as an automatic
-/// **yes** — they do not need to call `vote` for their own nomination (#73).
+/// **yes** — they do not need to call `vote` for their own nomination.
 pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameError> {
     require_not_ended(game)?;
     game.require_no_pending_host()?;
@@ -195,7 +195,7 @@ pub fn nominate(game: &mut Game, by: SeatId, target: SeatId) -> Result<(), GameE
     //
     // Spy/Recluse registration for the Virgin is resolved **immediately** via
     // `registration_mode` (never a day-blocking host pause) so the public path is
-    // identical to a normal nomination — no limbo leak (#39) and no probe channel (#41).
+    // identical to a normal nomination — no limbo leak and no probe channel.
     if is_virgin_first_nom {
         if let Ok(s) = seat_mut(game, target) {
             s.virgin_ability_used = true;
@@ -385,7 +385,7 @@ fn nomination_ready_to_auto_close(game: &Game) -> bool {
 /// Host: finalize the current nomination's tally.
 ///
 /// When no further legal nomination remains after the tally, this also runs
-/// day end (execution leader / enter night) via [`try_auto_end_day`] (#28 / #34).
+/// day end (execution leader / enter night) via [`try_auto_end_day`].
 pub fn close_vote(game: &mut Game, host: &Token) -> Result<(), GameError> {
     match game.tokens.resolve(host) {
         Some(Actor::Host) => {}
@@ -457,7 +457,7 @@ fn try_auto_end_day(game: &mut Game) -> Result<(), GameError> {
     if game.winner.is_some() || matches!(game.phase, Phase::Ended { .. }) {
         return Ok(());
     }
-    // Never auto-end while a Storyteller decision is outstanding (#36).
+    // Never auto-end while a Storyteller decision is outstanding.
     if game.pending_host.is_some() {
         return Ok(());
     }
@@ -656,8 +656,7 @@ pub fn day_action_slay(game: &mut Game, slayer: SeatId, target: SeatId) -> Resul
 
     // Validate the target BEFORE spending / the disabled short-circuit so a Drunk-face or
     // poisoned Slayer returns exactly the same result (error / silent miss) as a healthy
-    // Slayer for a given target — no disabled-status is inferable from an error
-    // (Drunk-illusion hardening).
+    // Slayer for a given target — no disabled-status is inferable from an error.
     let target_seat = seat_ref(game, target)?;
     let target_alive = target_seat.alive;
     let target_true = target_seat.true_character;
@@ -679,7 +678,7 @@ pub fn day_action_slay(game: &mut Game, slayer: SeatId, target: SeatId) -> Resul
         return apply_slayer_kill(game, target, true);
     }
 
-    // Recluse-as-Demon via `registration_mode` immediately (no day-blocking host pause — #41).
+    // Recluse-as-Demon via `registration_mode` immediately (no day-blocking host pause).
     if target_true == Some(Character::Recluse) && !target_disabled {
         let demon_label = format!("slayer_reg:day:{}", target.0);
         if crate::game::ability::register::register_demon_for_ft(game, target, &demon_label) {

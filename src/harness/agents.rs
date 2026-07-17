@@ -21,8 +21,8 @@ pub enum AgentRole {
 }
 
 /// Which agent CLI runs a seat's turns. Per-seat (on [`AgentConfig`]) so a single
-/// game can mix grok and claude players (issue #69). `Grok` is the default so every
-/// existing construction site and corpus record keeps its current behavior.
+/// game can mix grok and claude players. `Grok` is the default, so a construction
+/// site or corpus record that omits a backend runs on grok.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
     #[default]
@@ -58,7 +58,7 @@ pub struct AgentConfig {
     /// Model this agent's sessions run on (picked per seat in setup).
     pub model: String,
     /// Which CLI backend runs this seat's turns; per-seat so one game can mix
-    /// grok and claude players (issue #69).
+    /// grok and claude players.
     pub backend: Backend,
 }
 
@@ -73,7 +73,7 @@ pub struct HarnessConfig {
     /// Models available in the setup pickers — filled from `grok models` at TUI start.
     pub available_models: Vec<String>,
     pub grok_bin: PathBuf,
-    /// Path to the `claude` (Claude Code) binary for claude-backed seats (issue #69).
+    /// Path to the `claude` (Claude Code) binary for claude-backed seats.
     pub claude_bin: PathBuf,
     /// Claude models offered in the setup picker (curated — there is no `claude models`
     /// subcommand). Filled at TUI start; the default is [`Self::claude_model`].
@@ -365,7 +365,7 @@ pub fn cycle_in_list(current: &str, list: &[String], delta: i32) -> String {
     list[idx].clone()
 }
 
-/// Per-agent child process coordination (#46 / #52).
+/// Per-agent child process coordination.
 ///
 /// Critical: **never** hold the slot mutex across a blocking `Child::wait()`.
 /// The waiter uses `try_wait` + short sleeps; `take_and_kill` must be able to
@@ -389,7 +389,7 @@ impl ChildSlot {
         *self.inner.lock().unwrap() = ChildState::Running(child);
     }
 
-    /// Kill + reap if still running. Must not block on a waiter-held lock (#52).
+    /// Kill + reap if still running. Must not block on a waiter-held lock.
     fn take_and_kill(&self) {
         let mut g = self.inner.lock().unwrap();
         if let ChildState::Running(mut c) = std::mem::replace(&mut *g, ChildState::Empty) {
@@ -657,14 +657,14 @@ fn grok_session_signals_path(workdir: &Path, session_id: &str) -> Option<PathBuf
 #[derive(Debug)]
 pub struct LiveAgent {
     pub config: AgentConfig,
-    /// Mutable so a failed first run can mint a fresh UUID (#47).
+    /// Mutable so a failed first run can mint a fresh UUID.
     pub session_id: Arc<Mutex<String>>,
     pub workdir: PathBuf,
     /// Live stream buffer (kinded lines for coloured, un-chunked display).
     pub log: Arc<Mutex<Vec<LogLine>>>,
     /// True while a headless Grok child for this agent is alive.
     pub running: Arc<Mutex<bool>>,
-    /// True only after a **successful** first headless run (#47).
+    /// True only after a **successful** first headless run.
     pub session_started: Arc<Mutex<bool>>,
     /// Token spend + context window (updated each tick).
     pub usage: Arc<Mutex<AgentUsage>>,
@@ -724,7 +724,7 @@ impl AgentPool {
         })
     }
 
-    /// Kick off every agent. One spawn failure does not abort the rest (#48 borderline).
+    /// Kick off every agent. One spawn failure does not abort the rest.
     pub fn kickoff_all(&mut self, n_players: usize) -> std::io::Result<usize> {
         let mut n = 0;
         let mut last_err: Option<std::io::Error> = None;
@@ -784,7 +784,7 @@ impl AgentPool {
         Ok(n)
     }
 
-    /// Turn-routed tick (#60): run only the agents the scheduler selected this
+    /// Turn-routed tick: run only the agents the scheduler selected this
     /// cycle, each with a targeted role/phase prompt. Skips agents whose previous
     /// tick is still running. Returns how many were spawned.
     pub fn tick_scheduled(
@@ -839,7 +839,7 @@ impl AgentPool {
         Ok(n)
     }
 
-    /// Kill all grok children and remove workdirs containing tokens (#46).
+    /// Kill all grok children and remove workdirs containing tokens.
     pub fn stop_all(&mut self) {
         for agent in &mut self.agents {
             *agent.running.lock().unwrap() = false;
@@ -1009,18 +1009,18 @@ fn copy_grok_auth(workdir: &Path) {
     }
 }
 
-// ---- Claude Code backend spawn plumbing (issue #69) ----
+// ---- Claude Code backend spawn plumbing ----
 
 /// Build the `claude` argv (flags only — the prompt is fed on **stdin**, avoiding
 /// arg-length limits and the variadic `--tools` swallowing it) for one headless tick.
-/// Pure + unit-tested. Corrected against `claude --help` v2.1.209: `--tools ""` disables
+/// Pure + unit-tested. Per `claude --help` v2.1.209: `--tools ""` disables
 /// ALL built-in tools (only the botc MCP tools remain); `--strict-mcp-config` +
 /// `--mcp-config` load ONLY our server.
 ///
-/// ACCEPTED ASYMMETRY (#69): claude has no `--max-turns` flag, so unlike grok
-/// (`--max-turns 12`) a claude tick is not turn-capped — it self-terminates when done.
-/// In practice both backends make a handful of tool calls per tick, so grok's cap
-/// rarely bites; equalizing would need `--max-budget-usd` (declined) so this stands.
+/// claude has no `--max-turns` flag, so unlike grok (`--max-turns 12`) a claude tick
+/// is not turn-capped — it self-terminates when done. In practice both backends make
+/// a handful of tool calls per tick, so grok's cap rarely bites; equalizing would need
+/// `--max-budget-usd`, which the harness does not set.
 pub fn build_claude_tick_args(
     model: &str,
     workdir: &Path,
@@ -1121,7 +1121,7 @@ fn configure_claude_command(
     // Symmetry with grok's `--cwd workdir` + `--no-memory`: pin the child's working
     // dir to the clean isolated workdir (which has no CLAUDE.md / .claude/settings.json)
     // so claude discovers NO project memory or settings from wherever botc-tui was
-    // launched — matching grok's context confinement (and closing an isolation gap).
+    // launched — matching grok's context confinement.
     cmd.current_dir(&iso_home);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1269,7 +1269,7 @@ pub fn build_grok_tick_args(
     args
 }
 
-/// Per-backend stream-line dispatch (grok arm = the original grok parsers).
+/// Per-backend stream-line dispatch (grok arm calls the grok parsers).
 fn establishes_session_for(backend: Backend, line: &str) -> bool {
     match backend {
         Backend::Grok => stream_line_establishes_session(line),
@@ -1343,7 +1343,7 @@ fn spawn_tick(
             //   - HOME redirects the default config dir and ~/.cursor.
             //   - GROK_HOME takes PRECEDENCE over HOME for grok's own config dir, so
             //     set it explicitly to the isolated `.grok` — an inherited GROK_HOME
-            //     (relocated grok dirs, CI) would otherwise outrank HOME and re-leak.
+            //     (relocated grok dirs, CI) would otherwise outrank HOME and leak.
             // Canonicalized to match grok's session-dir encoding.
             let iso_home = agent
                 .workdir
@@ -1387,7 +1387,7 @@ fn spawn_tick(
     let game_id = agent.config.game_id;
     let model = agent.config.model.clone();
     let agent_role_label = label.clone();
-    // #56: grok exits 1 on normal --max-turns; gate resume on stream evidence of a
+    // grok exits 1 on normal --max-turns; gate resume on stream evidence of a
     // real session (end / max_turns_reached), not process exit code.
     let session_established = Arc::new(AtomicBool::new(false));
     *running_flag.lock().unwrap() = true;
@@ -1463,7 +1463,7 @@ fn spawn_tick(
 
     child_slot.store(child);
 
-    // Waiter: session_started from stream evidence (#47/#56), not exit code alone.
+    // Waiter: session_started from stream evidence, not exit code alone.
     let child_slot_w = Arc::clone(&child_slot);
     let exit_label = label.clone();
     let usage_slot_w = Arc::clone(&usage_slot);
@@ -1520,7 +1520,7 @@ fn agent_label(role: &AgentRole) -> String {
     }
 }
 
-/// True if a streaming-json line means grok created/used a session (#56).
+/// True if a streaming-json line means grok created/used a session.
 ///
 /// `max_turns_reached` and `end` both mean the session is on disk and resumable,
 /// even when the process exits non-zero.
@@ -1668,7 +1668,7 @@ pub fn apply_stream_event(log: &Mutex<Vec<LogLine>>, line: &str) {
     }
 }
 
-// ---- Claude Code stream-json parsers (issue #69) ----
+// ---- Claude Code stream-json parsers ----
 //
 // `claude --print --output-format stream-json` emits one JSON object per line. Only
 // the terminal `type:"result"` line carries authoritative usage; `assistant` lines
@@ -1859,12 +1859,12 @@ pub fn find_agent_mcp_bin() -> PathBuf {
     PathBuf::from("botc-agent-mcp")
 }
 
-/// True if the resolved agent MCP binary exists on disk (#50).
+/// True if the resolved agent MCP binary exists on disk.
 pub fn agent_mcp_bin_ok(cfg: &HarnessConfig) -> bool {
     resolve_agent_mcp_bin(cfg).exists()
 }
 
-/// Resolved path used for setup UI / error messages (#50).
+/// Resolved path used for setup UI / error messages.
 pub fn resolve_agent_mcp_bin_for_display(cfg: &HarnessConfig) -> PathBuf {
     resolve_agent_mcp_bin(cfg)
 }
@@ -1877,7 +1877,7 @@ pub fn sleep_ms(ms: u64) {
 mod tests {
     use super::*;
 
-    // ---- Claude stream-json parsers (issue #69), against the committed fixture ----
+    // ---- Claude stream-json parsers, against the committed fixture ----
 
     const CLAUDE_SUCCESS: &str = include_str!("testdata/claude_stream_success.jsonl");
 
@@ -2348,7 +2348,7 @@ Available models:
 
     #[test]
     fn max_turns_stream_establishes_session() {
-        // #56: exit 1 on max-turns still means the session exists and is resumable.
+        // exit 1 on max-turns still means the session exists and is resumable.
         assert!(stream_line_establishes_session(
             r#"{"type":"max_turns_reached"}"#
         ));
@@ -2437,8 +2437,8 @@ Available models:
         assert!(!root.exists(), "work root should be removed on stop");
     }
 
-    /// #52 regression: waiter must not hold the slot lock across blocking wait,
-    /// or take_and_kill / stop_all deadlocks while a child is still running.
+    /// Waiter must not hold the slot lock across a blocking wait, or
+    /// take_and_kill / stop_all deadlocks while a child is still running.
     #[test]
     fn take_and_kill_while_waiter_running_does_not_deadlock() {
         let slot = Arc::new(ChildSlot::default());

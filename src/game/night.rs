@@ -237,7 +237,7 @@ impl Game {
         seat: SeatId,
         payload: NightActionPayload,
     ) -> Result<(), GameError> {
-        // While a host ST decision is outstanding, players cannot advance the night (#36–#38).
+        // While a host ST decision is outstanding, players cannot advance the night.
         self.require_no_pending_host()?;
         let pending = self.pending_night.clone().ok_or(GameError::NotYourWake)?;
         if pending.seat != seat {
@@ -487,9 +487,9 @@ impl Game {
     /// Enter other-night `night` (must be ≥ 2): build queue and tick to first pending.
     ///
     /// Does **not** clear `host_lie_queue`: lies queued during the day apply to this
-    /// night. Unused lies are cleared at dawn (#30 / #34).
+    /// night. Unused lies are cleared at dawn.
     ///
-    /// Fails if a Storyteller decision is still pending (#36) — never silently drops it.
+    /// Fails if a Storyteller decision is still pending — never silently drops it.
     pub fn enter_night(&mut self, night: u32) -> Result<(), GameError> {
         self.require_no_pending_host()?;
         self.deaths_tonight.clear();
@@ -547,7 +547,7 @@ impl Game {
         }
     }
 
-    /// Resolve a submitted night choice (poison/monk/imp via ability; info via Task 8).
+    /// Resolve a submitted night choice (poison/monk/imp via ability; info via the night-info path).
     ///
     /// Returns `true` when a host decision is now pending (cursor must not advance).
     fn resolve_pending_action(
@@ -621,7 +621,7 @@ impl Game {
 
     /// Whether host-first mode requires the Storyteller to author this info result.
     ///
-    /// In host-first, **all** Storyteller-delivered night info pauses uniformly (#40).
+    /// In host-first, **all** Storyteller-delivered night info pauses uniformly.
     /// Conditional pauses (only when Spy/Recluse is in the pick) would leak hidden
     /// identity via result delay. `skip_night_action` still applies the engine path.
     fn should_host_compose_night_info(

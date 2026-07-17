@@ -93,9 +93,8 @@ fn handle_line(
         // Echo the client's requested protocol version. Our wire use (initialize +
         // tools/list + tools/call) is version-agnostic, so mirroring the client keeps
         // every client happy. Newer clients (Claude Code speaks e.g. "2025-11-25")
-        // reject a server that unilaterally downgrades to an old fixed version — that
-        // left the botc server stuck at "pending" so its tools never loaded. Fall back
-        // to a known-good version when the client sends none.
+        // reject a server that unilaterally downgrades to an old fixed version, leaving
+        // its tools unloaded. Fall back to a known-good version when the client sends none.
         "initialize" => Ok(json!({
             "protocolVersion": params
                 .get("protocolVersion")
@@ -128,7 +127,7 @@ fn handle_line(
                 );
             };
             // Policy denial is Invalid params (-32602), not Method not found (-32601).
-            // -32601 would let a strict client conclude tools/call itself is unsupported (#51).
+            // -32601 would let a strict client conclude tools/call itself is unsupported.
             if !proxy_acl::tool_allowed(name, is_host) {
                 return Some(
                     json!({
@@ -152,7 +151,7 @@ fn handle_line(
                 .map_err(|e| (-32000_i64, e))
         }
         other => {
-            // #54/#59: only forward genuine bare tool names. Namespaced MCP methods
+            // Only forward genuine bare tool names. Namespaced MCP methods
             // (resources/list, …) and unknown bare typos (nominatee, foobar) must get
             // local -32601 — never a tools/call-shaped isError success via the engine.
             if other.is_empty() || other.contains('/') || !mcp_server::is_known_tool(other) {

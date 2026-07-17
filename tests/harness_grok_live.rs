@@ -28,7 +28,7 @@ fn which_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// The bug we hit in the TUI: `--yolo` and `--always-approve` are the same clap flag.
+/// `--yolo` and `--always-approve` are the same clap flag, so passing both is rejected.
 #[test]
 #[ignore = "invokes live `grok` binary; run with: cargo test --test harness_grok_live -- --ignored"]
 fn yolo_plus_always_approve_is_rejected() {

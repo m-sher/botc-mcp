@@ -254,7 +254,7 @@ pub fn host_task_tick(
             if *in_discussion {
                 // Single action only: opening Nominations lets concurrent player
                 // sessions take nominate turns. Bundling end_nominations in the same
-                // wake collapses that window before models can act (live #66 race).
+                // wake collapses that window before models can act.
                 "The table has finished its discussion rounds and **nobody nominated** during \
                  talk. Open the nomination stage so each living seat gets a turn: call \
                  **`open_nominations` only**, then call `await_turn` again. Do **not** call \

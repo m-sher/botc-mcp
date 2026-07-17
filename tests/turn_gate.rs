@@ -1,7 +1,7 @@
 //! Turn gate: phase-advancing tools may only be called by a seat that currently
 //! holds the matching `await_turn` wake. Prevents an always-on session from
-//! advancing game state out of turn (#66 P3 race: Host ended nominations while a
-//! player was still mid-nomination).
+//! advancing game state out of turn (e.g. the Host ending nominations while a
+//! player is still mid-nomination).
 
 use botc_mcp::harness::socket::{SocketClient, SocketServer};
 use botc_mcp::mcp_server;

@@ -53,8 +53,8 @@ impl WakeActor {
 }
 
 /// Max times the same outstanding wake may be redelivered without a completing
-/// tool. Caps the live #64 spin (wrong-tool → await_turn → same wake) before
-/// wall-clock stall escalation would fire.
+/// tool. Caps the wrong-tool → await_turn → same wake spin before wall-clock
+/// stall escalation would fire.
 const MAX_WAKE_REDELIVERIES: u32 = 8;
 
 #[derive(Debug, Clone)]
@@ -64,7 +64,7 @@ struct WakeEnvelope {
     /// Fingerprint of the scheduled target (for still-valid checks).
     plan_key: String,
     target: SchedTarget,
-    /// Full wake text (same content as the old per-tick prompt).
+    /// Full wake text.
     prompt_text: String,
     kind: String,
     /// How many times this envelope has been returned to a waiting client.
@@ -189,8 +189,8 @@ impl WakeCoordinator {
     /// target that `tool` would complete — i.e. it is genuinely this actor's turn
     /// to call `tool`. The turn gate uses this so an always-on session cannot
     /// advance game state out of turn (e.g. the Host calling `end_nominations`
-    /// while a player is still mid-nomination), restoring the "only the scheduled
-    /// actor advances state" invariant the process-per-turn harness had for free.
+    /// while a player is still mid-nomination), enforcing the "only the scheduled
+    /// actor advances state" invariant.
     ///
     /// Deliberately keyed on the recomputed plan, NOT the `outstanding` mailbox:
     /// `outstanding` is mutable state that any actor's poll can clear (stage-key
@@ -260,7 +260,7 @@ impl WakeCoordinator {
     ///
     /// Phase-changing tools (`open_nominations`, `end_nominations`, …) also drop
     /// **all** outstanding wakes so a concurrent seat cannot keep acting on a
-    /// superseded turn after the stage has moved (live #66 wrong-phase race).
+    /// superseded turn after the stage has moved.
     ///
     /// Call only after the tool has released the store lock (socket path does).
     pub fn note_tool_success(&self, store: &SharedStore, actor: WakeActor, tool: &str) {
@@ -423,7 +423,7 @@ fn try_deliver(
         }));
     }
 
-    // Stage change resets discussion rotation (same as old TUI).
+    // Stage change resets discussion rotation.
     let key = stage_key_of(game);
     if key != guard.stage_key {
         guard.stage_key = key;
@@ -458,8 +458,8 @@ fn try_deliver(
         guard.last_stall_bump = Some(now);
     }
 
-    // Stalled directed wake: drop so RR can continue (plan already falls through
-    // at STALL_ESCALATE). Matches main TUI do_tick behaviour.
+    // Stalled directed wake: drop so round-robin can continue (the plan already
+    // falls through at STALL_ESCALATE).
     if guard.stall >= crate::harness::scheduler::STALL_ESCALATE
         && game.pending_directed_wake.is_some()
     {
@@ -480,7 +480,7 @@ fn try_deliver(
     }
 
     // Stalled undirected discussion speaker: skip them so a mute / wrong-tool
-    // agent cannot spin redelivery forever (live #64 bug).
+    // agent cannot spin redelivery forever.
     if guard.stall >= crate::harness::scheduler::STALL_ESCALATE
         && game.pending_directed_wake.is_none()
         && matches!(
@@ -505,7 +505,7 @@ fn try_deliver(
         if plan_still_contains(&plan, &env) {
             if env.deliveries >= MAX_WAKE_REDELIVERIES {
                 // Too many redeliveries without a completing tool — skip this
-                // player turn so the table can move on (live #64 spin cap).
+                // player turn so the table can move on.
                 let directed = matches!(
                     env.target,
                     SchedTarget::Player {
@@ -799,7 +799,7 @@ fn fmt_public_event(e: &crate::comms::PublicEvent) -> String {
 fn public_summary(game: &Game) -> (String, String) {
     let phase = format!("{:?}", game.phase);
     // Player-facing roster: publicly-known alive so a night kill isn't leaked
-    // into a later night-order agent's prompt before the dawn announcement (#71).
+    // into a later night-order agent's prompt before the dawn announcement.
     let living: Vec<_> = game
         .seats
         .iter()
@@ -1355,8 +1355,8 @@ mod tests {
         );
     }
 
-    /// Regression: await_turn must not block on the store while holding the
-    /// coordinator (inverted order vs note_tool_success / TUI maintain).
+    /// await_turn must not block on the store while holding the coordinator
+    /// (inverted order vs note_tool_success / TUI maintain).
     #[test]
     fn try_lock_avoids_deadlock_under_store_hold() {
         let (store, gid) = started_store();

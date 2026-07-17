@@ -1,4 +1,4 @@
-//! Re-audit round 6: #32 nominate validation order, #33 bluff refilter <7, #34 lie queue day→night.
+//! Nominate validation order, demon bluff refiltering under 7 players, lie queue across day→night.
 
 use botc_mcp::comms::PublicEvent;
 use botc_mcp::game::{DayStage, Game, Phase, RoleAssignment, SeatId, StartOpts};
@@ -50,7 +50,7 @@ fn five_tb() -> Vec<RoleAssignment> {
     ]
 }
 
-/// #32: illegal self-nominate from Discussion must not open Nominations.
+/// Illegal self-nominate from Discussion must not open Nominations.
 #[test]
 fn illegal_self_nominate_from_discussion_does_not_open_noms() {
     let (mut g, host, tokens) = start_scripted(3201, five_tb(), |_| {});
@@ -81,7 +81,7 @@ fn illegal_self_nominate_from_discussion_does_not_open_noms() {
     );
 }
 
-/// #32: dead nominator from Discussion must not open Nominations.
+/// Dead nominator from Discussion must not open Nominations.
 #[test]
 fn dead_nominator_from_discussion_does_not_open_noms() {
     let (mut g, host, tokens) = start_scripted(3202, five_tb(), |_| {});
@@ -136,7 +136,7 @@ fn dead_nominator_from_discussion_does_not_open_noms() {
     assert_eq!(g.public_log.since(0).len(), log_len);
 }
 
-/// #32: legal nominate from Discussion still auto-opens.
+/// Legal nominate from Discussion still auto-opens.
 #[test]
 fn legal_nominate_from_discussion_still_auto_opens() {
     let (mut g, host, tokens) = start_scripted(3203, five_tb(), |_| {});
@@ -152,7 +152,7 @@ fn legal_nominate_from_discussion_still_auto_opens() {
     assert!(g.current_nomination.is_some());
 }
 
-/// #33: drunk_faces override on <7p must not fabricate demon bluffs.
+/// drunk_faces override on <7p must not fabricate demon bluffs.
 #[test]
 fn small_game_drunk_face_override_no_fabricated_bluffs() {
     // 6p TB with Drunk: no bluff trio per rules.
@@ -179,7 +179,7 @@ fn small_game_drunk_face_override_no_fabricated_bluffs() {
     );
 }
 
-/// #33: 7+ still refilters and keeps 3 bluffs after drunk face override.
+/// 7+ still refilters and keeps 3 bluffs after drunk face override.
 #[test]
 fn seven_plus_drunk_face_override_still_three_bluffs() {
     let face = Character::Investigator;
@@ -202,7 +202,7 @@ fn seven_plus_drunk_face_override_still_three_bluffs() {
     assert!(!g.demon_bluffs.contains(&face));
 }
 
-/// #34: lies queued during day survive enter_night for the upcoming night.
+/// Lies queued during day survive enter_night for the upcoming night.
 #[test]
 fn host_lie_queued_during_day_survives_enter_night() {
     let (mut g, host, tokens) = start_scripted(3401, five_tb(), |_| {});
@@ -240,7 +240,7 @@ fn host_lie_queued_during_day_survives_enter_night() {
     assert!(g.host_lie_queue.is_empty(), "unused lie must clear at dawn");
 }
 
-/// #34 / #28: last closed nomination with no majority → NoExecution.
+/// Last closed nomination with no majority → NoExecution.
 #[test]
 fn auto_end_last_nom_all_no_is_no_execution() {
     let (mut g, host, tokens) = start_scripted(3402, five_tb(), |_| {});

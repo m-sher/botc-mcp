@@ -1,6 +1,6 @@
 //! Tool allowlists for `botc-agent-mcp` proxies.
 
-/// JSON-RPC error code for role/policy denials (`tools/call` exists; params invalid) (#51).
+/// JSON-RPC error code for role/policy denials (`tools/call` exists; params invalid).
 /// Do **not** use `-32601` (Method not found) — strict clients may disable all tools.
 pub const ACL_DENY_JSONRPC_CODE: i64 = -32602;
 
@@ -62,7 +62,7 @@ mod tests {
     }
 }
 
-// #59: bare unknown method must not pass a "known tool" gate (mirrors proxy other-arm).
+// Bare unknown method must not pass a "known tool" gate (mirrors proxy other-arm).
 #[cfg(test)]
 mod bare_method_gate_tests {
     use crate::mcp_server;
