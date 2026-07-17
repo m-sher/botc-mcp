@@ -12,7 +12,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::auth::Actor;
+use crate::game::GameId;
 use crate::harness::action_log::ActionLog;
+use crate::harness::wake::{WakeActor, WakeCoordinator, AWAIT_SERVER_BUDGET_SECS};
 use crate::mcp_server::{self, SharedStore};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,12 +71,18 @@ pub struct SocketServer {
 impl SocketServer {
     /// Start with a throwaway action log (tests / callers that don't monitor).
     pub fn start(store: SharedStore, path: impl Into<PathBuf>) -> std::io::Result<Self> {
-        Self::start_with_log(store, Arc::new(ActionLog::default()), path)
+        Self::start_with_log(
+            store,
+            Arc::new(WakeCoordinator::new()),
+            Arc::new(ActionLog::default()),
+            path,
+        )
     }
 
     /// Start serving, recording every dispatched tool RPC into `action_log`.
     pub fn start_with_log(
         store: SharedStore,
+        wake: Arc<WakeCoordinator>,
         action_log: Arc<ActionLog>,
         path: impl Into<PathBuf>,
     ) -> std::io::Result<Self> {
@@ -98,9 +107,10 @@ impl SocketServer {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let store = Arc::clone(&store);
+                        let wake = Arc::clone(&wake);
                         let action_log = Arc::clone(&action_log);
                         thread::spawn(move || {
-                            if let Err(e) = handle_client(store, action_log, stream) {
+                            if let Err(e) = handle_client(store, wake, action_log, stream) {
                                 eprintln!("botc harness client error: {e}");
                             }
                         });
@@ -159,6 +169,7 @@ impl Drop for SocketServer {
 
 fn handle_client(
     store: SharedStore,
+    wake: Arc<WakeCoordinator>,
     action_log: Arc<ActionLog>,
     stream: UnixStream,
 ) -> std::io::Result<()> {
@@ -190,14 +201,19 @@ fn handle_client(
                 continue;
             }
         };
-        let resp = dispatch(&store, &action_log, req);
+        let resp = dispatch(&store, &wake, &action_log, req);
         writeln!(writer, "{}", serde_json::to_string(&resp).unwrap())?;
         writer.flush()?;
     }
     Ok(())
 }
 
-fn dispatch(store: &SharedStore, action_log: &ActionLog, req: RpcRequest) -> RpcResponse {
+fn dispatch(
+    store: &SharedStore,
+    wake: &WakeCoordinator,
+    action_log: &ActionLog,
+    req: RpcRequest,
+) -> RpcResponse {
     match req.op.as_str() {
         "ping" => RpcResponse {
             id: req.id,
@@ -222,8 +238,47 @@ fn dispatch(store: &SharedStore, action_log: &ActionLog, req: RpcRequest) -> Rpc
                 .get("token")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            let outcome = mcp_server::invoke_named_tool(store, name, req.arguments.clone());
+            // Resolve the calling seat once (host/player) for gating + liveness.
+            let actor = resolve_wake_actor(store, &req.arguments);
+            if let Some(a) = actor {
+                wake.note_activity(a);
+            }
+            let outcome = if name == "await_turn" {
+                invoke_await_turn(store, wake, &req.arguments)
+            } else if turn_gated_tool(name)
+                && actor
+                    .map(|a| !wake.is_scheduled_for(store, a, name))
+                    .unwrap_or(false)
+            {
+                // Turn gate: a phase-advancing tool is only legal when the live
+                // plan schedules THIS actor for it. Restores "only the scheduled
+                // actor advances state" — an always-on session can no longer end
+                // the day while a player is still mid-nomination (#66 P3 race).
+                // If the caller can't be resolved to a seat (actor None), fall
+                // through so the engine returns its own precise auth/arg error.
+                let who = actor.map(|a| a.label()).unwrap_or_else(|| "?".into());
+                crate::dlog!(
+                    "GATE-BLOCK {who} tool={name} — not this actor's turn (not scheduled)"
+                );
+                Err(format!(
+                    "not your turn: `{name}` is only legal when it is your scheduled turn. \
+                     Call await_turn and act on the wake it returns."
+                ))
+            } else {
+                let r = mcp_server::invoke_named_tool(store, name, req.arguments.clone());
+                // MCP wraps tool failures as Ok({ isError: true }) — do NOT treat
+                // those as completing a wake (live #64 bug: wrong-tool spam).
+                if tool_call_succeeded(&r) {
+                    if let Some(a) = actor {
+                        wake.note_tool_success(store, a, name);
+                    }
+                }
+                r
+            };
             let (ok, err, result_preview) = match &outcome {
+                Ok(v) if mcp_result_is_error(v) => {
+                    (false, Some(mcp_error_message(v)), Some(v.to_string()))
+                }
                 Ok(v) => (true, None, Some(v.to_string())),
                 Err(e) => (false, Some(e.clone()), None),
             };
@@ -259,6 +314,133 @@ fn dispatch(store: &SharedStore, action_log: &ActionLog, req: RpcRequest) -> Rpc
     }
 }
 
+fn resolve_wake_actor(store: &SharedStore, args: &Value) -> Option<WakeActor> {
+    use crate::auth::Token;
+    let game_id = args.get("game_id").and_then(|v| v.as_u64())?;
+    // Match the engine's auth surface: accept token / host_token / player_token.
+    let tok = ["token", "host_token", "player_token"]
+        .iter()
+        .find_map(|k| args.get(*k).and_then(|v| v.as_str()))?;
+    let st = store.lock().ok()?;
+    let game = st.get(GameId(game_id))?;
+    let actor = game.tokens.resolve(&Token::from_shared(tok))?;
+    Some(WakeActor::from_auth(actor))
+}
+
+fn invoke_await_turn(
+    store: &SharedStore,
+    wake: &WakeCoordinator,
+    args: &Value,
+) -> Result<Value, String> {
+    use crate::auth::Token;
+    let game_id = args
+        .get("game_id")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "await_turn requires game_id".to_string())?;
+    let token = args
+        .get("token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "await_turn requires token".to_string())?;
+    let budget_secs = args
+        .get("budget_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(AWAIT_SERVER_BUDGET_SECS)
+        .min(AWAIT_SERVER_BUDGET_SECS);
+
+    let (wake_actor, display_name) = {
+        let st = store
+            .lock()
+            .map_err(|_| "store lock poisoned".to_string())?;
+        let game = st
+            .get(GameId(game_id))
+            .ok_or_else(|| format!("unknown game_id {game_id}"))?;
+        let actor = game
+            .tokens
+            .resolve(&Token::from_shared(token))
+            .ok_or_else(|| "unauthorized".to_string())?;
+        let wa = WakeActor::from_auth(actor);
+        let name = match actor {
+            Actor::Host => "Host".to_string(),
+            Actor::Player { seat } => game
+                .seats
+                .iter()
+                .find(|s| s.id == seat)
+                .map(|s| s.display_name.clone())
+                .unwrap_or_else(|| format!("P{}", seat.0)),
+        };
+        (wa, name)
+    };
+
+    // Bind only when unbound. A mismatched id against an already-bound game must
+    // not wipe rotation/outstanding for the live table (stale/hallucinated game_id).
+    match wake.game_id() {
+        None => wake.set_game_id(game_id),
+        Some(bound) if bound == game_id => {}
+        Some(bound) => {
+            return Err(format!(
+                "await_turn game_id={game_id} does not match bound game_id={bound}"
+            ));
+        }
+    }
+
+    let structured = wake.await_turn(
+        store,
+        wake_actor,
+        &display_name,
+        Duration::from_secs(budget_secs.max(1)),
+    );
+    // MCP-shaped envelope (same as other tools).
+    let text = structured.to_string();
+    Ok(json!({
+        "content": [{ "type": "text", "text": text }],
+        "structuredContent": structured,
+        "isError": false
+    }))
+}
+
+/// Tools that advance day/night/turn state and are only legal when the live plan
+/// schedules this actor for them (checked via [`WakeCoordinator::is_scheduled_for`]).
+///
+/// Deliberately NOT gated:
+/// - reads (`get_*`, `list_*`), `create_game`, `await_turn` — no turn to hold;
+/// - `night_action` — the engine already turn-gates it (`pending_night` →
+///   `NotYourWake`), so socket gating would only add lock-skew risk;
+/// - `say` — public table-talk; strict round-robin speaking is enforced by who
+///   is *woken*, not by rejecting out-of-turn chatter (directed `say.to` has its
+///   own wake), and gating it would block legitimate replies;
+/// - `day_action` (Slayer) — the rules allow it any time during the day;
+/// - `st_announce`, `host_queue_lie` — host prerogatives that do not advance a phase.
+///
+/// This is the mid-game phase-transition set (the class that caused the #66 P3
+/// race, where the Host ended nominations out of turn). `nominate`/`vote` gating
+/// is a deliberate future extension left off here so player table dynamics are
+/// not tightened without a live game to validate against.
+fn turn_gated_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "open_nominations" | "end_nominations" | "close_vote" | "host_decide" | "skip_night_action"
+    )
+}
+
+/// True when `invoke_named_tool` produced a genuine success (not MCP isError).
+fn tool_call_succeeded(r: &Result<Value, String>) -> bool {
+    matches!(r, Ok(v) if !mcp_result_is_error(v))
+}
+
+fn mcp_result_is_error(v: &Value) -> bool {
+    v.get("isError").and_then(|b| b.as_bool()).unwrap_or(false)
+}
+
+fn mcp_error_message(v: &Value) -> String {
+    v.get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|item| item.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("tool error")
+        .to_string()
+}
+
 /// Client used by `botc-agent-mcp` to call the harness.
 pub struct SocketClient {
     stream: UnixStream,
@@ -274,6 +456,15 @@ impl SocketClient {
     }
 
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value, String> {
+        let read_timeout = if name == "await_turn" {
+            // Server budget + skew so soft `idle` returns before the socket times out.
+            Duration::from_secs(AWAIT_SERVER_BUDGET_SECS + 60)
+        } else {
+            Duration::from_secs(120)
+        };
+        self.stream
+            .set_read_timeout(Some(read_timeout))
+            .map_err(|e| e.to_string())?;
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let req = RpcRequest {
@@ -293,6 +484,7 @@ impl SocketClient {
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        let _ = self.stream.set_read_timeout(Some(Duration::from_secs(120)));
         let resp: RpcResponse =
             serde_json::from_str(line.trim()).map_err(|e| format!("bad response: {e}"))?;
         if resp.id != id {
@@ -310,7 +502,22 @@ impl SocketClient {
 mod tests {
     use super::*;
     use crate::mcp_server;
+    use serde_json::json;
     use std::time::Instant;
+
+    #[test]
+    fn is_error_payload_is_not_a_successful_tool_call() {
+        let ok = json!({"content": [], "isError": false});
+        let err = json!({
+            "content": [{ "type": "text", "text": "not your wake" }],
+            "isError": true
+        });
+        assert!(tool_call_succeeded(&Ok(ok)));
+        assert!(!tool_call_succeeded(&Ok(err.clone())));
+        assert!(!tool_call_succeeded(&Err("transport".into())));
+        assert!(mcp_result_is_error(&err));
+        assert_eq!(mcp_error_message(&err), "not your wake");
+    }
 
     #[test]
     fn stop_after_socket_unlinked_does_not_deadlock() {
