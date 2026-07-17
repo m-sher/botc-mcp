@@ -34,7 +34,6 @@
         text-transform: uppercase;
         letter-spacing: .04em;
       }
-      .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
       .matrix-note { color: var(--muted); font-size: 12px; margin: 0 0 10px; }
       .cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
       .card {
@@ -89,18 +88,13 @@
   <body>
     <div class="wrap">
       <h1>BOTC Model Leaderboard</h1>
-      <div class="sub">Trouble Brewing multi-agent harness &middot; team-win Bradley–Terry ratings (init 1500) &middot; model names anonymized</div>
 
       <div id="cards" class="cards"></div>
       <div id="content"><p class="status">Loading&hellip;</p></div>
       <div id="matrix"></div>
 
       <footer>
-        Auto-refreshes every 30s &middot; <span id="updated">&mdash;</span><br />
-        Ratings are batch MAP Bradley–Terry estimates &plusmn;1&sigma; from finished games
-        (winning seats beat losing seats; same-model pairs skipped).
-        The role/side matrix counts seated appearances only — it does not affect Elo.
-        Public labels are stable aliases — real model ids stay on the rating machine.
+        <span id="updated">&mdash;</span>
       </footer>
     </div>
 
@@ -172,9 +166,8 @@
         return `
           <h2>Role &amp; side matrix</h2>
           <p class="matrix-note">
-            Seat counts from finished games only. Side = Good/Evil team; role =
+            Seat counts from games. Side = Good/Evil team; role =
             character type. Same-model multi-seat games count each seat once.
-            Does not affect ranking.
           </p>
           <div class="table-wrap"><table class="matrix">
             <thead><tr>
