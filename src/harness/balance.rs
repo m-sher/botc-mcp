@@ -1,28 +1,30 @@
-//! History-balanced role assignment driven by **match-up coverage**.
+//! History-balanced role assignment driven by **rating uncertainty**.
 //!
 //! The bag composition for a player count is fixed (see [`crate::game::setup`]);
 //! what we choose is **which model plays which character**.
 //!
 //! # What the leaderboard actually consumes
 //!
-//! `scripts/rate_models.py` fits Bradley–Terry over *pairwise* outcomes: each
-//! winning-seat model "beats" each losing-seat model, and **same-model pairs are
-//! skipped**. Winners and losers are whole teams, so every edge a game can produce
-//! is a `(Good-seat model) × (Evil-seat model)` seat-pair with the two models
-//! *different*. Two consequences drive this module:
+//! `scripts/rate_models.py` fits Bradley–Terry on **one team-vs-team contest per
+//! game**: a team's strength is the mean rating of its seats, and the fit's precision
+//! is its Fisher information `M = τ·I + Σ_games z zᵀ`, where `z[m]` is model `m`'s
+//! (Good-share − Evil-share) that game. The reported ± is the diagonal of the
+//! posterior covariance `Σ = M⁻¹`. Two consequences drive this module:
 //!
-//! * A table where every seat is the same model yields **zero** edges — the game
-//!   teaches the ratings nothing at all.
-//! * A model can have a perfectly even record and still be barely rateable, because
-//!   a per-model count says nothing about *whom it played against*. What pins a
-//!   rating is the weight and connectivity of the pair graph.
+//! * A table where every seat is the same model has `z = 0` — the game shrinks no
+//!   variance and teaches the ratings nothing at all.
+//! * A model can have a perfectly even record and still be barely rateable, because a
+//!   per-model count says nothing about *whom it played against*. What pins a rating is
+//!   the connectivity of the contest graph, i.e. the off-diagonals of `Σ`.
 //!
-//! So the primary axis is **pair-coverage deficit**: prefer the model that has been
-//! observed least against the opposing side. The per-model count axes —
-//! **team** (Good / Evil), then **role type** (Townsfolk / Outsider / Minion / Demon),
-//! then **specific role** (Empath, Poisoner, …) — are kept as lexicographic tie-breaks,
-//! so a model still can't drift into always drawing the same team (which would confound
-//! its rating with role advantage).
+//! So the primary axis is **uncertainty**: field the table whose team-contrast probes
+//! the direction of greatest remaining variance, i.e. give a seat to the model least
+//! **covariant** with the opposition already placed — the least-resolved match-up,
+//! counting indirect connectivity a raw pair-count cannot see. The per-model count
+//! axes — **team** (Good / Evil), then **role type** (Townsfolk / Outsider / Minion /
+//! Demon), then **specific role** (Empath, Poisoner, …) — are kept as lexicographic
+//! tie-breaks, so a model still can't drift into always drawing the same team (which
+//! would confound its rating with role advantage).
 //!
 //! Only models with **≥1 completed game** drive the balance (the same games the
 //! leaderboard rates; aborted games carry no eval signal). Seats whose model is new
@@ -40,31 +42,23 @@ use serde_json::Value;
 use crate::game::{RoleAssignment, SeatId};
 use crate::roles::{Character, Team};
 
-/// Cost added for putting a model on **both** sides of the table. Those seat-pairs
-/// are skipped by the rater, so they carry no information: ranked far above any real
-/// pair weight, but finite, so a one-eligible-model table still resolves instead of
-/// having no legal assignment. Small enough that summing one per seat cannot overflow.
-const SAME_MODEL_PENALTY: u32 = 1 << 20;
+/// Cost added for putting a model on **both** sides of the table. Splitting a model
+/// across teams cancels its own contrast, so those seats resolve no variance: ranked
+/// far above any real covariance term, but finite, so a one-eligible-model table still
+/// resolves instead of having no legal assignment.
+const SAME_MODEL_PENALTY: f64 = 1_048_576.0;
 
-/// Cross-team seat-pair coverage, keyed by an **unordered** model pair.
-///
-/// `pairs[(a, b)]` counts the seat-pairs in which `a` and `b` sat on opposite teams,
-/// i.e. exactly the observations the BT fit accumulates for that pair (the rater keys
-/// on the ordered winner/loser, but coverage of `a` vs `b` is the sum of both
-/// directions — which direction a game landed depends on who won, not on the setup).
-pub type PairStats = HashMap<(String, String), u32>;
+/// Prior width (Elo) around the 1500 anchor, and the per-game Fisher weight at the
+/// rating-agnostic operating point `p = 0.5` (`p·(1−p)`). Both identical to
+/// `scripts/rate_models.py` so the balancer's information matrix matches the fit's.
+const LEVEL_SIGMA_ELO: f64 = 350.0;
+const GAME_WEIGHT: f64 = 0.25;
 
-/// Order-independent key for [`PairStats`].
-fn pair_key(a: &str, b: &str) -> (String, String) {
-    if a <= b {
-        (a.to_string(), b.to_string())
-    } else {
-        (b.to_string(), a.to_string())
-    }
-}
-
-fn pair_n(pairs: &PairStats, a: &str, b: &str) -> u32 {
-    *pairs.get(&pair_key(a, b)).unwrap_or(&0)
+/// Prior precision `τ = (SCALE / LEVEL_SIGMA)²` on the natural-rating scale, where
+/// `SCALE = 400 / ln 10` is Elo per natural logistic unit (matches the rater).
+fn prior_precision() -> f64 {
+    let s = (400.0 / std::f64::consts::LN_10) / LEVEL_SIGMA_ELO;
+    s * s
 }
 
 /// Everything the balancer reads out of the results corpus.
@@ -72,8 +66,9 @@ fn pair_n(pairs: &PairStats, a: &str, b: &str) -> u32 {
 pub struct History {
     /// Per-model record (team / role type / role counts).
     pub models: HashMap<String, ModelStats>,
-    /// Cross-team seat-pair coverage between models — the BT edge weights.
-    pub pairs: PairStats,
+    /// One entry per completed game: the team-contrast weights `model → (Good-share −
+    /// Evil-share)`, i.e. the `z` vector whose `z zᵀ` the Fisher information sums.
+    pub contests: Vec<Vec<(String, f64)>>,
 }
 
 /// Per-model play history. Only models with ≥1 recorded game get an entry.
@@ -126,17 +121,16 @@ pub fn node_key(backend: &str, model: &str) -> String {
     }
 }
 
-/// Read play [`History`] from a `botc-results.jsonl` file: the per-model record and
-/// the cross-team pair coverage, from every `game_end` event (one per *completed*
-/// game). These are the same games the leaderboard rates — an aborted game
-/// (`game_abort`) produces no eval signal, so counting it would balance against games
-/// that never mattered; `game_start`/`game_abort` are ignored. A missing file or
-/// unreadable lines yield an empty history, and the caller falls back to a random
-/// assignment. Only models that actually appear are inserted.
+/// Read play [`History`] from a `botc-results.jsonl` file: the per-model record and the
+/// per-game team contrasts, from every `game_end` event (one per *completed* game).
+/// These are the same games the leaderboard rates — an aborted game (`game_abort`)
+/// produces no eval signal, so counting it would balance against games that never
+/// mattered; `game_start`/`game_abort` are ignored. A missing file or unreadable lines
+/// yield an empty history, and the caller falls back to a random assignment.
 ///
-/// Pair coverage mirrors `expand_pairwise` in `scripts/rate_models.py`: one count per
-/// (Good seat, Evil seat) pair of *differing* models. Same-model pairs are skipped
-/// there and so are never recorded here.
+/// Each contest is the game's `z` vector: `model → (its Good seats / Good total) − (its
+/// Evil seats / Evil total)`, matching the rater's mean-team contrast. A game with an
+/// empty side, or a single model spanning both, contributes no contrast.
 pub fn read_history(path: &Path) -> History {
     let mut out = History::default();
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -156,8 +150,9 @@ pub fn read_history(path: &Path) -> History {
         let Some(seats) = v.get("seats").and_then(Value::as_array) else {
             continue;
         };
-        // Per-game sides, so the pair tally only crosses the Good/Evil divide.
-        let (mut good, mut evil): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+        // Per-team seat counts per model, so the contrast is the mean-team difference.
+        let mut good: HashMap<String, u32> = HashMap::new();
+        let mut evil: HashMap<String, u32> = HashMap::new();
         for s in seats {
             let model = s.get("model").and_then(Value::as_str).unwrap_or("");
             // Compose-on-read: legacy rows (no backend) default to grok → bare model.
@@ -171,8 +166,8 @@ pub fn read_history(path: &Path) -> History {
             if let Some(t) = s.get("team").and_then(Value::as_str) {
                 *entry.team.entry(t.to_string()).or_insert(0) += 1;
                 match t {
-                    "Good" => good.push(key.clone()),
-                    "Evil" => evil.push(key.clone()),
+                    "Good" => *good.entry(key.clone()).or_insert(0) += 1,
+                    "Evil" => *evil.entry(key.clone()).or_insert(0) += 1,
                     _ => {}
                 }
             }
@@ -183,15 +178,39 @@ pub fn read_history(path: &Path) -> History {
                 *entry.role.entry(r.to_string()).or_insert(0) += 1;
             }
         }
-        for g in &good {
-            for e in &evil {
-                if g != e {
-                    *out.pairs.entry(pair_key(g, e)).or_insert(0) += 1;
-                }
-            }
+        if let Some(contest) = contest_of(&good, &evil) {
+            out.contests.push(contest);
         }
     }
     out
+}
+
+/// The mean-team contrast `z` for one game from its per-team seat counts, or `None` when
+/// a side is empty (no cross-team contrast to learn from). Models whose Good and Evil
+/// shares cancel drop out.
+fn contest_of(
+    good: &HashMap<String, u32>,
+    evil: &HashMap<String, u32>,
+) -> Option<Vec<(String, f64)>> {
+    let (gt, et) = (good.values().sum::<u32>(), evil.values().sum::<u32>());
+    if gt == 0 || et == 0 {
+        return None;
+    }
+    let (gt, et) = (gt as f64, et as f64);
+    let mut z: HashMap<&str, f64> = HashMap::new();
+    for (m, c) in good {
+        *z.entry(m).or_insert(0.0) += f64::from(*c) / gt;
+    }
+    for (m, c) in evil {
+        *z.entry(m).or_insert(0.0) -= f64::from(*c) / et;
+    }
+    let contest: Vec<(String, f64)> = z
+        .into_iter()
+        .filter(|(_, w)| *w != 0.0)
+        .map(|(m, w)| (m.to_string(), w))
+        .collect();
+    // A single model spanning both sides cancels to nothing — no contrast to learn.
+    (!contest.is_empty()).then_some(contest)
 }
 
 /// Per-model record only — [`read_history`] without the pair coverage.
@@ -303,60 +322,121 @@ pub fn balanced_assignment(
 
 /// Indices (into `candidates`) already placed on the team **opposing** `seat`'s — the
 /// seats this one will form BT edges with.
-fn opposite_picks(seat_chars: &[Character], out: &[usize], seat: usize) -> Vec<usize> {
-    let mine = seat_chars[seat].team();
-    (0..seat_chars.len())
-        .filter(|&j| out[j] != usize::MAX && seat_chars[j].team() != mine)
-        .map(|j| out[j])
-        .collect()
-}
-
-/// How well `ci` is **already** known against the current opposition — the axis we
-/// minimise, so the pick is the match-up the leaderboard has seen least.
-///
-/// A model facing *itself* across the divide is charged [`SAME_MODEL_PENALTY`] rather
-/// than the `0` a never-observed pair scores: the rater skips same-model pairs, so
-/// those seats produce no edge. Without this, "never seen" and "cannot ever be seen"
-/// would tie at zero and a single model could sweep the table.
-fn pair_cost(ci: usize, opposite: &[usize], candidates: &[&str], pairs: &PairStats) -> u32 {
-    opposite.iter().fold(0u32, |acc, &oi| {
-        let add = if oi == ci {
-            SAME_MODEL_PENALTY
-        } else {
-            pair_n(pairs, candidates[ci], candidates[oi])
-        };
-        acc.saturating_add(add)
-    })
-}
-
-/// Fold a pick into the running record so later seats see the updated coverage.
-fn commit_pick(
-    live: &mut [ModelStats],
-    pairs: &mut PairStats,
-    candidates: &[&str],
-    ci: usize,
-    opposite: &[usize],
-    (team, rtype, role): (String, String, String),
-) {
-    let st = &mut live[ci];
-    st.games += 1;
-    *st.team.entry(team).or_insert(0) += 1;
-    *st.role_type.entry(rtype).or_insert(0) += 1;
-    *st.role.entry(role).or_insert(0) += 1;
-    for &oi in opposite {
-        if oi != ci {
-            *pairs
-                .entry(pair_key(candidates[ci], candidates[oi]))
-                .or_insert(0) += 1;
+/// Invert a matrix by Gauss–Jordan with partial pivoting. `None` if singular — not
+/// expected here, since the `τ` prior keeps the information matrix full-rank.
+#[allow(clippy::needless_range_loop)]
+fn invert(mat: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+    let n = mat.len();
+    // Augment [mat | I], then reduce the left half to identity.
+    let mut a: Vec<Vec<f64>> = (0..n)
+        .map(|i| {
+            let mut row = vec![0.0; 2 * n];
+            row[..n].copy_from_slice(&mat[i]);
+            row[n + i] = 1.0;
+            row
+        })
+        .collect();
+    for col in 0..n {
+        let mut piv = col;
+        for r in (col + 1)..n {
+            if a[r][col].abs() > a[piv][col].abs() {
+                piv = r;
+            }
         }
+        if a[piv][col].abs() < 1e-12 {
+            return None;
+        }
+        a.swap(col, piv);
+        let d = a[col][col];
+        for j in 0..2 * n {
+            a[col][j] /= d;
+        }
+        for r in 0..n {
+            if r == col {
+                continue;
+            }
+            let f = a[r][col];
+            if f != 0.0 {
+                for j in 0..2 * n {
+                    a[r][j] -= f * a[col][j];
+                }
+            }
+        }
+    }
+    Some(a.into_iter().map(|row| row[n..].to_vec()).collect())
+}
+
+/// Posterior covariance `Σ = M⁻¹` restricted to `candidates`, where
+/// `M = τ·I + GAME_WEIGHT · Σ_contests z zᵀ` is the team-contest Fisher information over
+/// every model in `candidates` and in the history. Off-diagonals carry the indirect
+/// connectivity a raw pair-count misses. Falls back to the prior-only covariance if the
+/// (always full-rank) inverse cannot be formed.
+#[allow(clippy::needless_range_loop)]
+fn candidate_covariance(candidates: &[&str], hist: &History) -> Vec<Vec<f64>> {
+    let tau = prior_precision();
+    // Universe index: candidates first, then any other model seen in a contest.
+    let mut idx: HashMap<&str, usize> = HashMap::new();
+    for &c in candidates {
+        let next = idx.len();
+        idx.entry(c).or_insert(next);
+    }
+    for game in &hist.contests {
+        for (m, _) in game {
+            let next = idx.len();
+            idx.entry(m.as_str()).or_insert(next);
+        }
+    }
+    let n = idx.len();
+    let mut m = vec![vec![0.0; n]; n];
+    for i in 0..n {
+        m[i][i] = tau;
+    }
+    for game in &hist.contests {
+        let terms: Vec<(usize, f64)> = game
+            .iter()
+            .filter_map(|(name, z)| idx.get(name.as_str()).map(|&i| (i, *z)))
+            .collect();
+        for &(i, zi) in &terms {
+            for &(j, zj) in &terms {
+                m[i][j] += GAME_WEIGHT * zi * zj;
+            }
+        }
+    }
+    let nc = candidates.len();
+    let mut sigma = vec![vec![0.0; nc]; nc];
+    match invert(&m) {
+        Some(inv) => {
+            for a in 0..nc {
+                for b in 0..nc {
+                    sigma[a][b] = inv[idx[candidates[a]]][idx[candidates[b]]];
+                }
+            }
+        }
+        None => {
+            for a in 0..nc {
+                sigma[a][a] = 1.0 / tau;
+            }
+        }
+    }
+    sigma
+}
+
+/// Lexicographic order on the selection cost: match-up cost first (with a relative
+/// tolerance so float noise falls through), then the team / role-type / role counts.
+fn cost_less(a: (f64, u32, u32, u32), b: (f64, u32, u32, u32)) -> bool {
+    let eps = 1e-9 * (1.0 + a.0.abs().max(b.0.abs()));
+    if (a.0 - b.0).abs() > eps {
+        a.0 < b.0
+    } else {
+        (a.1, a.2, a.3) < (b.1, b.2, b.3)
     }
 }
 
 /// Hard floor: a table must field **at least two models**, because a monolithic table
-/// produces zero BT edges and so contributes nothing to the leaderboard.
+/// has zero team contrast and so contributes nothing to the leaderboard.
 ///
-/// [`pair_cost`] already charges [`SAME_MODEL_PENALTY`] per Good seat for reusing the
-/// Evil model, so with ≥2 candidates and both sides present the greedy never builds
+/// The match-up cost already charges [`SAME_MODEL_PENALTY`] for reusing the Evil model
+/// on a Good seat, so with ≥2 candidates and both sides present the greedy never builds
 /// one. This is the belt-and-braces guarantee for shapes that reasoning cannot cover
 /// (a bag with no Evil seat at all), and is necessarily a no-op when only one model is
 /// eligible — there is then no second model to field.
@@ -374,8 +454,8 @@ fn enforce_two_models(
     if out.iter().any(|&c| c != incumbent) {
         return;
     }
-    // Flip a seat on the *smaller* side: with 5 Good / 2 Evil, moving one Evil seat to
-    // a second model creates 5 edges where moving one Good seat would create only 2.
+    // Flip a seat on the *smaller* side: with 5 Good / 2 Evil, a second model on one
+    // Evil seat is measured against all 5 Good seats, where one on a Good seat faces 2.
     let good: Vec<usize> = (0..out.len())
         .filter(|&i| seat_chars[i].team() == Team::Good)
         .collect();
@@ -410,21 +490,24 @@ fn enforce_two_models(
 /// so the corpus improves. Returns `out[seat_i]` = index into `candidates`.
 ///
 /// There are usually fewer eligible models than seats, so a candidate may take several
-/// seats and some may go unused — repeats **within** a side are free, since only
-/// cross-team pairs produce BT edges.
+/// seats and some may go unused — repeats **within** a side are free, since only the
+/// Good-vs-Evil contrast carries rating signal.
 ///
-/// Greedy, cost `(pair deficit, team, role type, role)`:
+/// Greedy, cost `(match-up cost, team, role type, role)`, over the posterior covariance
+/// `Σ` of games already played:
 /// * **Evil seats first.** They are the scarce side, and pinning them gives every Good
 ///   seat a concrete opposition to measure against. While they are placed there is no
-///   opposition yet, so `pair_cost` is 0 for all and the tuple degrades to the
+///   opposition yet, so the match-up cost is 0 for all and the tuple degrades to the
 ///   count axes — exactly what we want for "who is owed Evil".
-/// * **Good seats** then go to whoever has faced that Evil side least, which both
-///   forbids the monolithic table (via [`SAME_MODEL_PENALTY`]) and spreads the seats:
-///   each pick raises its own pair weight, so the next seat prefers someone else.
+/// * **Good seats** then go to whoever is least **covariant** with the placed Evil side
+///   — the least-resolved match-up. A model already seated opposite itself is charged
+///   [`SAME_MODEL_PENALTY`] (its split contrast resolves nothing), which forbids the
+///   monolithic table; the count axes then spread the remaining seats.
 ///
-/// Over successive games the team axis rotates who draws Evil while the pair axis picks
-/// their opposition, so the two together sweep the pair graph rather than deepening the
-/// match-ups it already knows. `candidates` must be non-empty.
+/// Over successive games the team axis rotates who draws Evil while the covariance axis
+/// picks their opposition, so the two together drive down the largest rating variances
+/// rather than re-measuring match-ups already pinned. `candidates` must be non-empty.
+#[allow(clippy::needless_range_loop)]
 pub fn select_balanced_models(
     seat_chars: &[Character],
     candidates: &[&str],
@@ -433,13 +516,17 @@ pub fn select_balanced_models(
 ) -> Vec<usize> {
     assert!(!candidates.is_empty(), "need at least one eligible model");
     let n = seat_chars.len();
-    // Running record = real history + what this game has already handed out.
+    // Running per-model record = real history + what this game has already handed out.
     let mut live: Vec<ModelStats> = candidates
         .iter()
         .map(|k| hist.models.get(*k).cloned().unwrap_or_default())
         .collect();
-    let mut live_pairs = hist.pairs.clone();
+    // Covariance from games already played; this game is not folded into it.
+    let sigma = candidate_covariance(candidates, hist);
     let mut out = vec![usize::MAX; n];
+
+    let good_total = seat_chars.iter().filter(|c| c.team() == Team::Good).count() as f64;
+    let evil_total = n as f64 - good_total;
 
     // Shuffle, then *stable* sort Evil-first so order within a side stays random.
     let mut order: Vec<usize> = (0..n).collect();
@@ -448,33 +535,53 @@ pub fn select_balanced_models(
 
     for &si in &order {
         let (team, rtype, role) = keys(seat_chars[si]);
-        let opposite = opposite_picks(seat_chars, &out, si);
+        let my_team = seat_chars[si].team();
+        let opp_total = if my_team == Team::Good {
+            evil_total
+        } else {
+            good_total
+        };
+        // Opposition seat-share per candidate: each placed seat on the other team adds
+        // 1 / (its team's seat total). u stays zero while the scarce side is still being
+        // filled, so those seats fall through to the count axes (owed-team balance).
+        let mut u = vec![0.0f64; candidates.len()];
+        if opp_total > 0.0 {
+            for j in 0..n {
+                if out[j] != usize::MAX && seat_chars[j].team() != my_team {
+                    u[out[j]] += 1.0 / opp_total;
+                }
+            }
+        }
         // Random candidate order so equal-cost ties resolve arbitrarily.
         let mut cand_order: Vec<usize> = (0..candidates.len()).collect();
         cand_order.shuffle(rng);
-        let mut best: Option<(usize, (u32, u32, u32, u32))> = None;
+        let mut best: Option<(usize, (f64, u32, u32, u32))> = None;
         for ci in cand_order {
+            // Match-up cost = covariance-weighted overlap with the opposition (lower =
+            // less-resolved match-up); a candidate already opposite itself resolves
+            // nothing and is ranked out via SAME_MODEL_PENALTY.
+            let mut info = 0.0;
+            for m in 0..candidates.len() {
+                if u[m] != 0.0 {
+                    info += sigma[ci][m] * u[m];
+                }
+            }
+            if u[ci] != 0.0 {
+                info += SAME_MODEL_PENALTY;
+            }
             let st = &live[ci];
-            let cost = (
-                pair_cost(ci, &opposite, candidates, &live_pairs),
-                st.team_n(&team),
-                st.type_n(&rtype),
-                st.role_n(&role),
-            );
-            if best.is_none_or(|(_, bc)| cost < bc) {
+            let cost = (info, st.team_n(&team), st.type_n(&rtype), st.role_n(&role));
+            if best.is_none_or(|(_, bc)| cost_less(cost, bc)) {
                 best = Some((ci, cost));
             }
         }
         let (ci, _) = best.expect("candidates is non-empty");
         out[si] = ci;
-        commit_pick(
-            &mut live,
-            &mut live_pairs,
-            candidates,
-            ci,
-            &opposite,
-            (team, rtype, role),
-        );
+        let st = &mut live[ci];
+        st.games += 1;
+        *st.team.entry(team).or_insert(0) += 1;
+        *st.role_type.entry(rtype).or_insert(0) += 1;
+        *st.role.entry(role).or_insert(0) += 1;
     }
 
     enforce_two_models(&mut out, seat_chars, candidates, &live, rng);
@@ -503,12 +610,28 @@ mod tests {
         rows.into_iter().map(|(m, s)| (m.to_string(), s)).collect()
     }
 
-    /// History with per-model records and, optionally, cross-team pair coverage
-    /// (`(a, b, seat_pairs)` — order-independent).
-    fn hist_with(rows: Vec<(&str, ModelStats)>, pairs: &[(&str, &str, u32)]) -> History {
+    /// History with per-model records and, optionally, a set of games given as
+    /// `(model, team)` seat lists — each becomes one mean-team contest, exactly as
+    /// [`read_history`] would build it.
+    fn hist_with(rows: Vec<(&str, ModelStats)>, games: &[&[(&str, &str)]]) -> History {
+        let mut contests = Vec::new();
+        for game in games {
+            let mut good: HashMap<String, u32> = HashMap::new();
+            let mut evil: HashMap<String, u32> = HashMap::new();
+            for (m, team) in *game {
+                match *team {
+                    "Good" => *good.entry((*m).to_string()).or_insert(0) += 1,
+                    "Evil" => *evil.entry((*m).to_string()).or_insert(0) += 1,
+                    _ => {}
+                }
+            }
+            if let Some(c) = contest_of(&good, &evil) {
+                contests.push(c);
+            }
+        }
         History {
             models: stats_with(rows),
-            pairs: pairs.iter().map(|(a, b, w)| (pair_key(a, b), *w)).collect(),
+            contests,
         }
     }
 
@@ -821,27 +944,29 @@ mod tests {
         }
     }
 
-    /// Match-up coverage is the **primary** axis: with the count axes tied, the Good
-    /// seats must go to whoever has faced the Evil side least.
+    /// Match-up cost is the **primary** axis: with the count axes tied, the Good seats
+    /// must go to whoever is least covariant with the placed Evil side.
     #[test]
     fn select_targets_the_least_observed_matchup() {
         let seat_chars = vec![Character::Empath, Character::Chef, Character::Imp];
         // `owed_evil` has never been Evil, so it takes the Demon seat. `stranger` and
-        // `rival` have *identical* records — only pair coverage can separate them, and
-        // `rival` is already heavily observed against `owed_evil`.
+        // `rival` have *identical* records — only the covariance separates them, and
+        // `rival` is heavily coupled to `owed_evil` by 30 shared contests.
         let even = || {
             model(&[
                 ("Good", "Townsfolk", "Empath", 5),
                 ("Evil", "Demon", "Imp", 9),
             ])
         };
+        let paired: &[(&str, &str)] = &[("owed_evil", "Evil"), ("rival", "Good")];
+        let games: Vec<&[(&str, &str)]> = vec![paired; 30];
         let hist = hist_with(
             vec![
                 ("owed_evil", model(&[("Good", "Townsfolk", "Empath", 9)])),
                 ("stranger", even()),
                 ("rival", even()),
             ],
-            &[("owed_evil", "rival", 30)],
+            &games,
         );
         let pool = ["owed_evil", "stranger", "rival"];
         for seed in 0..32u64 {
@@ -892,8 +1017,8 @@ mod tests {
         }
     }
 
-    /// The ≥2 floor still holds for a shape the pair axis cannot reason about: a bag
-    /// with no Evil seat at all leaves `pair_cost` at 0 for everyone.
+    /// The ≥2 floor still holds for a shape the match-up axis cannot reason about: a bag
+    /// with no Evil seat at all leaves the match-up cost at 0 for everyone.
     #[test]
     fn min_two_models_holds_even_with_no_evil_seat() {
         let seat_chars = vec![Character::Empath, Character::Chef];
@@ -929,12 +1054,11 @@ mod tests {
     }
 
     #[test]
-    fn read_history_counts_only_cross_team_pairs() {
-        // One game: A and B are Good, C is Evil. Only the cross-team pairs {A,C} and
-        // {B,C} can ever become BT edges — {A,B} share an outcome, so the rater never
-        // compares them. A second game seats the SAME model on both sides: the rater
-        // skips same-model pairs, so it must contribute nothing.
-        let path = std::env::temp_dir().join("botc_balance_read_history_pairs_test.jsonl");
+    fn read_history_builds_team_contrasts() {
+        // One game: A and B are Good, C is Evil → z is each Good seat's share (½) and
+        // −1 for the lone Evil seat. A second game seats the SAME model on both sides:
+        // its shares cancel, so it yields no contrast at all.
+        let path = std::env::temp_dir().join("botc_balance_read_history_contest_test.jsonl");
         let seat = |m: &str, team: &str, ct: &str, role: &str| {
             format!(
                 r#"{{"model":"{m}","team":"{team}","character_type":"{ct}","true_character":"{role}"}}"#
@@ -955,20 +1079,17 @@ mod tests {
         let hist = read_history(&path);
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(pair_n(&hist.pairs, "A", "C"), 1, "Good×Evil pair counted");
-        assert_eq!(pair_n(&hist.pairs, "B", "C"), 1, "order-independent lookup");
-        assert_eq!(pair_n(&hist.pairs, "C", "B"), 1, "key is unordered");
-        assert_eq!(
-            pair_n(&hist.pairs, "A", "B"),
-            0,
-            "same-team seats never form a BT edge"
+        // Only the contested game contributes a contrast; the same-model game drops out.
+        assert_eq!(hist.contests.len(), 1);
+        let z = &hist.contests[0];
+        let w = |name: &str| z.iter().find(|(m, _)| m == name).map(|(_, w)| *w);
+        assert!((w("A").unwrap() - 0.5).abs() < 1e-9, "A share ½");
+        assert!((w("B").unwrap() - 0.5).abs() < 1e-9, "B share ½");
+        assert!(
+            (w("C").unwrap() + 1.0).abs() < 1e-9,
+            "C lone Evil seat = −1"
         );
-        assert_eq!(
-            pair_n(&hist.pairs, "D", "D"),
-            0,
-            "same-model cross-team pairs carry no information"
-        );
-        // The per-model record is unaffected by the pair tally.
+        // The per-model record still counts both of D's seats.
         assert_eq!(hist.models["D"].games, 2);
     }
 
