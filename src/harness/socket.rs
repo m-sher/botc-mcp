@@ -238,17 +238,39 @@ fn dispatch(
                 .get("token")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            // Resolve the calling seat once (host/player) for gating + liveness.
+            let actor = resolve_wake_actor(store, &req.arguments);
+            if let Some(a) = actor {
+                wake.note_activity(a);
+            }
             let outcome = if name == "await_turn" {
                 invoke_await_turn(store, wake, &req.arguments)
+            } else if turn_gated_tool(name)
+                && actor
+                    .map(|a| !wake.is_scheduled_for(store, a, name))
+                    .unwrap_or(false)
+            {
+                // Turn gate: a phase-advancing tool is only legal when the live
+                // plan schedules THIS actor for it. Restores "only the scheduled
+                // actor advances state" — an always-on session can no longer end
+                // the day while a player is still mid-nomination (#66 P3 race).
+                // If the caller can't be resolved to a seat (actor None), fall
+                // through so the engine returns its own precise auth/arg error.
+                let who = actor.map(|a| a.label()).unwrap_or_else(|| "?".into());
+                crate::dlog!(
+                    "GATE-BLOCK {who} tool={name} — not this actor's turn (not scheduled)"
+                );
+                Err(format!(
+                    "not your turn: `{name}` is only legal when it is your scheduled turn. \
+                     Call await_turn and act on the wake it returns."
+                ))
             } else {
                 let r = mcp_server::invoke_named_tool(store, name, req.arguments.clone());
                 // MCP wraps tool failures as Ok({ isError: true }) — do NOT treat
                 // those as completing a wake (live #64 bug: wrong-tool spam).
                 if tool_call_succeeded(&r) {
-                    if let Some(ref tok) = token {
-                        if let Some(actor) = resolve_wake_actor(store, tok, &req.arguments) {
-                            wake.note_tool_success(store, actor, name);
-                        }
+                    if let Some(a) = actor {
+                        wake.note_tool_success(store, a, name);
                     }
                 }
                 r
@@ -292,12 +314,16 @@ fn dispatch(
     }
 }
 
-fn resolve_wake_actor(store: &SharedStore, token: &str, args: &Value) -> Option<WakeActor> {
+fn resolve_wake_actor(store: &SharedStore, args: &Value) -> Option<WakeActor> {
     use crate::auth::Token;
     let game_id = args.get("game_id").and_then(|v| v.as_u64())?;
+    // Match the engine's auth surface: accept token / host_token / player_token.
+    let tok = ["token", "host_token", "player_token"]
+        .iter()
+        .find_map(|k| args.get(*k).and_then(|v| v.as_str()))?;
     let st = store.lock().ok()?;
     let game = st.get(GameId(game_id))?;
-    let actor = game.tokens.resolve(&Token::from_shared(token))?;
+    let actor = game.tokens.resolve(&Token::from_shared(tok))?;
     Some(WakeActor::from_auth(actor))
 }
 
@@ -370,6 +396,30 @@ fn invoke_await_turn(
         "structuredContent": structured,
         "isError": false
     }))
+}
+
+/// Tools that advance day/night/turn state and are only legal when the live plan
+/// schedules this actor for them (checked via [`WakeCoordinator::is_scheduled_for`]).
+///
+/// Deliberately NOT gated:
+/// - reads (`get_*`, `list_*`), `create_game`, `await_turn` — no turn to hold;
+/// - `night_action` — the engine already turn-gates it (`pending_night` →
+///   `NotYourWake`), so socket gating would only add lock-skew risk;
+/// - `say` — public table-talk; strict round-robin speaking is enforced by who
+///   is *woken*, not by rejecting out-of-turn chatter (directed `say.to` has its
+///   own wake), and gating it would block legitimate replies;
+/// - `day_action` (Slayer) — the rules allow it any time during the day;
+/// - `st_announce`, `host_queue_lie` — host prerogatives that do not advance a phase.
+///
+/// This is the mid-game phase-transition set (the class that caused the #66 P3
+/// race, where the Host ended nominations out of turn). `nominate`/`vote` gating
+/// is a deliberate future extension left off here so player table dynamics are
+/// not tightened without a live game to validate against.
+fn turn_gated_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "open_nominations" | "end_nominations" | "close_vote" | "host_decide" | "skip_night_action"
+    )
 }
 
 /// True when `invoke_named_tool` produced a genuine success (not MCP isError).

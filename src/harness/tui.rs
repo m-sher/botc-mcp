@@ -927,7 +927,22 @@ impl App {
             (matches!(g.phase, Phase::Ended { .. }), plan_dbg, state_dbg)
         };
         self.last_targets = plan_dbg.clone();
-        crate::dlog!("MAINTAIN {state_dbg} plan=[{}]", plan_dbg.join(", "));
+        // Per-seat silence for wake-holders: "P3:87s" = P3 holds a turn but has
+        // not made any RPC for 87s (the "green but idle" / stalled-session signal).
+        let outstanding = self
+            .wake
+            .outstanding_silence()
+            .iter()
+            .map(|(label, secs)| match secs {
+                Some(s) => format!("{label}:{s}s"),
+                None => format!("{label}:?"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        crate::dlog!(
+            "MAINTAIN {state_dbg} plan=[{}] outstanding=[{outstanding}]",
+            plan_dbg.join(", ")
+        );
 
         self.results_poll();
 

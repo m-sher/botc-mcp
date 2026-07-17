@@ -83,6 +83,10 @@ struct Inner {
     outstanding: HashMap<WakeActor, WakeEnvelope>,
     /// Actors currently blocked inside `await_turn` (for UI).
     waiters: HashMap<WakeActor, Instant>,
+    /// Wall-clock of each actor's most recent harness RPC (any tool). Lets the
+    /// harness spot a seat that holds a wake but has gone silent ("green but
+    /// idle": handed a turn, then its process stalled without acting or polling).
+    last_seen: HashMap<WakeActor, Instant>,
     /// Shut down all waiters (TUI quit).
     stopped: bool,
 }
@@ -113,6 +117,7 @@ impl WakeCoordinator {
                 next_seq: 1,
                 outstanding: HashMap::new(),
                 waiters: HashMap::new(),
+                last_seen: HashMap::new(),
                 stopped: false,
             })),
             cv: Arc::new(Condvar::new()),
@@ -127,6 +132,7 @@ impl WakeCoordinator {
         g.wait_sig = None;
         g.stage_key.clear();
         g.outstanding.clear();
+        g.last_seen.clear();
         g.last_stall_bump = None;
         g.stopped = false;
         self.cv.notify_all();
@@ -177,6 +183,68 @@ impl WakeCoordinator {
     pub fn working_labels(&self) -> Vec<String> {
         let g = self.inner.lock().unwrap();
         g.outstanding.keys().map(|a| a.label()).collect()
+    }
+
+    /// True when `actor` is currently SCHEDULED (by the live `plan_ticks`) for a
+    /// target that `tool` would complete — i.e. it is genuinely this actor's turn
+    /// to call `tool`. The turn gate uses this so an always-on session cannot
+    /// advance game state out of turn (e.g. the Host calling `end_nominations`
+    /// while a player is still mid-nomination), restoring the "only the scheduled
+    /// actor advances state" invariant the process-per-turn harness had for free.
+    ///
+    /// Deliberately keyed on the recomputed plan, NOT the `outstanding` mailbox:
+    /// `outstanding` is mutable state that any actor's poll can clear (stage-key
+    /// change / mute-skip clear ALL wakes) and that a mid-turn phase change can
+    /// leave stale, so authorizing from it would both spuriously block a
+    /// correctly-scheduled Host action and keep authorizing a stale one after the
+    /// plan moved on (e.g. a fresh nomination). The plan is always current.
+    pub fn is_scheduled_for(&self, store: &SharedStore, actor: WakeActor, tool: &str) -> bool {
+        let (game_id, rotation, stall) = {
+            let g = self.inner.lock().unwrap();
+            match g.game_id {
+                Some(id) => (GameId(id), g.rotation, g.stall),
+                None => return false,
+            }
+        };
+        // Coordinator lock released above; safe to take the store lock here.
+        let Ok(st) = store.lock() else { return false };
+        let Some(game) = st.get(game_id) else {
+            return false;
+        };
+        plan_ticks(game, rotation, stall)
+            .iter()
+            .any(|t| target_matches_actor(t, actor) && tool_completes_wake(tool, t))
+    }
+
+    /// Record that `actor` just made a harness RPC of any kind (for liveness /
+    /// silence diagnostics). Cheap; called on every dispatched tool.
+    pub fn note_activity(&self, actor: WakeActor) {
+        self.inner
+            .lock()
+            .unwrap()
+            .last_seen
+            .insert(actor, Instant::now());
+    }
+
+    /// For every actor holding an outstanding wake, seconds since its last RPC.
+    /// A large value = "green but silent": handed a turn, then its process went
+    /// quiet without acting or re-polling. `None` = no RPC recorded yet.
+    pub fn outstanding_silence(&self) -> Vec<(String, Option<u64>)> {
+        let g = self.inner.lock().unwrap();
+        let now = Instant::now();
+        let mut v: Vec<(String, Option<u64>)> = g
+            .outstanding
+            .keys()
+            .map(|a| {
+                let secs = g
+                    .last_seen
+                    .get(a)
+                    .map(|t| now.saturating_duration_since(*t).as_secs());
+                (a.label(), secs)
+            })
+            .collect();
+        v.sort();
+        v
     }
 
     /// True when every listed actor is blocked in `await_turn` (all idle).
@@ -479,6 +547,13 @@ fn try_deliver(
             }
             let mut env = env;
             env.deliveries = env.deliveries.saturating_add(1);
+            crate::dlog!(
+                "WAKE redeliver {} kind={} wake_id={} deliv={}",
+                actor.label(),
+                env.kind,
+                env.wake_id,
+                env.deliveries
+            );
             guard.outstanding.insert(actor, env.clone());
             // Summary only when delivering a wake (idle polls skip O(log) string build).
             let (summary, _) = public_summary(game);
@@ -508,6 +583,12 @@ fn try_deliver(
             kind,
             deliveries: 1,
         };
+        crate::dlog!(
+            "WAKE fresh {} kind={} wake_id={} deliv=1",
+            actor.label(),
+            env.kind,
+            env.wake_id
+        );
         let out = wake_json(&env, &summary);
         guard.outstanding.insert(actor, env);
         return Deliver::Wake(out);
@@ -1113,6 +1194,56 @@ mod tests {
             },
         };
         assert!(tool_completes_wake("say", &directed));
+    }
+
+    #[test]
+    fn is_scheduled_for_gates_on_the_live_plan() {
+        let (store, gid) = started_store();
+        let coord = WakeCoordinator::new();
+        coord.set_game_id(gid);
+        let host = WakeActor::Host;
+        let p0 = WakeActor::Player(SeatId(0));
+
+        // Put the game in Day/Nominations with every living seat having already
+        // nominated, so plan_ticks schedules Host(EndDay{in_discussion:false}).
+        {
+            let mut st = store.lock().unwrap();
+            let g = st.get_mut(GameId(gid)).unwrap();
+            g.phase = Phase::Day {
+                day: 1,
+                stage: crate::game::DayStage::Nominations,
+            };
+            g.pending_host = None;
+            g.pending_night = None;
+            g.current_nomination = None;
+            for s in &mut g.seats {
+                s.alive = true;
+            }
+            g.day_nominators = g.seats.iter().map(|s| s.id).collect();
+        }
+
+        // It IS the Host's scheduled turn to end the day...
+        assert!(coord.is_scheduled_for(&store, host, "end_nominations"));
+        // ...but only that tool (a different phase-advance is not scheduled),
+        assert!(!coord.is_scheduled_for(&store, host, "close_vote"));
+        // ...and a player is not scheduled to end nominations.
+        assert!(!coord.is_scheduled_for(&store, p0, "end_nominations"));
+
+        // Authorization tracks the LIVE plan, not a stale mailbox: once seats can
+        // still nominate again, the plan schedules a player and the Host's
+        // end-the-day turn is gone — so the gate must revoke it.
+        {
+            let mut st = store.lock().unwrap();
+            st.get_mut(GameId(gid)).unwrap().day_nominators.clear();
+        }
+        assert!(
+            !coord.is_scheduled_for(&store, host, "end_nominations"),
+            "Host end-day authorization must vanish once the plan schedules a player"
+        );
+
+        // A coordinator with no bound game schedules nobody for anything.
+        let unbound = WakeCoordinator::new();
+        assert!(!unbound.is_scheduled_for(&store, host, "end_nominations"));
     }
 
     #[test]
