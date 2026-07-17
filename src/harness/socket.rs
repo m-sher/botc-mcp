@@ -38,7 +38,7 @@ pub struct RpcResponse {
     pub error: Option<String>,
 }
 
-/// Identity of the socket file we bound, so cleanup never unlinks a rebound peer's path (#55).
+/// Identity of the socket file we bound, so cleanup never unlinks a rebound peer's path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SockId {
     dev: u64,
@@ -62,7 +62,7 @@ fn remove_if_ours(path: &Path, id: SockId) {
 /// Background accept-loop serving tool RPCs on a Unix domain socket.
 pub struct SocketServer {
     path: PathBuf,
-    /// Bound socket inode; only remove path if it still matches (#55).
+    /// Bound socket inode; only remove path if it still matches.
     sock_id: SockId,
     stop: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
@@ -97,7 +97,7 @@ impl SocketServer {
         let sock_id = sock_id_of(&path)
             .ok_or_else(|| std::io::Error::other("socket metadata missing after bind"))?;
         // Non-blocking accept so stop()/Drop never deadlocks if the socket file
-        // is unlinked or rebound (#48). We poll with a short sleep + stop flag.
+        // is unlinked or rebound. We poll with a short sleep + stop flag.
         listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_c = Arc::clone(&stop);
@@ -130,7 +130,7 @@ impl SocketServer {
                     }
                 }
             }
-            // #55: only unlink if this path is still *our* socket inode.
+            // Only unlink if this path is still *our* socket inode.
             remove_if_ours(&path_c, sock_id);
         });
         Ok(Self {
@@ -251,9 +251,9 @@ fn dispatch(
                     .unwrap_or(false)
             {
                 // Turn gate: a phase-advancing tool is only legal when the live
-                // plan schedules THIS actor for it. Restores "only the scheduled
-                // actor advances state" — an always-on session can no longer end
-                // the day while a player is still mid-nomination (#66 P3 race).
+                // plan schedules THIS actor for it — only the scheduled actor
+                // advances state, so an always-on session cannot end the day
+                // while a player is still mid-nomination.
                 // If the caller can't be resolved to a seat (actor None), fall
                 // through so the engine returns its own precise auth/arg error.
                 let who = actor.map(|a| a.label()).unwrap_or_else(|| "?".into());
@@ -267,7 +267,7 @@ fn dispatch(
             } else {
                 let r = mcp_server::invoke_named_tool(store, name, req.arguments.clone());
                 // MCP wraps tool failures as Ok({ isError: true }) — do NOT treat
-                // those as completing a wake (live #64 bug: wrong-tool spam).
+                // those as completing a wake.
                 if tool_call_succeeded(&r) {
                     if let Some(a) = actor {
                         wake.note_tool_success(store, a, name);
@@ -411,10 +411,10 @@ fn invoke_await_turn(
 /// - `day_action` (Slayer) — the rules allow it any time during the day;
 /// - `st_announce`, `host_queue_lie` — host prerogatives that do not advance a phase.
 ///
-/// This is the mid-game phase-transition set (the class that caused the #66 P3
-/// race, where the Host ended nominations out of turn). `nominate`/`vote` gating
-/// is a deliberate future extension left off here so player table dynamics are
-/// not tightened without a live game to validate against.
+/// This is the mid-game phase-transition set — ungated, these let the Host end
+/// nominations or advance a phase out of turn. `nominate`/`vote` gating is a
+/// deliberate future extension left off here so player table dynamics are not
+/// tightened without a live game to validate against.
 fn turn_gated_tool(name: &str) -> bool {
     matches!(
         name,
@@ -535,7 +535,7 @@ mod tests {
         );
     }
 
-    /// #55: dropping an older server must not unlink a rebound peer's live socket.
+    /// Dropping an older server must not unlink a rebound peer's live socket.
     #[test]
     fn drop_old_server_does_not_unlink_rebound_socket() {
         let store_a = mcp_server::new_shared_store();

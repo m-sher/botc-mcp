@@ -88,7 +88,7 @@ struct App {
     last_tick: Instant,
     cfg: HarnessConfig,
     should_quit: bool,
-    /// Lines scrolled up from the live tail (0 = stick to newest output) (#45).
+    /// Lines scrolled up from the live tail (0 = stick to newest output).
     scroll_from_bottom: usize,
     /// Agent indices whose stream shows full `[think]` blocks (default: collapsed).
     thinking_expanded: HashSet<usize>,
@@ -101,7 +101,7 @@ struct App {
     feed_rows: Vec<Option<u64>>,
     /// Feed entries (by seq) whose full args/result are expanded.
     feed_expanded: HashSet<u64>,
-    /// Central feed of every agent tool RPC (shared with the socket server) (#UI).
+    /// Central feed of every agent tool RPC (shared with the socket server).
     action_log: Arc<ActionLog>,
     /// Per visible row of the left board pane: agent index to select on click
     /// (`None` = header / nom tracker / spacer — not clickable for selection).
@@ -599,12 +599,12 @@ impl App {
     }
 
     fn launch(&mut self) {
-        // #55: also gate on socket — a failed prior launch may have left socket=Some.
+        // Also gate on socket — a failed prior launch may have left socket=Some.
         if self.agents.is_some() || self.socket.is_some() {
             self.status = "Already launched — restart the TUI for a new table.".into();
             return;
         }
-        // #50: refuse to launch without a real botc-agent-mcp binary.
+        // Refuse to launch without a real botc-agent-mcp binary.
         if !agent_mcp_bin_ok(&self.cfg) {
             let p = resolve_agent_mcp_bin_for_display(&self.cfg);
             self.status = format!(
@@ -613,7 +613,7 @@ impl App {
             );
             return;
         }
-        // #69: a claude seat needs the claude binary + a model from the claude list.
+        // A claude seat needs the claude binary + a model from the claude list.
         if self
             .seat_choices
             .iter()
@@ -708,7 +708,7 @@ impl App {
         };
         if let Some(e) = start_err {
             self.status = format!("start_game: {e}");
-            // #55/#58: roll back partial launch state (socket + work_root).
+            // Roll back partial launch state (socket + work_root).
             self.abort_partial_launch();
             return;
         }
@@ -831,7 +831,7 @@ impl App {
             }
             Err(e) => {
                 self.status = format!("prepare: {e}");
-                // #55/#58: socket + partial work_root without agents.
+                // Socket + partial work_root without agents.
                 self.abort_partial_launch();
             }
         }
@@ -887,7 +887,7 @@ impl App {
         }
     }
 
-    /// Tear down socket + work_root after a launch that never got a live AgentPool (#55/#58).
+    /// Tear down socket + work_root after a launch that never got a live AgentPool.
     fn abort_partial_launch(&mut self) {
         if let Some(s) = self.socket.take() {
             s.stop();
@@ -1171,7 +1171,7 @@ impl App {
         if let Some(s) = self.socket.take() {
             s.stop();
         }
-        // #58: even if agents never built (failed launch), remove work_root/tokens.
+        // Even if agents never built (failed launch), remove work_root/tokens.
         if self.cfg.work_root.exists() {
             let _ = std::fs::remove_dir_all(&self.cfg.work_root);
         }
@@ -1404,7 +1404,7 @@ fn draw_action_feed(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(p, area);
 }
 
-/// RAII guard: restores terminal raw-mode / alternate screen on Drop or panic (#49).
+/// RAII guard: restores terminal raw-mode / alternate screen on Drop or panic.
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     restored: bool,
@@ -1412,7 +1412,7 @@ struct TerminalGuard {
 
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
-        // #57: enable raw mode first, then finish setup under a restore-on-err path
+        // Enable raw mode first, then finish setup under a restore-on-err path
         // so a later failure cannot leave the terminal in raw mode without a guard.
         enable_raw_mode()?;
         match Self::enter_after_raw() {
@@ -2204,13 +2204,13 @@ fn draw_monitor(f: &mut Frame, area: Rect, app: &mut App) {
         })
         .unwrap_or_else(|| "stream".into());
 
-    // #45/#53: tail-anchor in *wrapped visual rows* (Paragraph::scroll unit), not
+    // Tail-anchor in *wrapped visual rows* (Paragraph::scroll unit), not
     // logical lines — long Grok prose wraps in the stream column constantly.
     let log_lines = app.agent_log_lines();
     let inner_w = cols[2].width.saturating_sub(2);
     let view_h = cols[2].height.saturating_sub(2) as usize;
     let para = Paragraph::new(log_lines).wrap(Wrap { trim: false });
-    // Wrapped-row count for the exact rendered width (tail-anchor scroll, #53).
+    // Wrapped-row count for the exact rendered width (tail-anchor scroll).
     let row_count = if inner_w == 0 {
         0
     } else {
@@ -2308,7 +2308,7 @@ pub fn stream_lines(entries: &[LogLine], expand: bool) -> Vec<Line<'static>> {
     out
 }
 
-/// Wrapped visual row count at `inner_w` — same unit as `Paragraph::scroll` (#53).
+/// Wrapped visual row count at `inner_w` — same unit as `Paragraph::scroll`.
 ///
 /// Uses ratatui's wrap math (no Block) so the count matches what the renderer
 /// produces inside a bordered pane of that inner width.
@@ -2322,7 +2322,7 @@ pub fn stream_wrapped_row_count(text: &str, inner_w: u16) -> usize {
 }
 
 /// Vertical scroll offset that keeps the live tail (or an offset from it) in view.
-/// `row_count` / `scroll_from_bottom` are in **wrapped visual rows** (#45/#53).
+/// `row_count` / `scroll_from_bottom` are in **wrapped visual rows**.
 pub fn stream_scroll_y(row_count: usize, view_h: usize, scroll_from_bottom: usize) -> usize {
     let max_scroll_top = row_count.saturating_sub(view_h);
     max_scroll_top.saturating_sub(scroll_from_bottom.min(max_scroll_top))
@@ -2436,17 +2436,17 @@ mod tests {
             wrapped > logical,
             "expected wrap to inflate row count: logical={logical} wrapped={wrapped}"
         );
-        // Issue repro numbers: logical scroll under-shoots; wrap-aware is larger.
+        // Logical scroll under-shoots; wrap-aware is larger.
         assert!(
             stream_scroll_y(wrapped, 6, 0) > stream_scroll_y(logical, 6, 0),
             "wrap-aware tail scroll must be deeper than logical-only"
         );
     }
 
-    /// #53: with wrapping lines, live-tail scroll must keep MARKER on screen.
+    /// With wrapping lines, live-tail scroll must keep MARKER on screen.
     #[test]
     fn wrap_aware_tail_anchor_shows_last_line_on_test_backend() {
-        // Pane w=20 / h=8 → inner 18×6 (borders). Matches issue repro shape.
+        // Pane w=20 / h=8 → inner 18×6 (borders).
         let backend = TestBackend::new(20, 8);
         let mut terminal = Terminal::new(backend).expect("terminal");
 
@@ -2463,7 +2463,7 @@ mod tests {
                 let view_h = area.height.saturating_sub(2) as usize;
                 let rows = stream_wrapped_row_count(&log_text, inner_w);
                 let scroll_y = stream_scroll_y(rows, view_h, 0);
-                // Sanity: logical-only would under-scroll (issue repro).
+                // Sanity: logical-only would under-scroll.
                 let logical = log_text.lines().count();
                 assert!(
                     scroll_y > stream_scroll_y(logical, view_h, 0),
@@ -2490,7 +2490,7 @@ mod tests {
             "last line MARKER must be visible with wrap-aware tail scroll; screen:\n{screen}"
         );
 
-        // Control: logical-only scroll must leave MARKER off-screen (documents the bug).
+        // Control: logical-only scroll must leave MARKER off-screen — proves wrap matters.
         let backend2 = TestBackend::new(20, 8);
         let mut terminal2 = Terminal::new(backend2).expect("terminal2");
         terminal2

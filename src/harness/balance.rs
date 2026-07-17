@@ -1,4 +1,4 @@
-//! History-balanced role assignment (issue #70) driven by **match-up coverage**.
+//! History-balanced role assignment driven by **match-up coverage**.
 //!
 //! The bag composition for a player count is fixed (see [`crate::game::setup`]);
 //! what we choose is **which model plays which character**.
@@ -18,7 +18,7 @@
 //!   rating is the weight and connectivity of the pair graph.
 //!
 //! So the primary axis is **pair-coverage deficit**: prefer the model that has been
-//! observed least against the opposing side. The per-model count axes from #70 —
+//! observed least against the opposing side. The per-model count axes —
 //! **team** (Good / Evil), then **role type** (Townsfolk / Outsider / Minion / Demon),
 //! then **specific role** (Empath, Poisoner, …) — are kept as lexicographic tie-breaks,
 //! so a model still can't drift into always drawing the same team (which would confound
@@ -110,9 +110,9 @@ fn keys(c: Character) -> (String, String, String) {
     )
 }
 
-/// Compose the ranking/identity node key for a seat (issue #69). Grok — and legacy
-/// rows with no `backend` field — stay **bare**, so pre-#69 corpus and ratings keys
-/// are unchanged and no leaderboard node splits. Other backends are namespaced
+/// Compose the ranking/identity node key for a seat. Grok — and legacy
+/// rows with no `backend` field — stay **bare**, so grok and legacy rows resolve to
+/// the same bare key and no leaderboard node splits. Other backends are namespaced
 /// `<backend>:<model>`, so a native claude seat never conflates with claude weights
 /// served through grok. Empty model → empty key (the caller skips it). Must stay
 /// identical to `node_key` in scripts/rate_models.py and scripts/model_aliases.py.
@@ -416,7 +416,7 @@ fn enforce_two_models(
 /// Greedy, cost `(pair deficit, team, role type, role)`:
 /// * **Evil seats first.** They are the scarce side, and pinning them gives every Good
 ///   seat a concrete opposition to measure against. While they are placed there is no
-///   opposition yet, so `pair_cost` is 0 for all and the tuple degrades to the #70
+///   opposition yet, so `pair_cost` is 0 for all and the tuple degrades to the
 ///   count axes — exactly what we want for "who is owed Evil".
 /// * **Good seats** then go to whoever has faced that Evil side least, which both
 ///   forbids the monolithic table (via [`SAME_MODEL_PENALTY`]) and spreads the seats:
@@ -778,13 +778,13 @@ mod tests {
         );
     }
 
-    /// Regression: the pure-count cost let one model take **every** seat.
+    /// A single model must never field **every** seat.
     ///
     /// A model with far less history is the cheapest pick on every count axis, and
-    /// folding a single seat in per pick never closes a gap that large — so all seven
-    /// went to it. The rater skips same-model pairs, so that table produced *zero* BT
-    /// edges: the model with the least data was seated in a game that could teach the
-    /// leaderboard nothing about it.
+    /// folding a single seat in per pick never closes a gap that large, so a pure-count
+    /// cost would hand it all seven. The rater skips same-model pairs, so such a table
+    /// produces *zero* BT edges: the model with the least data seated in a game that
+    /// could teach the leaderboard nothing about it.
     #[test]
     fn select_never_fields_one_model_when_a_second_is_eligible() {
         let seat_chars = vec![

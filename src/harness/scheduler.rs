@@ -231,12 +231,11 @@ pub fn plan_ticks(game: &Game, rotation: usize, stall: usize) -> Vec<SchedTarget
                     .filter(|s| s.alive && !game.day_nominators.contains(&s.id))
                     .map(|s| s.id)
                     .collect();
-                // End when every eligible seat has had a fair offer. Under the
-                // old per-tick harness, `stall` rose every ~2s maintain cycle.
-                // Continuous sessions only wall-clock-bump stall (~45s), so
-                // agents can "Pass."-say around the table forever (rot → 100+)
-                // while stall stays 0–1. Also accept `rotation` so one full lap
-                // of offers ends the day without waiting on the wall clock.
+                // End when every eligible seat has had a fair offer. Continuous
+                // sessions only wall-clock-bump stall (~45s), so agents can
+                // "Pass."-say around the table forever (rot → 100+) while stall
+                // stays 0–1. Also accept `rotation` so one full lap of offers
+                // ends the day without waiting on the wall clock.
                 let need = eligible.len().max(2);
                 let everyone_had_a_turn = stall >= need || rotation >= need;
                 if eligible.is_empty() || everyone_had_a_turn {

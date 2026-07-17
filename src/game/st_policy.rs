@@ -62,7 +62,7 @@ pub enum PendingHostDecision {
     },
     // Day-time Spy/Recluse registration (Virgin / Slayer) is **not** a host pause:
     // it resolves immediately via `registration_mode` so the day is never blocked and
-    // no covert channel is created (#39 residual / #41).
+    // no covert channel is created.
 }
 
 /// Payload needed to finish a night info step after a host pause.

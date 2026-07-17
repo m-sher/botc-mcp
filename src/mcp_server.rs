@@ -135,7 +135,7 @@ fn dispatch_method(store: &SharedStore, method: &str, params: Value) -> Result<V
     }
 }
 
-/// Whether `name` is a real botc tool (used by stdio server + agent proxy bare-dispatch) (#59).
+/// Whether `name` is a real botc tool (used by stdio server + agent proxy bare-dispatch).
 pub fn is_known_tool(name: &str) -> bool {
     TOOL_NAMES.contains(&name)
 }
@@ -181,9 +181,8 @@ fn tool_descriptors() -> Vec<Value> {
 }
 
 /// Full JSON Schema for one tool's arguments, matching the dispatch parsing
-/// exactly. Empty `properties` here left model agents unable to see what any
-/// tool takes — they guessed arg names, then went hunting for the source to
-/// find the signatures. Every schema must name and type every accepted field.
+/// exactly. Every schema names and types every accepted field so model agents
+/// can see what each tool takes without guessing arg names or reading the source.
 fn tool_schema(name: &str) -> Value {
     // Shared fragments. `token` is optional on the wire: the harness proxy
     // injects the caller's token automatically; direct MCP connections pass it.
@@ -1409,7 +1408,7 @@ mod tests {
         let salt = host_resp["result"]["structuredContent"]["secret_salt"]
             .as_u64()
             .expect("secret_salt");
-        // CSPRNG seed: must not silently default to 0 (issue #1 #4).
+        // CSPRNG seed: must not silently default to 0.
         assert_ne!(seed, 0, "omitted seed must not default to 0");
         // secret_salt is present for host (player views never get it).
         let _ = salt;
@@ -1432,9 +1431,8 @@ mod tests {
         assert_eq!(resp["result"]["serverInfo"]["name"], "botc-mcp");
     }
 
-    /// Empty `properties` left model agents unable to see any tool's arguments —
-    /// they guessed field names and went hunting for the source to find the
-    /// signatures. Every tool must publish a real schema.
+    /// Every tool must publish a real schema so model agents can see its arguments
+    /// instead of guessing field names or reading the source.
     #[test]
     fn every_tool_publishes_a_real_input_schema() {
         // The only tools that genuinely take no arguments.

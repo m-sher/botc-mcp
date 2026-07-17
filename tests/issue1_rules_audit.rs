@@ -1,4 +1,4 @@
-//! Focused regression tests for GitHub issue #1 (TB rules audit remediation).
+//! Trouble Brewing rules invariants.
 
 use botc_mcp::comms::PrivateMessage;
 use botc_mcp::game::ability::{register, try_demon_kill, KillResult};
@@ -46,7 +46,7 @@ fn to_day1(g: &mut Game, host: &botc_mcp::auth::Token) {
     ));
 }
 
-/// 1. Drunk face not in bag (also covered in setup unit tests).
+/// Drunk face not in bag (also covered in setup unit tests).
 #[test]
 fn drunk_face_not_duplicating_in_bag_many_seeds() {
     use botc_mcp::game::setup::build_bag;
@@ -72,7 +72,7 @@ fn drunk_face_not_duplicating_in_bag_many_seeds() {
     assert!(found > 0);
 }
 
-/// 2. Two Empaths (real + Drunk face) both queued on first night.
+/// Two Empaths (real + Drunk face) both queued on first night.
 #[test]
 fn two_empaths_real_and_drunk_face_both_wake() {
     let (g, host, tokens) = start_scripted(
@@ -121,7 +121,7 @@ fn two_empaths_real_and_drunk_face_both_wake() {
     assert!(results1 >= 1, "Drunk-face Empath needs a night result");
 }
 
-/// 3. Drunk face Ravenkeeper dies at night → gets wake.
+/// Drunk face Ravenkeeper dies at night → gets wake.
 #[test]
 fn drunk_face_ravenkeeper_dies_at_night_wakes() {
     let (mut g, host, tokens) = start_scripted(
@@ -229,7 +229,7 @@ fn poisoned_ravenkeeper_still_wakes_on_death() {
     ));
 }
 
-/// 4. Mayor bounce never kills Imp; Minions are allowed (host kill_other).
+/// Mayor bounce never kills Imp; Minions are allowed (host kill_other).
 #[test]
 fn mayor_bounce_never_kills_imp() {
     use botc_mcp::game::ability::protect::is_demon_killable;
@@ -296,7 +296,7 @@ fn mayor_bounce_never_kills_imp() {
     assert!(g.seats[4].alive, "Imp remains alive");
 }
 
-/// 5. Ghost vote: living finish voting first does not auto-close before dead votes.
+/// Ghost vote: living finish voting first does not auto-close before dead votes.
 #[test]
 fn ghost_vote_not_auto_closed_when_only_living_voted() {
     let (mut g, host, tokens) = start_scripted(
@@ -342,7 +342,7 @@ fn ghost_vote_not_auto_closed_when_only_living_voted() {
     assert!(g.current_nomination.is_none());
 }
 
-/// 6. Poisoned Virgin first nom spends ability without executing.
+/// Poisoned Virgin first nom spends ability without executing.
 #[test]
 fn poisoned_virgin_first_nom_spends_ability() {
     let (mut g, host, tokens) = start_scripted(
@@ -375,7 +375,7 @@ fn poisoned_virgin_first_nom_spends_ability() {
     assert_eq!(g.executed_today, None);
 }
 
-/// 7. Chef: single registration per seat → Evil–Recluse–Evil cannot yield count 1.
+/// Chef: single registration per seat → Evil–Recluse–Evil cannot yield count 1.
 #[test]
 fn chef_single_reg_evil_recluse_evil_never_one() {
     // Circle: Imp, Recluse, Poisoner, Soldier, Chef — pairs Imp-Recluse, Recluse-Poisoner,
@@ -419,8 +419,8 @@ fn chef_single_reg_evil_recluse_evil_never_one() {
     }
 }
 
-/// 8. Seed default not 0 when omitted from MCP create_game — covered in mcp_server unit tests.
-/// 9. Substream with salt differs — covered in rng_tests.
+/// Seed default not 0 when omitted from MCP create_game — covered in mcp_server unit tests.
+/// Substream with salt differs — covered in rng_tests.
 
 #[test]
 fn host_state_exposes_secret_salt_not_private() {

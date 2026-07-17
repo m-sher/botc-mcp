@@ -765,7 +765,7 @@ fn dawn_announces_deaths_publicly_not_roles() {
 }
 
 // ---------------------------------------------------------------------------
-// Review fixes: Spy grimoire, FT distinct seats
+// Spy grimoire, FT distinct seats
 // ---------------------------------------------------------------------------
 
 #[test]

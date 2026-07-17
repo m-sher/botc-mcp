@@ -1,4 +1,4 @@
-//! Re-audit round 4: #21 poisoned Spy+Virgin, ST policy, #26 cleanup covered in unit tests.
+//! Poisoned Spy+Virgin, Storyteller host decisions, and registration modes.
 
 use botc_mcp::game::ability::register;
 use botc_mcp::game::{
@@ -44,7 +44,7 @@ fn to_day1(g: &mut Game, host: &botc_mcp::auth::Token) {
     ));
 }
 
-/// #21 poisoned Spy nominating Virgin never triggers execution.
+/// Poisoned Spy nominating Virgin never triggers execution.
 #[test]
 fn poisoned_spy_never_triggers_virgin() {
     for seed in 0..40u64 {
@@ -182,7 +182,7 @@ fn starpass_pending_host_pick() {
         NightActionPayload::PickOne { target: SeatId(1) },
     )
     .unwrap();
-    // #27: Imp stays publicly alive during host starpass pause.
+    // Imp stays publicly alive during host starpass pause.
     assert!(
         g.seats[1].alive,
         "Imp must stay alive until host resolves starpass"
@@ -294,7 +294,7 @@ fn host_queue_lie_used_for_disabled_empath() {
     assert!(g.host_lie_queue.is_empty());
 }
 
-/// Direct register unit: Ability disabled Spy is never Townsfolk for Virgin (#21).
+/// Direct register unit: Ability disabled Spy is never Townsfolk for Virgin.
 #[test]
 fn registers_as_townsfolk_disabled_spy_unit() {
     let (mut g, _, _) = start_scripted(
