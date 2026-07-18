@@ -7,6 +7,9 @@ Cargo.lock
 .DS_Store
 botc-results.jsonl
 
+# Local Superpowers / SDD agent process artifacts (not product docs)
+.superpowers/
+
 # Leaderboard local state / secrets
 .env
 leaderboard/ratings.json
